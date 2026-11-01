@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/p2p-core",
+    "crates/p2p-cli",
+]
+resolver = "2"

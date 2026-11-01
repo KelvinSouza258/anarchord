@@ -1,0 +1,40 @@
+[package]
+name = "p2p-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core P2P Decentralized Engine (Identity, DHT, QUIC, GossipSub, Audio)"
+
+[dependencies]
+# Redes P2P oficiais com todas as features de transporte
+libp2p = { version = "0.54", features = [
+    "tokio",
+    "gossipsub",
+    "kad",
+    "identify",
+    "ping",
+    "dcutr",
+    "relay",
+    "autonat",
+    "quic",
+    "tcp",
+    "noise",
+    "yamux",
+    "macros"
+] }
+
+# Criptografia e Identidade (Ed25519)
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+sha2 = "0.10"
+
+# Assíncrono e Utilidades
+tokio = { version = "1.40", features = ["full"] }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"

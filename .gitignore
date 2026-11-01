@@ -1,0 +1,20 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Cryptographic private keys & Identities (Soberania local do usuário)
+*.key
+identity.key
+*.pem
+
+# IDEs & System
+.vscode/
+.idea/
+*.swp
+*.DS_Store
+Thumbs.db
+
+# OS Temporary Files
+tmp/
+*.tmp
