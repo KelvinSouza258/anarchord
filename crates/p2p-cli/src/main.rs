@@ -27,8 +27,8 @@ struct Args {
     #[arg(short, long, default_value_t = 0)]
     port: u16,
 
-    /// Caminho do arquivo de chave de identidade permanente
-    #[arg(long, default_value = "identity.key")]
+    /// Caminho do arquivo de identidade e perfil do usuário (JSON com chaves PEM)
+    #[arg(long, default_value = "identity.json")]
     identity_file: PathBuf,
 
     /// Conectar diretamente a um endereço multiaddr conhecido (opcional)
@@ -57,9 +57,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(" 🚀 P2P Discord Daemon / CLI (100% Descentralizado)");
     println!("============================================================");
 
-    // 1. Carrega ou gera a identidade permanente do usuário (sem TTL)
-    let identity = UserIdentity::load_or_create(&args.identity_file)?;
-    println!("👤 Apelido     : {}", args.nick);
+    // 1. Carrega ou gera a identidade permanente do usuário (JSON/PEM com perfil)
+    let mut identity = UserIdentity::load_or_create(&args.identity_file)?;
+    if args.nick != "Peer" || identity.profile.display_name == "Anonymous Peer" {
+        identity.set_nick(&args.nick);
+        let _ = identity.save_to(&args.identity_file);
+    }
+    println!("👤 Apelido     : {}", identity.profile.display_name);
     println!("🔑 User ID     : {}", identity.public_key_hex());
 
     // 2. Inicializa o Nó P2P (Swarm com Kademlia, QUIC, GossipSub, DCUtR)

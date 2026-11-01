@@ -23,7 +23,7 @@ libp2p = { version = "0.54", features = [
 ] }
 
 # Criptografia e Identidade (Ed25519)
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core", "pkcs8", "pem"] }
 rand = "0.8"
 sha2 = "0.10"
 
@@ -35,6 +35,9 @@ serde_json = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+# Áudio Nativo Multiplataforma (Windows WASAPI, Linux ALSA, macOS CoreAudio)
+cpal = "0.15"
 
 [dev-dependencies]
 tokio-test = "0.4"

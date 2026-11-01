@@ -1,59 +1,220 @@
+use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum IdentityError {
     #[error("Erro de I/O: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Chave inválida")]
-    InvalidKey,
+    #[error("Chave inválida: {0}")]
+    InvalidKey(String),
+    #[error("Erro de serialização JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("Erro de formato PKCS8/PEM: {0}")]
+    Pkcs8(String),
 }
 
-/// Identidade Permanente do Usuário (Sem TTL)
+/// Perfil público do usuário armazenado junto com a identidade
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserProfile {
+    pub display_name: String,
+    pub bio: Option<String>,
+    pub avatar_base64: Option<String>,
+    pub banner_color: Option<String>,
+}
+
+impl Default for UserProfile {
+    fn default() -> Self {
+        Self {
+            display_name: "Anonymous Peer".to_string(),
+            bio: None,
+            avatar_base64: None,
+            banner_color: Some("#5865F2".to_string()),
+        }
+    }
+}
+
+/// Representação das chaves criptográficas em formato PEM / PKCS#8
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdentityKeys {
+    pub algorithm: String,
+    pub private_key_pem: String,
+    pub public_key_pem: String,
+}
+
+/// Documento JSON persistido da Identidade do Usuário
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IdentityDocument {
+    pub version: u32,
+    pub created_at: u64,
+    pub user_id: String,
+    pub profile: UserProfile,
+    pub keys: IdentityKeys,
+}
+
+/// Identidade Permanente do Usuário em memória
 #[derive(Clone)]
 pub struct UserIdentity {
+    pub profile: UserProfile,
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
 }
 
 impl UserIdentity {
-    /// Gera uma nova identidade criptográfica aleatória usando RNG do SO
+    /// Gera uma nova identidade criptográfica aleatória com perfil padrão
     pub fn generate() -> Self {
+        Self::generate_with_nick("Anonymous Peer")
+    }
+
+    /// Gera uma nova identidade com apelido inicial
+    pub fn generate_with_nick(nick: &str) -> Self {
         let mut csprng = OsRng;
         let signing_key = SigningKey::generate(&mut csprng);
         let verifying_key = signing_key.verifying_key();
         Self {
+            profile: UserProfile {
+                display_name: nick.to_string(),
+                ..Default::default()
+            },
             signing_key,
             verifying_key,
         }
     }
 
-    /// Carrega do disco ou cria uma nova se não existir (Persistência permanente)
+    /// Carrega do disco ou cria uma nova se não existir (Persistência permanente em JSON/PEM).
+    /// Suporta retrocompatibilidade transparente com arquivos de 32 bytes binários antigos.
     pub fn load_or_create<P: AsRef<Path>>(path: P) -> Result<Self, IdentityError> {
         let path = path.as_ref();
         if path.exists() {
-            let bytes = fs::read(path)?;
-            if bytes.len() != 32 {
-                return Err(IdentityError::InvalidKey);
+            let data = fs::read(path)?;
+
+            // 1. Tentar ler como JSON estruturado moderno
+            if let Ok(doc) = serde_json::from_slice::<IdentityDocument>(&data) {
+                return Self::from_document(&doc);
             }
-            let key_bytes: [u8; 32] = bytes.try_into().map_err(|_| IdentityError::InvalidKey)?;
-            let signing_key = SigningKey::from_bytes(&key_bytes);
-            let verifying_key = signing_key.verifying_key();
-            Ok(Self {
-                signing_key,
-                verifying_key,
-            })
+
+            // 2. Retrocompatibilidade: Se for arquivo binário de 32 bytes brutos (versão legada)
+            if data.len() == 32 {
+                let key_bytes: [u8; 32] = data
+                    .try_into()
+                    .map_err(|_| IdentityError::InvalidKey("Tamanho incorreto".into()))?;
+                let signing_key = SigningKey::from_bytes(&key_bytes);
+                let verifying_key = signing_key.verifying_key();
+                let identity = Self {
+                    profile: UserProfile::default(),
+                    signing_key,
+                    verifying_key,
+                };
+
+                // Migra automaticamente para o novo formato JSON
+                let _ = identity.save_to(path);
+                return Ok(identity);
+            }
+
+            // 3. Tentar ler como PEM bruto puro direto no arquivo
+            if let Ok(pem_str) = std::str::from_utf8(&data) {
+                if pem_str.contains("BEGIN PRIVATE KEY") {
+                    let signing_key = SigningKey::from_pkcs8_pem(pem_str)
+                        .map_err(|e| IdentityError::Pkcs8(e.to_string()))?;
+                    let verifying_key = signing_key.verifying_key();
+                    let identity = Self {
+                        profile: UserProfile::default(),
+                        signing_key,
+                        verifying_key,
+                    };
+                    let _ = identity.save_to(path);
+                    return Ok(identity);
+                }
+            }
+
+            Err(IdentityError::InvalidKey(
+                "Formato de chave não reconhecido (esperado JSON ou PEM)".into(),
+            ))
         } else {
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent)?;
+                }
             }
             let id = Self::generate();
-            fs::write(path, id.signing_key.to_bytes())?;
+            id.save_to(path)?;
             Ok(id)
         }
+    }
+
+    /// Reconstrói a identidade a partir do documento JSON
+    pub fn from_document(doc: &IdentityDocument) -> Result<Self, IdentityError> {
+        let signing_key = SigningKey::from_pkcs8_pem(&doc.keys.private_key_pem)
+            .map_err(|e| IdentityError::Pkcs8(e.to_string()))?;
+        let verifying_key = signing_key.verifying_key();
+
+        // Validar se o user_id bate com a chave pública
+        let calculated_user_id = hex::encode(verifying_key.to_bytes());
+        if calculated_user_id != doc.user_id {
+            return Err(IdentityError::InvalidKey(
+                "UserID divergente da chave pública informada".into(),
+            ));
+        }
+
+        Ok(Self {
+            profile: doc.profile.clone(),
+            signing_key,
+            verifying_key,
+        })
+    }
+
+    /// Converte a identidade em um documento JSON serializável
+    pub fn to_document(&self) -> Result<IdentityDocument, IdentityError> {
+        let priv_pem = self
+            .signing_key
+            .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
+            .map_err(|e| IdentityError::Pkcs8(e.to_string()))?;
+
+        let pub_pem = self
+            .verifying_key
+            .to_public_key_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
+            .map_err(|e| IdentityError::Pkcs8(e.to_string()))?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Ok(IdentityDocument {
+            version: 1,
+            created_at: now,
+            user_id: self.public_key_hex(),
+            profile: self.profile.clone(),
+            keys: IdentityKeys {
+                algorithm: "Ed25519".to_string(),
+                private_key_pem: priv_pem.to_string(),
+                public_key_pem: pub_pem,
+            },
+        })
+    }
+
+    /// Salva a identidade no disco em formato JSON legível e formatado
+    pub fn save_to<P: AsRef<Path>>(&self, path: P) -> Result<(), IdentityError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let doc = self.to_document()?;
+        let json_text = serde_json::to_string_pretty(&doc)?;
+        fs::write(path, json_text)?;
+        Ok(())
+    }
+
+    /// Atualiza o apelido do perfil
+    pub fn set_nick(&mut self, nick: &str) {
+        self.profile.display_name = nick.to_string();
     }
 
     /// Retorna a chave pública (UserID) em formato Hexadecimal legível
@@ -76,7 +237,7 @@ impl UserIdentity {
     }
 }
 
-// Helper para converter hex sem adicionar crate externa agora
+// Helper para converter hex sem adicionar crate externa
 mod hex {
     pub fn encode(data: [u8; 32]) -> String {
         data.iter().map(|b| format!("{:02x}", b)).collect()
@@ -90,7 +251,9 @@ mod tests {
     #[test]
     fn test_identity_generate_and_sign() {
         use ed25519_dalek::{Signature, Verifier};
-        let id = UserIdentity::generate();
+        let id = UserIdentity::generate_with_nick("Victor-PC");
+        assert_eq!(id.profile.display_name, "Victor-PC");
+
         let msg = b"Mensagem secreta no chat";
         let sig_bytes = id.sign(msg);
 
@@ -99,15 +262,54 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_persistence() {
-        let temp_dir = std::env::temp_dir().join("p2p_test_identity");
-        let key_file = temp_dir.join("id.key");
+    fn test_identity_json_pem_persistence() {
+        let temp_dir = std::env::temp_dir().join("p2p_test_identity_json");
+        let key_file = temp_dir.join("identity.json");
         let _ = fs::remove_file(&key_file);
 
-        let id1 = UserIdentity::load_or_create(&key_file).unwrap();
+        let mut id1 = UserIdentity::generate_with_nick("Victor");
+        id1.profile.bio = Some("Testando identidade P2P".to_string());
+        id1.save_to(&key_file).unwrap();
+
+        // Verificar que o arquivo é JSON válido e tem PEM dentro
+        let content = fs::read_to_string(&key_file).unwrap();
+        assert!(content.contains("BEGIN PRIVATE KEY"));
+        assert!(content.contains("BEGIN PUBLIC KEY"));
+        assert!(content.contains("\"display_name\": \"Victor\""));
+
+        // Carregar novamente do arquivo JSON
         let id2 = UserIdentity::load_or_create(&key_file).unwrap();
 
         assert_eq!(id1.public_key_hex(), id2.public_key_hex());
+        assert_eq!(id2.profile.display_name, "Victor");
+        assert_eq!(id2.profile.bio.as_deref(), Some("Testando identidade P2P"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_legacy_binary_key_migration() {
+        let temp_dir = std::env::temp_dir().join("p2p_test_legacy_migration");
+        let key_file = temp_dir.join("legacy.key");
+        let _ = fs::create_dir_all(&temp_dir);
+
+        // Criar chave legada de 32 bytes puros
+        let mut csprng = OsRng;
+        let old_signing_key = SigningKey::generate(&mut csprng);
+        fs::write(&key_file, old_signing_key.to_bytes()).unwrap();
+
+        // O load_or_create deve carregar sem erro e migrar automaticamente para JSON
+        let migrated_id = UserIdentity::load_or_create(&key_file).unwrap();
+        assert_eq!(
+            migrated_id.public_key_hex(),
+            hex::encode(old_signing_key.verifying_key().to_bytes())
+        );
+
+        // Verificar que agora o arquivo virou JSON com PEM
+        let updated_content = fs::read_to_string(&key_file).unwrap();
+        assert!(updated_content.contains("BEGIN PRIVATE KEY"));
+        assert!(updated_content.contains("\"version\": 1"));
+
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }
