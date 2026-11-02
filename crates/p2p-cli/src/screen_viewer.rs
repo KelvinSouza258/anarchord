@@ -71,6 +71,8 @@ impl ScreenViewer {
                     }
                 }
 
+                let mut had_new_frame = false;
+
                 for (codec, data) in incoming_packets {
                     let data_len = data.len();
                     bytes_this_second += data_len;
@@ -96,6 +98,7 @@ impl ScreenViewer {
 
                                 if rendered {
                                     frames_this_second += 1;
+                                    had_new_frame = true;
                                 }
                             }
                         }
@@ -120,6 +123,7 @@ impl ScreenViewer {
                                     }
                                 }
                                 frames_this_second += 1;
+                                had_new_frame = true;
                             }
                         }
                     }
@@ -143,11 +147,14 @@ impl ScreenViewer {
                     last_metrics_update = Instant::now();
                 }
 
-                if let Err(_) = window.update_with_buffer(&current_buffer, curr_w, curr_h) {
-                    break;
+                if had_new_frame {
+                    if let Err(_) = window.update_with_buffer(&current_buffer, curr_w, curr_h) {
+                        break;
+                    }
+                } else {
+                    window.update();
+                    std::thread::sleep(Duration::from_millis(2));
                 }
-
-                std::thread::sleep(Duration::from_millis(5));
             }
 
             is_active.store(false, Ordering::SeqCst);

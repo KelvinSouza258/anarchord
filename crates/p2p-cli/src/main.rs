@@ -71,6 +71,10 @@ pub struct Args {
     /// Desativar descoberta automática via IPFS Amino DHT e Open Trackers BitTorrent
     #[arg(long, default_value_t = false)]
     pub no_auto_bootstrap: bool,
+
+    /// Gravar logs de telemetria e diagnóstico em arquivo (ex: anarchord.log)
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
 }
 
 /// Ação interpretada a partir de uma linha digitada no chat
@@ -86,7 +90,7 @@ pub enum ChatAction {
     SendFile { recipient_query: String, file_path: String },
     AcceptFile(String),
     RejectFile(String),
-    ScreenStart(usize),
+    ScreenStart { monitor_idx: usize, quality: u32 },
     ScreenStop,
     ScreenWatch(String),
     ScreenList,
@@ -113,12 +117,14 @@ pub fn parse_user_input(input: &str) -> ChatAction {
         return ChatAction::ToggleMute;
     }
     if trimmed == "/screen start" {
-        return ChatAction::ScreenStart(0);
+        return ChatAction::ScreenStart { monitor_idx: 0, quality: 720 };
     }
     if trimmed.starts_with("/screen start ") {
-        let idx_str = trimmed.trim_start_matches("/screen start ").trim();
-        let idx = idx_str.parse::<usize>().unwrap_or(0);
-        return ChatAction::ScreenStart(idx);
+        let remainder = trimmed.trim_start_matches("/screen start ").trim();
+        let parts: Vec<&str> = remainder.split_whitespace().collect();
+        let monitor_idx = parts.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        let quality = parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(720);
+        return ChatAction::ScreenStart { monitor_idx, quality };
     }
     if trimmed == "/screen stop" {
         return ChatAction::ScreenStop;
@@ -178,9 +184,19 @@ pub fn parse_user_input(input: &str) -> ChatAction {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    if args.daemon {
+    if let Some(ref log_path) = args.log_file {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
         let subscriber = FmtSubscriber::builder()
-            .with_max_level(Level::WARN)
+            .with_max_level(Level::DEBUG)
+            .with_writer(file)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    } else if args.daemon {
+        let subscriber = FmtSubscriber::builder()
+            .with_max_level(Level::INFO)
             .finish();
         let _ = tracing::subscriber::set_global_default(subscriber);
     } else {
@@ -705,10 +721,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 let _ = tx_ui_event.send(UiEvent::SystemLog(msg));
                             }
-                            ChatAction::ScreenStart(monitor_idx) => {
+                            ChatAction::ScreenStart { monitor_idx, quality } => {
                                 if screen_capture_engine.is_streaming_handle().load(Ordering::Relaxed) {
                                     let _ = tx_ui_event.send(UiEvent::SystemLog("Você já está transmitindo sua tela. Use /screen stop para parar.".to_string()));
                                 } else {
+                                    let max_width = match quality {
+                                        1080 => 1920,
+                                        720 => 1280,
+                                        540 => 960,
+                                        480 => 854,
+                                        360 => 640,
+                                        other => other,
+                                    };
                                     let stream_id = format!("screen:{}", &identity.public_key_hex()[..8]);
                                     let tx_frame = tx_screen_out.clone();
                                     screen_capture_engine.start_capture(
@@ -717,11 +741,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         args.nick.clone(),
                                         monitor_idx,
                                         30, // 30 FPS com H.264
+                                        max_width,
                                         move |pkt| {
                                             let _ = tx_frame.send(pkt);
                                         },
                                     );
-                                    let _ = tx_ui_event.send(UiEvent::SystemLog(format!("📺 Transmissão H.264 (30 FPS) INICIADA (Stream ID: {}). Use /screen stop para encerrar.", stream_id)));
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog(format!("📺 Transmissão H.264 (30 FPS, {}p) INICIADA (Stream ID: {}). Use /screen stop para encerrar.", quality, stream_id)));
                                 }
                             }
                             ChatAction::ScreenStop => {
@@ -1089,10 +1114,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("-----------------------------------------------\n");
                                 continue;
                             }
-                            ChatAction::ScreenStart(monitor_idx) => {
+                            ChatAction::ScreenStart { monitor_idx, quality } => {
                                 if screen_capture_engine.is_streaming_handle().load(Ordering::Relaxed) {
                                     println!("⚠️  Você já está transmitindo sua tela. Use /screen stop para parar.");
                                 } else {
+                                    let max_width = match quality {
+                                        1080 => 1920,
+                                        720 => 1280,
+                                        540 => 960,
+                                        480 => 854,
+                                        360 => 640,
+                                        other => other,
+                                    };
                                     let stream_id = format!("screen:{}", &identity.public_key_hex()[..8]);
                                     let tx_frame = tx_screen_out.clone();
                                     screen_capture_engine.start_capture(
@@ -1101,11 +1134,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         args.nick.clone(),
                                         monitor_idx,
                                         30, // 30 FPS com H.264
+                                        max_width,
                                         move |pkt| {
                                             let _ = tx_frame.send(pkt);
                                         },
                                     );
-                                    println!("📺 Transmissão H.264 (30 FPS) INICIADA (Stream ID: {}). Use /screen stop para encerrar.", stream_id);
+                                    println!("📺 Transmissão H.264 (30 FPS, {}p) INICIADA (Stream ID: {}). Use /screen stop para encerrar.", quality, stream_id);
                                 }
                                 continue;
                             }
