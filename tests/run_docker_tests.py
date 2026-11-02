@@ -74,11 +74,14 @@ def main():
     # -------------------------------------------------------------
     # Teste 1: Isolamento Total da DHT global (Zero Oracle-Bot)
     # -------------------------------------------------------------
+    failures = []
+
     oracle_found = any("Oracle-Bot" in l for l in [bootstrap_logs, alice_logs, bob_logs, carol_logs])
     if not oracle_found:
         print("  ✅ [TESTE 1: ISOLAMENTO TOTAL] 100% isolado da DHT Global (Zero tráfego externo/Oracle-Bot).")
     else:
         print("  ❌ [TESTE 1: ISOLAMENTO TOTAL] FALHA: Detectado tráfego de nós externos (Oracle-Bot presente!).")
+        failures.append("isolamento")
 
     # -------------------------------------------------------------
     # Teste 2: Descoberta e Pareamento Multi-Peer (3+ peers)
@@ -99,6 +102,7 @@ def main():
         print(f"     -> Entre Peers: Bob viu Alice={bob_saw_alice}, Carol viu Alice={carol_saw_alice}")
     else:
         print("  ❌ [TESTE 2: CONECTIVIDADE MULTI-PEER 3+] Falha de conectividade entre pares:")
+        failures.append("conectividade")
         print(f"     -> Bootstrap registrou: Alice={alice_in_boot}, Bob={bob_in_boot}, Carol={carol_in_boot}")
         print(f"     -> Alice registrou: Bob={alice_saw_bob}, Carol={alice_saw_carol}")
         print(f"     -> Bob registrou: Alice={bob_saw_alice}")
@@ -113,8 +117,10 @@ def main():
         print("  ✅ [TESTE 3: ÁUDIO OPUS P2P] Transmitido por Alice e recebido por Bob e Carol simultaneamente.")
     elif audio_bob or audio_carol:
         print(f"  ⚠️ [TESTE 3: ÁUDIO OPUS P2P] Parcial: Bob={audio_bob}, Carol={audio_carol}")
+        failures.append("audio-parcial")
     else:
         print("  ❌ [TESTE 3: ÁUDIO OPUS P2P] Falha: Nenhum nó receptor detectou pacotes de voz de Alice.")
+        failures.append("audio")
 
     # -------------------------------------------------------------
     # Teste 4: Transmissão e Recepção de Vídeo H.264 P2P
@@ -136,6 +142,7 @@ def main():
             print(f"     -> Exemplo log Carol: {frames_carol[-1]}")
     else:
         print("  ❌ [TESTE 4: TELA / VÍDEO H.264 P2P] Falha:")
+        failures.append("video")
         print(f"     -> Notificação de nova stream: Bob={video_announced_bob}, Carol={video_announced_carol}")
         print(f"     -> Quadros válidos (>0 KB): Bob={valid_frames_bob} (total={len(frames_bob)}), Carol={valid_frames_carol} (total={len(frames_carol)})")
 
@@ -154,6 +161,9 @@ def main():
     print("\n" + "=" * 70)
     print("🧹 Encerrando cluster e limpando redes virtuais...")
     subprocess.run(["docker", "compose", "-f", "docker-compose.test.yml", "down", "--remove-orphans"], capture_output=True)
+    if failures:
+        print(f"❌ Bateria de testes finalizada com falhas: {', '.join(failures)}")
+        sys.exit(1)
     print("🎉 Bateria de testes finalizada!")
 
 if __name__ == "__main__":

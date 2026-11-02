@@ -17,6 +17,8 @@ libp2p = { version = "0.54", features = [
     "autonat",
     "quic",
     "tcp",
+    "dns",
+    "rsa", # nós de bootstrap da DHT Amino (IDs "Qm...") usam chaves RSA
     "noise",
     "yamux",
     "mdns",

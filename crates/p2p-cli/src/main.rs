@@ -1,3 +1,4 @@
+mod presence;
 mod ui;
 mod screen_viewer;
 
@@ -7,13 +8,14 @@ use libp2p::gossipsub::IdentTopic;
 use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use p2p_core::{
     api::ChatMessage,
-    bootstrap::{get_ipfs_bootstrap_multiaddrs, OPENTRACKER_SERVERS},
+    bootstrap::OPENTRACKER_SERVERS,
     file_transfer::{
         calculate_file_hash, chunk_file, FileDecision, FileOffer, FileReceiver, FileTransferMessage,
     },
     identity::UserIdentity,
-    node::P2PNode,
+    node::{parse_agent_version, P2PNode, DHT_DISCOVERY_NAMESPACE},
     protocol::AppBehaviourEvent,
+    relay::RelayManager,
     screen::{ScreenCaptureEngine, ScreenPacket},
     tracker::{make_info_hash, TorrentTrackerClient},
     voice::{AudioCodec, AudioDeviceManager, JitterBuffer, VoiceEngine, VoicePacket},
@@ -219,6 +221,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         identity.set_nick(&args.nick);
         let _ = identity.save_to(&args.identity_file);
     }
+    // Nick efetivo: o salvo na identidade (atualizado acima quando --nick é informado)
+    let my_nick = identity.profile.display_name.clone();
     if args.daemon {
         println!("👤 Apelido     : {}", identity.profile.display_name);
         println!("🔑 User ID     : {}", identity.public_key_hex());
@@ -229,9 +233,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.daemon {
         println!("🌐 Peer ID P2P : {}", node.peer_id);
         if args.port > 0 {
-            println!("🚪 Porta Local : {}", args.port);
+            println!("🚪 Porta Local : {} (TCP + QUIC)", node.listen_port);
         } else {
-            println!("🚪 Porta Local : Automática (Dinâmica)");
+            println!("🚪 Porta Local : {} (TCP + QUIC, escolhida automaticamente)", node.listen_port);
         }
         println!("💬 Sala Ativa  : #{}", args.channel);
         println!("============================================================");
@@ -248,8 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Canal ativo inicial
     let mut current_channel = args.channel.clone();
-    let mut topic_name = format!("p2p-anarchord/channel/{}", current_channel);
-    let mut current_topic = IdentTopic::new(topic_name.clone());
+    let mut current_topic = presence::channel_topic(&current_channel);
     node.swarm.behaviour_mut().gossipsub.subscribe(&current_topic)?;
 
     // Conexão direta explícita se fornecida
@@ -263,18 +266,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Descoberta Automática Híbrida: 1) IPFS Amino DHT + 2) BitTorrent Open Trackers
     let (tx_peer_discovery, mut rx_peer_discovery) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let (tx_assigned_port, mut rx_assigned_port) = tokio::sync::mpsc::channel::<u16>(1);
 
-    // Rastreamento da porta real para cleanup ao sair (Ctrl+C ou /quit)
-    let assigned_listen_port = Arc::new(std::sync::atomic::AtomicU16::new(args.port));
-    let assigned_port_clone = Arc::clone(&assigned_listen_port);
-
+    // TCP e QUIC escutam na mesma porta, então a porta anunciada nos trackers vale para os dois
+    let listen_port = node.listen_port;
     let is_daemon = args.daemon;
 
     if !args.no_auto_bootstrap {
-        // 1. Conecta aos nós globais da rede IPFS DHT
-        for bootstrap_addr in get_ipfs_bootstrap_multiaddrs() {
-            let _ = node.swarm.dial(bootstrap_addr);
+        // 1. Entra na DHT Amino do IPFS; a busca por outros nós Anarchord roda no loop principal
+        let bootstrap_count = node.bootstrap_dht();
+        if args.daemon {
+            println!("🌍 DHT Amino: {} nós de bootstrap registrados", bootstrap_count);
         }
 
         // 2. Fallback: Consulta os Open Trackers BitTorrent em background
@@ -284,15 +285,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bt_peer_id[0..copy_len].copy_from_slice(&p2p_id_bytes[0..copy_len]);
 
         tokio::spawn(async move {
-            // Aguarda a porta real atribuída pelo OS (caso args.port == 0)
-            let actual_port = rx_assigned_port.recv().await.unwrap_or(args.port);
-            assigned_port_clone.store(actual_port, Ordering::SeqCst);
-            let info_hash = make_info_hash("global-anarchord-discovery");
+            let info_hash = make_info_hash(DHT_DISCOVERY_NAMESPACE);
 
             // Loop contínuo de reanúncio e redescoberta periódica (a cada 10 segundos)
             loop {
                 for tracker in OPENTRACKER_SERVERS {
-                    match TorrentTrackerClient::discover_peers(tracker, &info_hash, &bt_peer_id, actual_port) {
+                    match TorrentTrackerClient::discover_peers(tracker, &info_hash, &bt_peer_id, listen_port) {
                         Ok(peers) => {
                             for peer in peers {
                                 if is_daemon {
@@ -571,7 +569,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rastreamento de nós conectados para desduplicação e metadados de identificação
     let mut connected_peers: HashSet<libp2p::PeerId> = HashSet::new();
     let mut peer_metadata: HashMap<libp2p::PeerId, (String, String)> = HashMap::new(); // PeerId -> (Nick, PubKey)
-    let mut port_reported = false;
+
+    // Busca periódica de outros nós Anarchord na DHT (registros de provedor)
+    let mut dht_search_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
+    // Reservas em relays públicos quando o AutoNAT detecta NAT (habilita DCUtR / hole punching)
+    let mut relay_manager = RelayManager::new();
 
     // Gerenciamento de Transferência Direta de Arquivos P2P
     // Tópico global do Gossipsub para ofertas e sinalização direta
@@ -609,7 +612,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen_capture_engine.start_synthetic_video_stream(
             stream_id.clone(),
             identity.public_key_hex(),
-            args.nick.clone(),
+            my_nick.clone(),
             30, // 30 FPS fluido com H.264
             move |pkt| {
                 let _ = tx_frame.send(pkt);
@@ -623,6 +626,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Loop de eventos da malha P2P + Teclado + Auto-Discovery
     loop {
         tokio::select! {
+            // Procura na DHT os nós Anarchord que anunciaram a chave de descoberta
+            _ = dht_search_interval.tick(), if !args.no_auto_bootstrap => {
+                node.dht_find_peers();
+            }
             // Monitora quando pares pararam de falar/transmitir (inatividade > 600ms)
             _ = speaker_check_interval.tick() => {
                 let now = std::time::Instant::now();
@@ -705,7 +712,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ChatAction::Empty => {}
                             ChatAction::Quit => break,
                             ChatAction::ListPeers => {
-                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Pares conectados: {}", connected_peers.len())));
+                                let anarchord_peers = peer_metadata.keys().filter(|p| connected_peers.contains(p)).count();
+                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Pares Anarchord conectados: {} (conexões totais, incluindo DHT: {})", anarchord_peers, connected_peers.len())));
                             }
                             ChatAction::ListDevices => {
                                 let _ = tx_ui_event.send(UiEvent::SystemLog("Dispositivos de áudio listados.".to_string()));
@@ -725,7 +733,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = tx_ui_event.send(UiEvent::SystemLog(msg));
                             }
                             ChatAction::ScreenStart { monitor_idx, quality } => {
-                                if screen_capture_engine.is_streaming_handle().load(Ordering::Relaxed) {
+                                if screen_capture_engine.is_streaming() {
                                     let _ = tx_ui_event.send(UiEvent::SystemLog("Você já está transmitindo sua tela. Use /screen stop para parar.".to_string()));
                                 } else {
                                     let max_width = match quality {
@@ -741,7 +749,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     screen_capture_engine.start_capture(
                                         stream_id.clone(),
                                         identity.public_key_hex(),
-                                        args.nick.clone(),
+                                        my_nick.clone(),
                                         monitor_idx,
                                         30, // 30 FPS com H.264
                                         max_width,
@@ -753,7 +761,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             ChatAction::ScreenStop => {
-                                if screen_capture_engine.is_streaming_handle().load(Ordering::Relaxed) {
+                                if screen_capture_engine.is_streaming() {
                                     screen_capture_engine.stop_capture();
                                     let _ = tx_ui_event.send(UiEvent::SystemLog("📺 Transmissão de tela ENCERRADA.".to_string()));
                                 } else {
@@ -794,7 +802,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(prev);
                                 }
                                 current_voice_peers.clear();
-                                current_voice_peers.insert(args.nick.clone());
+                                current_voice_peers.insert(my_nick.clone());
                                 let v_topic_name = format!("p2p-anarchord/voice/{}", channel_id);
                                 let v_topic = IdentTopic::new(v_topic_name);
                                 if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&v_topic) {
@@ -823,12 +831,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if new_channel != current_channel {
                                     let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&current_topic);
                                     current_channel = new_channel.clone();
-                                    topic_name = format!("p2p-anarchord/channel/{}", current_channel);
-                                    current_topic = IdentTopic::new(topic_name.clone());
+                                    current_topic = presence::channel_topic(&current_channel);
                                     if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&current_topic) {
                                         let _ = tx_ui_event.send(UiEvent::SystemLog(format!("❌ Erro ao entrar no canal #{}: {:?}", current_channel, e)));
                                     } else {
                                         let _ = tx_ui_event.send(UiEvent::ChannelChanged(current_channel.clone()));
+                                        publish_channel_members(&node, &peer_metadata, &current_channel, &current_topic, &tx_ui_event);
                                         let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🚀 Entrou no canal #{}", current_channel)));
                                     }
                                 }
@@ -865,7 +873,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             file_size,
                                             total_chunks,
                                             sender_pubkey: identity.public_key_hex(),
-                                            sender_name: args.nick.clone(),
+                                            sender_name: my_nick.clone(),
                                             recipient_pubkey: recipient_pubkey.clone(),
                                         };
 
@@ -925,7 +933,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let msg = ChatMessage {
                                     channel_id: current_channel.clone(),
                                     author_pubkey: identity.public_key_hex(),
-                                    author_name: args.nick.clone(),
+                                    author_name: my_nick.clone(),
                                     text: trimmed.clone(),
                                     timestamp: now,
                                     signature,
@@ -999,7 +1007,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(prev);
                                 }
                                 current_voice_peers.clear();
-                                current_voice_peers.insert(args.nick.clone());
+                                current_voice_peers.insert(my_nick.clone());
                                 let v_topic_name = format!("p2p-anarchord/voice/{}", v_channel);
                                 let v_topic = IdentTopic::new(v_topic_name);
                                 if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&v_topic) {
@@ -1031,12 +1039,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if new_channel != current_channel {
                                     let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&current_topic);
                                     current_channel = new_channel.clone();
-                                    topic_name = format!("p2p-anarchord/channel/{}", current_channel);
-                                    current_topic = IdentTopic::new(topic_name.clone());
+                                    current_topic = presence::channel_topic(&current_channel);
                                     if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&current_topic) {
                                         println!("❌ Erro ao entrar no canal #{}: {:?}", current_channel, e);
                                     } else {
                                         let _ = tx_ui_event.send(UiEvent::ChannelChanged(current_channel.clone()));
+                                        publish_channel_members(&node, &peer_metadata, &current_channel, &current_topic, &tx_ui_event);
                                         println!("🚀 Você entrou no canal [#{}]!", current_channel);
                                     }
                                 }
@@ -1081,7 +1089,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             file_size,
                                             total_chunks,
                                             sender_pubkey: identity.public_key_hex(),
-                                            sender_name: args.nick.clone(),
+                                            sender_name: my_nick.clone(),
                                             recipient_pubkey: recipient_pubkey.clone(),
                                         };
 
@@ -1162,7 +1170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
                             ChatAction::ScreenStart { monitor_idx, quality } => {
-                                if screen_capture_engine.is_streaming_handle().load(Ordering::Relaxed) {
+                                if screen_capture_engine.is_streaming() {
                                     println!("⚠️  Você já está transmitindo sua tela. Use /screen stop para parar.");
                                 } else {
                                     let max_width = match quality {
@@ -1178,7 +1186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     screen_capture_engine.start_capture(
                                         stream_id.clone(),
                                         identity.public_key_hex(),
-                                        args.nick.clone(),
+                                        my_nick.clone(),
                                         monitor_idx,
                                         30, // 30 FPS com H.264
                                         max_width,
@@ -1191,7 +1199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
                             ChatAction::ScreenStop => {
-                                if screen_capture_engine.is_streaming_handle().load(Ordering::Relaxed) {
+                                if screen_capture_engine.is_streaming() {
                                     screen_capture_engine.stop_capture();
                                     println!("📺 Transmissão de tela ENCERRADA.");
                                 } else {
@@ -1238,7 +1246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let msg = ChatMessage {
                                     channel_id: current_channel.clone(),
                                     author_pubkey: identity.public_key_hex(),
-                                    author_name: args.nick.clone(),
+                                    author_name: my_nick.clone(),
                                     text: trimmed.clone(),
                                     timestamp: now,
                                     signature,
@@ -1274,55 +1282,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if args.daemon {
                             println!("📡 Endereço de escuta ativo: {}", address);
                         }
-                        if !port_reported {
-                            // Extrai a porta atribuída pelo OS (TCP ou UDP)
-                            for proto in address.iter() {
-                                match proto {
-                                    libp2p::multiaddr::Protocol::Tcp(p) | libp2p::multiaddr::Protocol::Udp(p) => {
-                                        let _ = tx_assigned_port.send(p).await;
-                                        port_reported = true;
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
                     }
                     libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         connected_peers.insert(peer_id);
-                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Conexão P2P com {}", peer_id)));
-                        if args.daemon {
-                            println!("🤝 Conexão P2P Direta estabelecida com: {} via {:?}", peer_id, endpoint.get_remote_address());
-                        }
+                        // Com a DHT ativa, a maioria das conexões é com nós do IPFS; os pares Anarchord
+                        // aparecem na UI quando o Identify confirma a identidade
+                        tracing::debug!("Conexão P2P com {} via {:?}", peer_id, endpoint.get_remote_address());
                     }
                     libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. } => {
                         if num_established == 0 {
                             connected_peers.remove(&peer_id);
-                            let _ = tx_ui_event.send(UiEvent::PeerDisconnected(peer_id.to_string()));
-                            if args.daemon {
+                            relay_manager.remove_peer(&peer_id);
+                            if peer_metadata.contains_key(&peer_id) {
+                                let _ = tx_ui_event.send(UiEvent::PeerDisconnected(peer_id.to_string()));
+                                publish_channel_members(&node, &peer_metadata, &current_channel, &current_topic, &tx_ui_event);
+                            }
+                            if args.daemon && peer_metadata.contains_key(&peer_id) {
                                 println!("👋 Conexão fechada com: {} (Motivo: {:?})", peer_id, cause);
+                            } else {
+                                tracing::debug!("Conexão fechada com {}: {:?}", peer_id, cause);
                             }
                         }
                     }
                     libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Identify(
                         libp2p::identify::Event::Received { peer_id, info, .. }
                     )) => {
-                        // Extrai Nickname e PubKey do agent_version ("anarchord:nick:pubkey")
-                        if info.agent_version.starts_with("anarchord:") {
-                            let parts: Vec<&str> = info.agent_version.split(':').collect();
-                            if parts.len() >= 3 {
-                                let nick = parts[1].to_string();
-                                let pubkey = parts[2].to_string();
-                                peer_metadata.insert(peer_id, (nick.clone(), pubkey.clone()));
-                                let _ = tx_ui_event.send(UiEvent::PeerConnected {
-                                    peer_id: peer_id.to_string(),
-                                    nick: nick.clone(),
-                                    pubkey: pubkey.clone(),
-                                });
-                                if args.daemon {
-                                    println!("✨ Identidade confirmada: {} é '{}' (User ID: {})", peer_id, nick, pubkey);
-                                }
+                        // Alimenta a tabela de roteamento da DHT com os endereços de quem fala Kademlia
+                        if info.protocols.contains(&libp2p::kad::PROTOCOL_NAME) {
+                            for addr in &info.listen_addrs {
+                                node.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
                             }
+                        }
+                        // Pares que oferecem Circuit Relay v2 (HOP) viram candidatos a reserva
+                        if info.protocols.contains(&libp2p::relay::HOP_PROTOCOL_NAME) {
+                            relay_manager.add_candidate(peer_id, &info.listen_addrs);
+                            request_relay_reservations(&mut node, &mut relay_manager, &tx_ui_event, args.daemon);
+                        }
+
+                        // Extrai Nickname e PubKey do agent_version ("anarchord:nick:pubkey")
+                        if let Some((nick, pubkey)) = parse_agent_version(&info.agent_version) {
+                            peer_metadata.insert(peer_id, (nick.clone(), pubkey.clone()));
+                            let _ = tx_ui_event.send(UiEvent::PeerConnected {
+                                peer_id: peer_id.to_string(),
+                                nick: nick.clone(),
+                                pubkey: pubkey.clone(),
+                            });
+                            if args.daemon {
+                                println!("✨ Identidade confirmada: {} é '{}' (User ID: {})", peer_id, nick, pubkey);
+                            }
+                            publish_channel_members(&node, &peer_metadata, &current_channel, &current_topic, &tx_ui_event);
+                        }
+                    }
+                    // Presença na sala: um par entrou ou saiu de algum tópico Gossipsub
+                    libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(
+                        libp2p::gossipsub::Event::Subscribed { topic, .. }
+                        | libp2p::gossipsub::Event::Unsubscribed { topic, .. }
+                    )) => {
+                        if topic == current_topic.hash() {
+                            publish_channel_members(&node, &peer_metadata, &current_channel, &current_topic, &tx_ui_event);
                         }
                     }
                     libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(
@@ -1573,6 +1590,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tracing::debug!("mDNS expired: {} em {}", peer_id, multiaddr);
                         }
                     }
+                    // Outros nós Anarchord encontrados na DHT: os endereços deles ficam disponíveis
+                    // para o Kademlia enquanto a consulta está ativa, então discamos pelo PeerId
+                    libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Kademlia(
+                        libp2p::kad::Event::OutboundQueryProgressed {
+                            result: libp2p::kad::QueryResult::GetProviders(Ok(
+                                libp2p::kad::GetProvidersOk::FoundProviders { providers, .. }
+                            )),
+                            ..
+                        }
+                    )) => {
+                        for provider in providers {
+                            if provider != node.peer_id && !connected_peers.contains(&provider) {
+                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🌍 Par Anarchord encontrado via DHT: {}", provider)));
+                                if args.daemon {
+                                    println!("🌍 Par Anarchord encontrado via DHT: {}", provider);
+                                }
+                                let _ = node.swarm.dial(provider);
+                            }
+                        }
+                    }
+                    // Endereço externo confirmado (AutoNAT público ou reserva em relay aceita):
+                    // (re)anuncia o nó na DHT para que o registro de provedor carregue esse endereço
+                    libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
+                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🌐 Endereço externo confirmado: {}", address)));
+                        if args.daemon {
+                            println!("🌐 Endereço externo confirmado: {}", address);
+                        }
+                        if !args.no_auto_bootstrap {
+                            node.dht_start_providing();
+                        }
+                    }
+                    libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Autonat(
+                        libp2p::autonat::Event::StatusChanged { new, .. }
+                    )) => {
+                        match new {
+                            libp2p::autonat::NatStatus::Private => {
+                                let _ = tx_ui_event.send(UiEvent::SystemLog("🧱 AutoNAT: nó atrás de NAT. Buscando relays públicos...".to_string()));
+                                if args.daemon {
+                                    println!("🧱 AutoNAT: nó atrás de NAT. Buscando relays públicos...");
+                                }
+                                relay_manager.set_behind_nat(true);
+                                request_relay_reservations(&mut node, &mut relay_manager, &tx_ui_event, args.daemon);
+                            }
+                            libp2p::autonat::NatStatus::Public(addr) => {
+                                tracing::info!("AutoNAT: nó publicamente acessível em {}", addr);
+                                relay_manager.set_behind_nat(false);
+                            }
+                            libp2p::autonat::NatStatus::Unknown => {}
+                        }
+                    }
+                    libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(
+                        libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal, .. }
+                    )) => {
+                        if !renewal {
+                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🛰️ Reserva aceita no relay {}", relay_peer_id)));
+                            if args.daemon {
+                                println!("🛰️ Reserva aceita no relay {}", relay_peer_id);
+                            }
+                        }
+                    }
+                    libp2p::swarm::SwarmEvent::ListenerClosed { listener_id, reason, .. } => {
+                        if let Some(relay) = relay_manager.listener_closed(listener_id) {
+                            tracing::info!("Reserva no relay {} encerrada: {:?}", relay, reason);
+                            request_relay_reservations(&mut node, &mut relay_manager, &tx_ui_event, args.daemon);
+                        }
+                    }
+                    libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(
+                        libp2p::dcutr::Event { remote_peer_id, result }
+                    )) => {
+                        match result {
+                            Ok(_) => {
+                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🕳️ Hole punching OK: conexão direta com {}", remote_peer_id)));
+                                if args.daemon {
+                                    println!("🕳️ Hole punching OK: conexão direta com {}", remote_peer_id);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::info!("Hole punching com {} falhou (segue via relay): {}", remote_peer_id, e);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1580,22 +1678,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Graceful Shutdown: Desanuncia o par do BitTorrent Tracker com event = stopped
-    let port = assigned_listen_port.load(Ordering::SeqCst);
-    if !args.no_auto_bootstrap && port > 0 {
+    if !args.no_auto_bootstrap {
         println!("📡 Removendo nó da lista de pares dos Open Trackers (event = stopped)...");
         let p2p_id_bytes = node.peer_id.to_bytes();
         let mut bt_peer_id = [0u8; 20];
         let copy_len = p2p_id_bytes.len().min(20);
         bt_peer_id[0..copy_len].copy_from_slice(&p2p_id_bytes[0..copy_len]);
-        let info_hash = make_info_hash("global-discord-discovery");
+        let info_hash = make_info_hash(DHT_DISCOVERY_NAMESPACE);
 
         for tracker in OPENTRACKER_SERVERS {
-            let _ = TorrentTrackerClient::announce_stopped(tracker, &info_hash, &bt_peer_id, port);
+            let _ = TorrentTrackerClient::announce_stopped(tracker, &info_hash, &bt_peer_id, listen_port);
         }
     }
 
     println!("👋 Anarchord encerrado com sucesso.");
     Ok(())
+}
+
+/// Envia à UI os pares Anarchord inscritos no tópico do canal de texto atual (presença na sala)
+fn publish_channel_members(
+    node: &P2PNode,
+    peer_metadata: &HashMap<libp2p::PeerId, (String, String)>,
+    channel: &str,
+    topic: &IdentTopic,
+    tx_ui_event: &tokio::sync::mpsc::UnboundedSender<UiEvent>,
+) {
+    let members = presence::channel_members(&node.swarm.behaviour().gossipsub, peer_metadata, topic);
+    let _ = tx_ui_event.send(UiEvent::ChannelMembers {
+        channel: channel.to_string(),
+        members,
+    });
+}
+
+/// Pede reserva nos relays candidatos que faltam (só age quando o AutoNAT indicou NAT)
+fn request_relay_reservations(
+    node: &mut P2PNode,
+    relay_manager: &mut RelayManager,
+    tx_ui_event: &tokio::sync::mpsc::UnboundedSender<UiEvent>,
+    is_daemon: bool,
+) {
+    for (relay, circuit_addr) in relay_manager.next_reservations() {
+        match node.swarm.listen_on(circuit_addr.clone()) {
+            Ok(listener_id) => {
+                relay_manager.track_reservation(listener_id, relay);
+                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🛰️ Pedindo reserva no relay {}", relay)));
+                if is_daemon {
+                    println!("🛰️ Pedindo reserva no relay: {}", circuit_addr);
+                }
+            }
+            Err(e) => tracing::warn!("Falha ao pedir reserva em {}: {:?}", circuit_addr, e),
+        }
+    }
 }
 
 #[cfg(test)]

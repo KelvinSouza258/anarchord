@@ -36,6 +36,11 @@ pub enum UiEvent {
     },
     /// Par desconectado
     PeerDisconnected(String),
+    /// Pares inscritos no tópico de um canal de texto (presença na sala)
+    ChannelMembers {
+        channel: String,
+        members: Vec<String>,
+    },
     /// Mudança de canal de texto ativo
     ChannelChanged(String),
     /// Mudança de canal de voz ativo (None se desconectado de voz)
@@ -131,67 +136,7 @@ impl TerminalUi {
             tokio::select! {
                 // Processa eventos da malha P2P
                 Some(evt) = rx_events.recv() => {
-                    match evt {
-                        UiEvent::ChatMessage { channel, author, text } => {
-                            self.messages.push(format!("[#{}] {}: {}", channel, author, text));
-                            self.channel_members.entry(channel.clone()).or_default().insert(author);
-                        }
-                        UiEvent::ChannelChanged(new_channel) => {
-                            self.current_channel = new_channel.clone();
-                            self.channel_members.entry(new_channel).or_default().insert(self.my_nick.clone());
-                        }
-                        UiEvent::VoiceChannelChanged(opt_channel) => {
-                            self.current_voice_channel = opt_channel.clone();
-                            if opt_channel.is_none() {
-                                self.voice_members.clear();
-                                self.speakers.clear();
-                            } else {
-                                if !self.voice_members.contains(&self.my_nick) {
-                                    self.voice_members.push(self.my_nick.clone());
-                                }
-                            }
-                        }
-                        UiEvent::VoiceRoomMembers(members) => {
-                            self.voice_members = members;
-                        }
-                        UiEvent::SystemLog(log) => {
-                            self.last_status_bar = log.clone();
-                            self.messages.push(format!("⚙️  {}", log));
-                        }
-                        UiEvent::PeerConnected { peer_id, nick, pubkey } => {
-                            if let Some(pos) = self.peers.iter().position(|(pid, _, _)| pid == &peer_id) {
-                                self.peers[pos] = (peer_id, nick.clone(), pubkey);
-                            } else {
-                                self.peers.push((peer_id, nick.clone(), pubkey));
-                                self.messages.push(format!("🤝 Par conectado: {}", nick));
-                            }
-                        }
-                        UiEvent::PeerDisconnected(peer_id) => {
-                            if let Some(pos) = self.peers.iter().position(|(pid, _, _)| pid == &peer_id) {
-                                let (_, nick, _) = self.peers.remove(pos);
-                                self.messages.push(format!("👋 Par desconectado: {}", nick));
-                            } else {
-                                self.messages.push(format!("👋 Par desconectado: {}", peer_id));
-                            }
-                        }
-                        UiEvent::VoiceActivity { nick, speaking } => {
-                            if speaking {
-                                if !self.speakers.contains(&nick) {
-                                    self.speakers.push(nick);
-                                }
-                            } else {
-                                self.speakers.retain(|n| n != &nick);
-                            }
-                        }
-                        UiEvent::FileTransferProgress { file_name, percentage, is_download } => {
-                            if percentage >= 100.0 {
-                                self.file_transfer = None;
-                                self.messages.push(format!("✅ Arquivo '{}' concluído com sucesso!", file_name));
-                            } else {
-                                self.file_transfer = Some((file_name, percentage, is_download));
-                            }
-                        }
-                    }
+                    self.handle_event(evt);
                 }
 
                 // Processa teclado e mouse do usuário de forma não bloqueante
@@ -259,6 +204,77 @@ impl TerminalUi {
                             _ => {}
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Aplica um evento da malha P2P ao estado da UI (separado do loop para ser testável)
+    fn handle_event(&mut self, evt: UiEvent) {
+        match evt {
+            UiEvent::ChatMessage { channel, author, text } => {
+                self.messages.push(format!("[#{}] {}: {}", channel, author, text));
+                self.channel_members.entry(channel.clone()).or_default().insert(author);
+            }
+            UiEvent::ChannelChanged(new_channel) => {
+                self.current_channel = new_channel.clone();
+                self.channel_members.entry(new_channel).or_default().insert(self.my_nick.clone());
+            }
+            UiEvent::VoiceChannelChanged(opt_channel) => {
+                self.current_voice_channel = opt_channel.clone();
+                if opt_channel.is_none() {
+                    self.voice_members.clear();
+                    self.speakers.clear();
+                } else {
+                    if !self.voice_members.contains(&self.my_nick) {
+                        self.voice_members.push(self.my_nick.clone());
+                    }
+                }
+            }
+            UiEvent::VoiceRoomMembers(members) => {
+                self.voice_members = members;
+            }
+            UiEvent::SystemLog(log) => {
+                self.last_status_bar = log.clone();
+                self.messages.push(format!("⚙️  {}", log));
+            }
+            UiEvent::ChannelMembers { channel, members } => {
+                let set = self.channel_members.entry(channel).or_default();
+                set.clear();
+                set.extend(members);
+                set.insert(self.my_nick.clone());
+            }
+            UiEvent::PeerConnected { peer_id, nick, pubkey } => {
+                if let Some(pos) = self.peers.iter().position(|(pid, _, _)| pid == &peer_id) {
+                    self.peers[pos] = (peer_id, nick.clone(), pubkey);
+                } else {
+                    self.peers.push((peer_id, nick.clone(), pubkey));
+                    self.messages.push(format!("🤝 Par conectado: {}", nick));
+                }
+            }
+            UiEvent::PeerDisconnected(peer_id) => {
+                if let Some(pos) = self.peers.iter().position(|(pid, _, _)| pid == &peer_id) {
+                    let (_, nick, _) = self.peers.remove(pos);
+                    self.messages.push(format!("👋 Par desconectado: {}", nick));
+                } else {
+                    self.messages.push(format!("👋 Par desconectado: {}", peer_id));
+                }
+            }
+            UiEvent::VoiceActivity { nick, speaking } => {
+                if speaking {
+                    if !self.speakers.contains(&nick) {
+                        self.speakers.push(nick);
+                    }
+                } else {
+                    self.speakers.retain(|n| n != &nick);
+                }
+            }
+            UiEvent::FileTransferProgress { file_name, percentage, is_download } => {
+                if percentage >= 100.0 {
+                    self.file_transfer = None;
+                    self.messages.push(format!("✅ Arquivo '{}' concluído com sucesso!", file_name));
+                } else {
+                    self.file_transfer = Some((file_name, percentage, is_download));
                 }
             }
         }
@@ -367,7 +383,7 @@ impl TerminalUi {
         }
 
         // Título com membros da sala e total no Swarm P2P
-        let room_members_title = format!(" Membros da Sala #{:<8} [Swarm: {}] ", self.current_channel, self.peers.len());
+        let room_members_title = format!(" Membros #{} [Swarm: {}] ", self.current_channel, self.peers.len());
         let peers_list = List::new(room_members_items).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -474,5 +490,126 @@ impl TerminalUi {
         execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
         terminal.show_cursor()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn ui_for(nick: &str) -> TerminalUi {
+        TerminalUi::new(nick.to_string(), "abcdef0123".to_string(), Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Renderiza a UI num terminal virtual e devolve o texto da tela
+    fn render(ui: &mut TerminalUi) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| ui.draw_ui(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn bob_connected() -> UiEvent {
+        UiEvent::PeerConnected {
+            peer_id: "12D3KooWBob".to_string(),
+            nick: "Bob".to_string(),
+            pubkey: "224d733c71f8".to_string(),
+        }
+    }
+
+    fn members(channel: &str, nicks: &[&str]) -> UiEvent {
+        UiEvent::ChannelMembers {
+            channel: channel.to_string(),
+            members: nicks.iter().map(|n| n.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_own_nick_always_listed_in_room() {
+        let mut ui = ui_for("Alice");
+        let screen = render(&mut ui);
+        assert!(screen.contains("Alice (Você)"), "{}", screen);
+        assert!(screen.contains("[Swarm: 0]"), "{}", screen);
+    }
+
+    /// Regressão: par conectado e presente na sala aparece em "Membros da Sala" sem ter mandado mensagem
+    #[test]
+    fn test_present_peer_listed_in_room_without_chatting() {
+        let mut ui = ui_for("Alice");
+        ui.handle_event(bob_connected());
+        ui.handle_event(members("geral", &["Bob"]));
+
+        let screen = render(&mut ui);
+        assert!(screen.contains("Bob (224d73)"), "Bob deveria estar na lista de membros:\n{}", screen);
+        assert!(screen.contains("[Swarm: 1]"), "{}", screen);
+    }
+
+    #[test]
+    fn test_peer_leaving_room_is_removed_from_members() {
+        let mut ui = ui_for("Alice");
+        ui.handle_event(bob_connected());
+        ui.handle_event(members("geral", &["Bob"]));
+        ui.handle_event(members("geral", &[]));
+
+        let screen = render(&mut ui);
+        assert!(!screen.contains("Bob (224d73)"), "Bob não deveria estar na lista de membros:\n{}", screen);
+        assert!(screen.contains("Alice (Você)"), "{}", screen);
+    }
+
+    #[test]
+    fn test_members_of_other_channel_not_shown() {
+        let mut ui = ui_for("Alice");
+        ui.handle_event(bob_connected());
+        ui.handle_event(members("jogos", &["Bob"]));
+
+        let screen = render(&mut ui);
+        assert!(!screen.contains("Bob (224d73)"), "Bob não deveria estar na lista de membros:\n{}", screen);
+
+        ui.handle_event(UiEvent::ChannelChanged("jogos".to_string()));
+        let screen = render(&mut ui);
+        assert!(screen.contains("Bob (224d73)"), "{}", screen);
+        assert!(screen.contains("#jogos"), "{}", screen);
+    }
+
+    #[test]
+    fn test_disconnect_updates_swarm_count_and_logs() {
+        let mut ui = ui_for("Alice");
+        ui.handle_event(bob_connected());
+        ui.handle_event(UiEvent::PeerDisconnected("12D3KooWBob".to_string()));
+
+        let screen = render(&mut ui);
+        assert!(screen.contains("[Swarm: 0]"), "{}", screen);
+        assert!(screen.contains("Par desconectado: Bob"), "{}", screen);
+    }
+
+    #[test]
+    fn test_chat_message_rendered() {
+        let mut ui = ui_for("Alice");
+        ui.handle_event(UiEvent::ChatMessage {
+            channel: "geral".to_string(),
+            author: "Bob".to_string(),
+            text: "olá mesh".to_string(),
+        });
+
+        let screen = render(&mut ui);
+        assert!(screen.contains("Bob: olá mesh"), "{}", screen);
+    }
+
+    #[test]
+    fn test_voice_room_members_rendered() {
+        let mut ui = ui_for("Alice");
+        ui.handle_event(UiEvent::VoiceChannelChanged(Some("sala1".to_string())));
+        ui.handle_event(UiEvent::VoiceRoomMembers(vec!["Alice".to_string(), "Bob".to_string()]));
+
+        let screen = render(&mut ui);
+        assert!(screen.contains("sala1"), "{}", screen);
+        assert!(screen.contains("Bob"), "{}", screen);
     }
 }

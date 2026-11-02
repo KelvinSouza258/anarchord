@@ -5,6 +5,7 @@ pub mod protocol;
 pub mod node;
 pub mod bootstrap;
 pub mod tracker;
+pub mod relay;
 pub mod voice;
 pub mod file_transfer;
 pub mod screen;
@@ -12,9 +13,13 @@ pub mod screen;
 pub use identity::UserIdentity;
 pub use server::{ServerMetadata, ServerPayload, Channel, ChannelType};
 pub use api::{CoreCommand, CoreEvent, ChatMessage};
-pub use node::P2PNode;
+pub use node::{
+    dht_discovery_key, make_agent_version, parse_agent_version, P2PNode, AGENT_VERSION_PREFIX,
+    DHT_DISCOVERY_NAMESPACE,
+};
 pub use bootstrap::{IPFS_BOOTSTRAP_NODES, OPENTRACKER_SERVERS, get_ipfs_bootstrap_multiaddrs};
 pub use tracker::{TorrentTrackerClient, make_info_hash};
+pub use relay::{RelayManager, MAX_RELAY_RESERVATIONS};
 pub use file_transfer::{
     calculate_file_hash, chunk_file, FileChunk, FileDecision, FileOffer, FileReceiver,
     FileTransferMessage, CHUNK_SIZE,

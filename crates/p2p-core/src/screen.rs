@@ -3,7 +3,7 @@ use openh264::formats::{RgbaSliceU8, YUVBuffer};
 use openh264::OpenH264API;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use xcap::Monitor;
 
@@ -51,18 +51,33 @@ impl ScreenPacket {
 
 /// Motor de Captura de Tela P2P com suporte a H.264
 pub struct ScreenCaptureEngine {
-    is_streaming: Arc<AtomicBool>,
+    /// Flag da sessão de captura atual. Cada `start_*` cria uma flag nova, de modo que as threads
+    /// de uma sessão anterior (que ficam com a flag antiga) encerram mesmo que um novo start
+    /// aconteça logo após o stop, antes de elas perceberem a parada.
+    session: Mutex<Arc<AtomicBool>>,
 }
 
 impl ScreenCaptureEngine {
     pub fn new() -> Self {
         Self {
-            is_streaming: Arc::new(AtomicBool::new(false)),
+            session: Mutex::new(Arc::new(AtomicBool::new(false))),
         }
     }
 
-    pub fn is_streaming_handle(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.is_streaming)
+    pub fn is_streaming(&self) -> bool {
+        self.lock_session().load(Ordering::SeqCst)
+    }
+
+    /// Encerra a sessão anterior (se houver) e retorna a flag de uma sessão nova, já ativa
+    fn begin_session(&self) -> Arc<AtomicBool> {
+        let mut session = self.lock_session();
+        session.store(false, Ordering::SeqCst);
+        *session = Arc::new(AtomicBool::new(true));
+        Arc::clone(&session)
+    }
+
+    fn lock_session(&self) -> std::sync::MutexGuard<'_, Arc<AtomicBool>> {
+        self.session.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn list_screens() -> Vec<ScreenInfo> {
@@ -112,9 +127,8 @@ impl ScreenCaptureEngine {
     ) where
         F: FnMut(ScreenPacket) + Send + 'static,
     {
-        self.is_streaming.store(true, Ordering::SeqCst);
-        let is_running = Arc::clone(&self.is_streaming);
-        let is_running_capture = Arc::clone(&self.is_streaming);
+        let is_running = self.begin_session();
+        let is_running_capture = Arc::clone(&is_running);
         let fps = target_fps.clamp(10, 60);
         let frame_interval = Duration::from_millis((1000 / fps) as u64);
 
@@ -271,7 +285,7 @@ impl ScreenCaptureEngine {
     }
 
     pub fn stop_capture(&self) {
-        self.is_streaming.store(false, Ordering::SeqCst);
+        self.lock_session().store(false, Ordering::SeqCst);
     }
 
     /// Inicia uma transmissão de vídeo sintético animado em H.264
@@ -285,8 +299,7 @@ impl ScreenCaptureEngine {
     ) where
         F: FnMut(ScreenPacket) + Send + 'static,
     {
-        self.is_streaming.store(true, Ordering::SeqCst);
-        let is_running = Arc::clone(&self.is_streaming);
+        let is_running = self.begin_session();
         let fps = target_fps.clamp(10, 60);
         let frame_interval = Duration::from_millis((1000 / fps) as u64);
 
@@ -401,5 +414,29 @@ impl ScreenCaptureEngine {
         }
 
         (width, height, pixels)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_restart_does_not_revive_previous_session() {
+        let engine = ScreenCaptureEngine::new();
+        assert!(!engine.is_streaming());
+
+        let old_session = engine.begin_session();
+        engine.stop_capture();
+        let new_session = engine.begin_session();
+
+        // As threads da sessão antiga continuam vendo a parada mesmo após o novo start
+        assert!(!old_session.load(Ordering::SeqCst));
+        assert!(new_session.load(Ordering::SeqCst));
+        assert!(engine.is_streaming());
+
+        engine.stop_capture();
+        assert!(!new_session.load(Ordering::SeqCst));
+        assert!(!engine.is_streaming());
     }
 }
