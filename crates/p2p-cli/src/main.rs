@@ -867,9 +867,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         println!("   📄 Arquivo : {}", offer.file_name);
                                         println!("   📏 Tamanho : {:.2} MB ({} bytes em {} blocos de 64KB)", offer.file_size as f64 / (1024.0 * 1024.0), offer.file_size, offer.total_chunks);
                                         println!("   🔑 Hash    : {}", offer.file_hash);
-                                        println!("   💡 Para aceitar: /accept {}", &offer.file_hash[..8]);
-                                        println!("   💡 Para rejeitar: /reject {}\n", &offer.file_hash[..8]);
-                                        pending_incoming_offers.insert(offer.file_hash.clone(), offer);
+
+                                        // Se estiver rodando como Daemon (modo bot/servidor), aceita automaticamente
+                                        if args.daemon {
+                                            println!("🤖 [MODO DAEMON] Aceitando transferência automaticamente...");
+                                            active_file_receivers.insert(
+                                                offer.file_hash.clone(),
+                                                FileReceiver::new(offer.file_name.clone(), offer.file_size, offer.total_chunks),
+                                            );
+                                            let decision = FileDecision {
+                                                file_hash: offer.file_hash.clone(),
+                                                accepted: true,
+                                                responder_pubkey: identity.public_key_hex(),
+                                            };
+                                            let msg = FileTransferMessage::Decision(decision);
+                                            if let Ok(bytes) = msg.to_bytes() {
+                                                let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
+                                            }
+                                        } else {
+                                            println!("   💡 Para aceitar: /accept {}", &offer.file_hash[..8]);
+                                            println!("   💡 Para rejeitar: /reject {}\n", &offer.file_hash[..8]);
+                                            pending_incoming_offers.insert(offer.file_hash.clone(), offer);
+                                        }
                                     }
                                 }
                                 FileTransferMessage::Decision(decision) => {
