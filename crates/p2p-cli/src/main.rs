@@ -987,19 +987,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
-                        if connected_peers.contains(&peer_id) {
-                            if args.daemon {
-                                println!("⚠️  Conexão redundante detectada com o par {}. Fechando conexão secundária...", peer_id);
-                            }
-                            // Fecha apenas ESTA conexão específica, mantendo a primeira intacta!
-                            let _ = node.swarm.close_connection(connection_id);
-                        } else {
-                            connected_peers.insert(peer_id);
-                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Conexão P2P com {}", peer_id)));
-                            if args.daemon {
-                                println!("🤝 Conexão P2P Direta estabelecida com: {} via {:?}", peer_id, endpoint.get_remote_address());
-                            }
+                    libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        connected_peers.insert(peer_id);
+                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Conexão P2P com {}", peer_id)));
+                        if args.daemon {
+                            println!("🤝 Conexão P2P Direta estabelecida com: {} via {:?}", peer_id, endpoint.get_remote_address());
                         }
                     }
                     libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. } => {
@@ -1133,7 +1125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if let Some((file_name, data)) = pending_outgoing_files.get(&decision.file_hash) {
                                         if decision.accepted {
                                             let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Transferência aceita de '{}'! Enviando blocos...", file_name)));
-                                            println!("\n🎉 O destinatário ACEITOU a transferência de '{}'! Transmitindo blocos P2P...", file_name);
+                                            if args.daemon {
+                                                println!("\n🎉 O destinatário ACEITOU a transferência de '{}'! Transmitindo blocos P2P...", file_name);
+                                            }
                                             let chunks = chunk_file(&decision.file_hash, data);
                                             let total = chunks.len();
                                             for (idx, chunk) in chunks.into_iter().enumerate() {
@@ -1147,15 +1141,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     percentage: pct,
                                                     is_download: false,
                                                 });
-                                                if (idx + 1) % 10 == 0 || (idx + 1) == total {
+                                                if args.daemon && ((idx + 1) % 10 == 0 || (idx + 1) == total) {
                                                     println!("   📤 Enviado: {:.1}% ({}/{} blocos)", pct, idx + 1, total);
                                                 }
                                             }
-                                            println!("✅ Arquivo '{}' enviado com sucesso!\n", file_name);
+                                            if args.daemon {
+                                                println!("✅ Arquivo '{}' enviado com sucesso!\n", file_name);
+                                            }
                                             pending_outgoing_files.remove(&decision.file_hash);
                                         } else {
                                             let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Transferência de '{}' foi recusada pelo destinatário.", file_name)));
-                                            println!("\n❌ O destinatário REJEITOU a transferência de '{}'.", file_name);
+                                            if args.daemon {
+                                                println!("\n❌ O destinatário REJEITOU a transferência de '{}'.", file_name);
+                                            }
                                             pending_outgoing_files.remove(&decision.file_hash);
                                         }
                                     }
@@ -1169,7 +1167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             percentage: pct,
                                             is_download: true,
                                         });
-                                        if (chunk.chunk_index + 1) % 10 == 0 || receiver.is_complete() {
+                                        if args.daemon && ((chunk.chunk_index + 1) % 10 == 0 || receiver.is_complete()) {
                                             println!("   📥 Baixando '{}': {:.1}%", receiver.file_name, pct);
                                         }
 
@@ -1183,14 +1181,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     let save_path = download_dir.join(&file_name);
                                                     if let Ok(_) = std::fs::write(&save_path, &completed_bytes) {
                                                         let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Arquivo '{}' salvo com sucesso em downloads/", file_name)));
-                                                        println!("\n💾 [ARQUIVO CONCLUÍDO] '{}' salvo com sucesso em: {:?}", file_name, save_path);
-                                                        println!("   🔒 Integridade SHA-256 verificada com sucesso!\n");
-                                                    } else {
+                                                        if args.daemon {
+                                                            println!("\n💾 [ARQUIVO CONCLUÍDO] '{}' salvo com sucesso em: {:?}", file_name, save_path);
+                                                            println!("   🔒 Integridade SHA-256 verificada com sucesso!\n");
+                                                        }
+                                                    } else if args.daemon {
                                                         println!("❌ Erro ao salvar arquivo em {:?}", save_path);
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    println!("❌ Falha na verificação de integridade do arquivo: {}", e);
+                                                    if args.daemon {
+                                                        println!("❌ Falha na verificação de integridade do arquivo: {}", e);
+                                                    }
                                                 }
                                             }
                                             active_file_receivers.remove(&file_hash_clone);
