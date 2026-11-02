@@ -261,8 +261,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Inicialização do Subsistema de Áudio P2P
-    let voice_engine_res = VoiceEngine::start();
+    // Inicialização do Subsistema de Áudio P2P (somente se não estiver em modo daemon headless sem sintetizador)
+    let voice_engine_res = if args.daemon && !args.synth_audio && args.auto_voice.is_none() {
+        Err(p2p_core::voice::AudioEngineError::Init("Modo daemon headless sem captura de microfone".to_string()))
+    } else {
+        VoiceEngine::start()
+    };
     let (voice_engine, mut voice_mic_rx) = match voice_engine_res {
         Ok((engine, rx)) => {
             if args.daemon {
