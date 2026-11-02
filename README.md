@@ -121,7 +121,7 @@ While inside the chat console, you can use built-in slash commands:
 - [x] Multi-subnet automated End-to-End Docker test harness (`tests/run_docker_tests.py`).
 
 ### Phase 2: Decentralized Text Mesh, TUI & File Transfer ✅ (Completed)
-- [x] GossipSub channel routing (e.g. `p2p-discord/channel/<channel>`).
+- [x] GossipSub channel routing (e.g. `p2p-anarchord/channel/<channel>`).
 - [x] Cryptographic verification: All messages signed by author's private key.
 - [x] Interactive Terminal User Interface (**Ratatui**) with dynamic online peers, blinking input cursor, and mouse click interactions.
 - [x] Direct P2P File Transfer subsystem:

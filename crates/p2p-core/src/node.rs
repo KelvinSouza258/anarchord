@@ -42,7 +42,7 @@ impl P2PNode {
             .with_behaviour(|key, relay_client| {
                 // 1. Kademlia DHT com protocolo customizado de salas P2P
                 let kad_store = MemoryStore::new(key.public().to_peer_id());
-                let kad_protocol = StreamProtocol::new("/p2p-discord/kad/1.0.0");
+                let kad_protocol = StreamProtocol::new("/p2p-anarchord/kad/1.0.0");
                 let kad_config = kad::Config::new(kad_protocol);
                 let kademlia = kad::Behaviour::with_config(key.public().to_peer_id(), kad_store, kad_config);
 
@@ -68,7 +68,7 @@ impl P2PNode {
                 // 3. Identify com User Agent contendo o Nickname e PubKey
                 let user_agent = format!("anarchord:{}:{}", identity.profile.display_name, identity.public_key_hex());
                 let identify_config = identify::Config::new(
-                    "/p2p-discord/1.0.0".to_string(),
+                    "/p2p-anarchord/1.0.0".to_string(),
                     key.public(),
                 )
                 .with_agent_version(user_agent);

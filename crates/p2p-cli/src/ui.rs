@@ -11,6 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
     Terminal,
 };
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -35,6 +36,12 @@ pub enum UiEvent {
     },
     /// Par desconectado
     PeerDisconnected(String),
+    /// Mudança de canal de texto ativo
+    ChannelChanged(String),
+    /// Mudança de canal de voz ativo (None se desconectado de voz)
+    VoiceChannelChanged(Option<String>),
+    /// Membros ativos na sala de voz atual
+    VoiceRoomMembers(Vec<String>),
     /// Indicador de voz de alguém falando (Nick, energy)
     VoiceActivity {
         nick: String,
@@ -60,10 +67,13 @@ pub struct TerminalUi {
     my_nick: String,
     my_pubkey: String,
     current_channel: String,
+    current_voice_channel: Option<String>,
     input: String,
     messages: Vec<String>,
-    peers: Vec<(String, String, String)>, // (PeerId, Nick, PubKey)
-    speakers: Vec<String>,        // Nomes de quem está falando agora
+    peers: Vec<(String, String, String)>, // (PeerId, Nick, PubKey) - Todo o Swarm
+    voice_members: Vec<String>,           // Membros presentes na sala de voz ativa
+    channel_members: HashMap<String, HashSet<String>>, // Canal -> Nomes com presença ativa
+    speakers: Vec<String>,                // Nomes de quem está falando agora
     file_transfer: Option<(String, f32, bool)>, // (nome, pct, is_download)
     is_muted: Arc<AtomicBool>,
     peers_area: Rect,
@@ -72,16 +82,24 @@ pub struct TerminalUi {
 
 impl TerminalUi {
     pub fn new(my_nick: String, my_pubkey: String, is_muted: Arc<AtomicBool>) -> Self {
+        let mut channel_members = HashMap::new();
+        let mut geral_set = HashSet::new();
+        geral_set.insert(my_nick.clone());
+        channel_members.insert("geral".to_string(), geral_set);
+
         Self {
             my_nick,
             my_pubkey,
             current_channel: "geral".to_string(),
+            current_voice_channel: None,
             input: String::new(),
             messages: vec![
                 "🚀 Bem-vindo ao Anarchord P2P (100% Descentralizado)!".to_string(),
                 "💡 Clique em um par com o mouse para iniciar o envio de arquivo, ou digite /help.".to_string(),
             ],
             peers: Vec::new(),
+            voice_members: Vec::new(),
+            channel_members,
             speakers: Vec::new(),
             file_transfer: None,
             is_muted,
@@ -116,6 +134,25 @@ impl TerminalUi {
                     match evt {
                         UiEvent::ChatMessage { channel, author, text } => {
                             self.messages.push(format!("[#{}] {}: {}", channel, author, text));
+                            self.channel_members.entry(channel.clone()).or_default().insert(author);
+                        }
+                        UiEvent::ChannelChanged(new_channel) => {
+                            self.current_channel = new_channel.clone();
+                            self.channel_members.entry(new_channel).or_default().insert(self.my_nick.clone());
+                        }
+                        UiEvent::VoiceChannelChanged(opt_channel) => {
+                            self.current_voice_channel = opt_channel.clone();
+                            if opt_channel.is_none() {
+                                self.voice_members.clear();
+                                self.speakers.clear();
+                            } else {
+                                if !self.voice_members.contains(&self.my_nick) {
+                                    self.voice_members.push(self.my_nick.clone());
+                                }
+                            }
+                        }
+                        UiEvent::VoiceRoomMembers(members) => {
+                            self.voice_members = members;
                         }
                         UiEvent::SystemLog(log) => {
                             self.last_status_bar = log.clone();
@@ -294,43 +331,78 @@ impl TerminalUi {
         // Painel Lateral de Membros e Status de Voz
         let side_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(main_chunks[1]);
 
-        // Lista de Membros
+        // 1. Membros da Sala de Texto Atual (#canal)
         self.peers_area = side_chunks[0];
-        let peer_items: Vec<ListItem> = self
-            .peers
-            .iter()
-            .map(|(_pid, nick, pk)| {
-                let short_pk = if pk.len() >= 6 { &pk[..6] } else { pk };
-                ListItem::new(Line::from(vec![
-                    Span::styled("🟢 ", Style::default().fg(Color::Green)),
-                    Span::styled(nick.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" ({})", short_pk), Style::default().fg(Color::DarkGray)),
-                ]))
-            })
-            .collect();
+        let current_members = self.channel_members.get(&self.current_channel);
+        
+        let mut room_members_items: Vec<ListItem> = Vec::new();
+        let mut seen_nicks = HashSet::new();
 
-        let peers_list = List::new(peer_items).block(
+        // Usuário atual na sala
+        room_members_items.push(ListItem::new(Line::from(vec![
+            Span::styled("👤 ", Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{} (Você)", self.my_nick), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ])));
+        seen_nicks.insert(self.my_nick.clone());
+
+        // Pares ativos na sala atual
+        if let Some(members) = current_members {
+            for nick in members {
+                if seen_nicks.insert(nick.clone()) {
+                    let short_pk = self.peers.iter()
+                        .find(|(_, n, _)| n == nick)
+                        .map(|(_, _, pk)| if pk.len() >= 6 { format!(" ({})", &pk[..6]) } else { format!(" ({})", pk) })
+                        .unwrap_or_default();
+
+                    room_members_items.push(ListItem::new(Line::from(vec![
+                        Span::styled("🟢 ", Style::default().fg(Color::Green)),
+                        Span::styled(nick.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled(short_pk, Style::default().fg(Color::DarkGray)),
+                    ])));
+                }
+            }
+        }
+
+        // Título com membros da sala e total no Swarm P2P
+        let room_members_title = format!(" Membros da Sala #{:<8} [Swarm: {}] ", self.current_channel, self.peers.len());
+        let peers_list = List::new(room_members_items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Pares Online ({}) ", self.peers.len())),
+                .title(room_members_title),
         );
         f.render_widget(peers_list, side_chunks[0]);
 
-        // Atividade de Voz
-        let voice_items: Vec<ListItem> = if self.speakers.is_empty() {
-            vec![ListItem::new(Span::styled("  (Silêncio na sala)", Style::default().fg(Color::DarkGray)))]
+        // 2. Painel da Sala de Voz Atual
+        let voice_title = match &self.current_voice_channel {
+            Some(vchan) => format!(" Sala de Voz [🔊 {}] ({}) ", vchan, self.voice_members.len()),
+            None => " Sala de Voz [Desconectada] ".to_string(),
+        };
+
+        let voice_items: Vec<ListItem> = if self.current_voice_channel.is_none() {
+            vec![ListItem::new(Span::styled("  Use /voice join <sala> para entrar", Style::default().fg(Color::DarkGray)))]
+        } else if self.voice_members.is_empty() {
+            vec![ListItem::new(Span::styled("  (Nenhum participante conectado)", Style::default().fg(Color::DarkGray)))]
         } else {
-            self.speakers
+            self.voice_members
                 .iter()
                 .map(|name| {
-                    ListItem::new(Line::from(vec![
-                        Span::styled("🔊 ", Style::default().fg(Color::Cyan)),
-                        Span::styled(name.clone(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                        Span::styled(" [Falando...]", Style::default().fg(Color::Yellow)),
-                    ]))
+                    let is_speaking = self.speakers.contains(name);
+                    if is_speaking {
+                        ListItem::new(Line::from(vec![
+                            Span::styled("🔊 ", Style::default().fg(Color::Green)),
+                            Span::styled(name.clone(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                            Span::styled(" [Falando...]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        ]))
+                    } else {
+                        ListItem::new(Line::from(vec![
+                            Span::styled("🔈 ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(name.clone(), Style::default().fg(Color::White)),
+                            Span::styled(" [Ouvindo]", Style::default().fg(Color::DarkGray)),
+                        ]))
+                    }
                 })
                 .collect()
         };
@@ -338,7 +410,7 @@ impl TerminalUi {
         let voice_list = List::new(voice_items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Sala de Voz [🔊 geral] "),
+                .title(voice_title),
         );
         f.render_widget(voice_list, side_chunks[1]);
 

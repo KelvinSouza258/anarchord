@@ -30,7 +30,7 @@ use tracing_subscriber::FmtSubscriber;
 use ui::{TerminalUi, UiAction, UiEvent};
 
 #[derive(Parser, Debug, PartialEq)]
-#[command(author = "Victor Gerin", version = "0.1.0", about = "P2P Discord Daemon & CLI")]
+#[command(author = "Victor Gerin", version = "0.1.0", about = "Anarchord P2P Daemon & CLI")]
 pub struct Args {
     /// Nome de exibição (apelido no chat)
     #[arg(short, long, default_value = "Peer")]
@@ -209,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.daemon {
         println!("============================================================");
-        println!(" 🚀 P2P Discord Daemon / CLI (100% Descentralizado)");
+        println!(" 🚀 Anarchord P2P Daemon / CLI (100% Descentralizado)");
         println!("============================================================");
     }
 
@@ -248,7 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Canal ativo inicial
     let mut current_channel = args.channel.clone();
-    let mut topic_name = format!("p2p-discord/channel/{}", current_channel);
+    let mut topic_name = format!("p2p-anarchord/channel/{}", current_channel);
     let mut current_topic = IdentTopic::new(topic_name.clone());
     node.swarm.behaviour_mut().gossipsub.subscribe(&current_topic)?;
 
@@ -287,7 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Aguarda a porta real atribuída pelo OS (caso args.port == 0)
             let actual_port = rx_assigned_port.recv().await.unwrap_or(args.port);
             assigned_port_clone.store(actual_port, Ordering::SeqCst);
-            let info_hash = make_info_hash("global-discord-discovery");
+            let info_hash = make_info_hash("global-anarchord-discovery");
 
             // Loop contínuo de reanúncio e redescoberta periódica (a cada 10 segundos)
             loop {
@@ -338,7 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut current_voice_topic: Option<IdentTopic> = None;
 
     if let Some(v_chan) = &args.auto_voice {
-        let v_topic_name = format!("p2p-discord/voice/{}", v_chan);
+        let v_topic_name = format!("p2p-anarchord/voice/{}", v_chan);
         let v_topic = IdentTopic::new(v_topic_name);
         if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&v_topic) {
             if args.daemon {
@@ -575,7 +575,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Gerenciamento de Transferência Direta de Arquivos P2P
     // Tópico global do Gossipsub para ofertas e sinalização direta
-    let files_topic = IdentTopic::new("p2p-discord/direct-files");
+    let files_topic = IdentTopic::new("p2p-anarchord/direct-files");
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&files_topic);
 
     // Ofertas recebidas pendentes de aprovação pelo usuário: file_hash -> FileOffer
@@ -589,8 +589,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut active_speakers: HashMap<String, (String, std::time::Instant)> = HashMap::new();
     let mut speaker_check_interval = tokio::time::interval(std::time::Duration::from_millis(200));
 
+    // Rastreamento de participantes conhecidos no canal de voz ativo
+    let mut current_voice_peers: HashSet<String> = HashSet::new();
+
     // Subsistema de Compartilhamento de Tela P2P (Screen Share H.264)
-    let screen_topic = IdentTopic::new("p2p-discord/screens");
+    let screen_topic = IdentTopic::new("p2p-anarchord/screens");
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&screen_topic);
     let screen_capture_engine = Arc::new(ScreenCaptureEngine::new());
     let (tx_screen_out, mut rx_screen_out) = tokio::sync::mpsc::unbounded_channel::<ScreenPacket>();
@@ -787,13 +790,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             ChatAction::JoinVoice(channel_id) => {
-                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Entrou na sala de voz: {}", channel_id)));
+                                if let Some(prev) = &current_voice_topic {
+                                    let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(prev);
+                                }
+                                current_voice_peers.clear();
+                                current_voice_peers.insert(args.nick.clone());
+                                let v_topic_name = format!("p2p-anarchord/voice/{}", channel_id);
+                                let v_topic = IdentTopic::new(v_topic_name);
+                                if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&v_topic) {
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog(format!("❌ Falha ao entrar no canal de voz: {:?}", e)));
+                                } else {
+                                    current_voice_channel = Some(channel_id.clone());
+                                    current_voice_topic = Some(v_topic);
+                                    let _ = tx_ui_event.send(UiEvent::VoiceChannelChanged(Some(channel_id.clone())));
+                                    let _ = tx_ui_event.send(UiEvent::VoiceRoomMembers(current_voice_peers.iter().cloned().collect()));
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🔊 Conectado à sala de voz [🔊 {}]", channel_id)));
+                                }
                             }
                             ChatAction::LeaveVoice => {
-                                let _ = tx_ui_event.send(UiEvent::SystemLog("Saiu da sala de voz.".to_string()));
+                                if let Some(prev) = current_voice_topic.take() {
+                                    let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&prev);
+                                    let prev_name = current_voice_channel.take().unwrap_or_default();
+                                    current_voice_peers.clear();
+                                    let _ = tx_ui_event.send(UiEvent::VoiceChannelChanged(None));
+                                    let _ = tx_ui_event.send(UiEvent::VoiceRoomMembers(Vec::new()));
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🔇 Saiu da sala de voz [{}].", prev_name)));
+                                } else {
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog("⚠️ Você não está conectado a nenhuma sala de voz.".to_string()));
+                                }
                             }
                             ChatAction::JoinTextChannel(new_channel) => {
-                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Mudou para canal #{}", new_channel)));
+                                if new_channel != current_channel {
+                                    let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&current_topic);
+                                    current_channel = new_channel.clone();
+                                    topic_name = format!("p2p-anarchord/channel/{}", current_channel);
+                                    current_topic = IdentTopic::new(topic_name.clone());
+                                    if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&current_topic) {
+                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("❌ Erro ao entrar no canal #{}: {:?}", current_channel, e)));
+                                    } else {
+                                        let _ = tx_ui_event.send(UiEvent::ChannelChanged(current_channel.clone()));
+                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🚀 Entrou no canal #{}", current_channel)));
+                                    }
+                                }
                             }
                             ChatAction::SendFile { recipient_query, file_path } => {
                                 let target_pubkey = peer_metadata.iter().find_map(|(pid, (nick, pubkey))| {
@@ -960,13 +998,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(prev) = &current_voice_topic {
                                     let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(prev);
                                 }
-                                let v_topic_name = format!("p2p-discord/voice/{}", v_channel);
+                                current_voice_peers.clear();
+                                current_voice_peers.insert(args.nick.clone());
+                                let v_topic_name = format!("p2p-anarchord/voice/{}", v_channel);
                                 let v_topic = IdentTopic::new(v_topic_name);
                                 if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&v_topic) {
                                     println!("❌ Falha ao entrar no canal de voz: {:?}", e);
                                 } else {
                                     current_voice_channel = Some(v_channel.clone());
                                     current_voice_topic = Some(v_topic);
+                                    let _ = tx_ui_event.send(UiEvent::VoiceChannelChanged(Some(v_channel.clone())));
+                                    let _ = tx_ui_event.send(UiEvent::VoiceRoomMembers(current_voice_peers.iter().cloned().collect()));
                                     println!("🔊 Você conectou à sala de voz [🔊 {}]!", v_channel);
                                     println!("💡 Dica: Fale no microfone ou use /mute para silenciar.");
                                 }
@@ -975,7 +1017,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ChatAction::LeaveVoice => {
                                 if let Some(prev) = current_voice_topic.take() {
                                     let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&prev);
-                                    println!("🔇 Você saiu da sala de voz [{}].", current_voice_channel.take().unwrap_or_default());
+                                    let prev_name = current_voice_channel.take().unwrap_or_default();
+                                    current_voice_peers.clear();
+                                    let _ = tx_ui_event.send(UiEvent::VoiceChannelChanged(None));
+                                    let _ = tx_ui_event.send(UiEvent::VoiceRoomMembers(Vec::new()));
+                                    println!("🔇 Você saiu da sala de voz [{}].", prev_name);
                                 } else {
                                     println!("⚠️  Você não está conectado a nenhuma sala de voz.");
                                 }
@@ -985,11 +1031,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if new_channel != current_channel {
                                     let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&current_topic);
                                     current_channel = new_channel.clone();
-                                    topic_name = format!("p2p-discord/channel/{}", current_channel);
+                                    topic_name = format!("p2p-anarchord/channel/{}", current_channel);
                                     current_topic = IdentTopic::new(topic_name.clone());
                                     if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&current_topic) {
                                         println!("❌ Erro ao entrar no canal #{}: {:?}", current_channel, e);
                                     } else {
+                                        let _ = tx_ui_event.send(UiEvent::ChannelChanged(current_channel.clone()));
                                         println!("🚀 Você entrou no canal [#{}]!", current_channel);
                                     }
                                 }
@@ -1298,6 +1345,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         else if let Ok(voice_pkt) = VoicePacket::from_bytes(&message.data) {
                             if voice_pkt.sender_pubkey != identity.public_key_hex() {
                                 let now = std::time::Instant::now();
+                                if current_voice_peers.insert(voice_pkt.sender_name.clone()) {
+                                    let _ = tx_ui_event.send(UiEvent::VoiceRoomMembers(current_voice_peers.iter().cloned().collect()));
+                                }
                                 if let std::collections::hash_map::Entry::Vacant(e) = active_speakers.entry(voice_pkt.sender_pubkey.clone()) {
                                     let _ = tx_ui_event.send(UiEvent::VoiceActivity {
                                         nick: voice_pkt.sender_name.clone(),

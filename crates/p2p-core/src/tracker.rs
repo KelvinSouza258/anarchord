@@ -154,7 +154,7 @@ impl TorrentTrackerClient {
 pub fn make_info_hash(namespace: &str) -> [u8; 20] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(b"DISCORD_P2P_TRACKER_BOOTSTRAP_V1:");
+    hasher.update(b"ANARCHORD_P2P_TRACKER_BOOTSTRAP_V1:");
     hasher.update(namespace.as_bytes());
     let hash = hasher.finalize();
     let mut result = [0u8; 20];
