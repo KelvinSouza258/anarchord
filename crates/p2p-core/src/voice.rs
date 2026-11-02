@@ -257,7 +257,7 @@ impl VoiceEngine {
                 let is_running_clone = Arc::clone(&is_running);
                 let mut pcm_accumulator = Vec::with_capacity(FRAME_SIZE * 2);
 
-                let stream = input_dev.build_input_stream(
+                match input_dev.build_input_stream(
                     &config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         if !is_running_clone.load(Ordering::Relaxed) {
@@ -265,14 +265,12 @@ impl VoiceEngine {
                         }
 
                         if is_muted_clone.load(Ordering::Relaxed) {
-                            // Se estiver mutado, não acumula áudio
                             pcm_accumulator.clear();
                             return;
                         }
 
                         pcm_accumulator.extend_from_slice(data);
 
-                        // Quando acumular pelo menos um frame de 20ms (960 amostras), despacha
                         while pcm_accumulator.len() >= FRAME_SIZE {
                             let frame: Vec<f32> = pcm_accumulator.drain(..FRAME_SIZE).collect();
                             let _ = mic_tx.send(frame);
@@ -280,9 +278,16 @@ impl VoiceEngine {
                     },
                     |err| eprintln!("⚠️ Erro no stream de microfone: {}", err),
                     None,
-                )?;
-                stream.play()?;
-                Some(stream)
+                ) {
+                    Ok(stream) => {
+                        let _ = stream.play();
+                        Some(stream)
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Não foi possível abrir o dispositivo de microfone: {}", e);
+                        None
+                    }
+                }
             }
             None => None,
         };
@@ -306,10 +311,9 @@ impl VoiceEngine {
                 let playback_rx_clone = Arc::clone(&playback_rx);
                 let mut current_playback_buffer: Vec<f32> = Vec::new();
 
-                let stream = output_dev.build_output_stream(
+                match output_dev.build_output_stream(
                     &config,
                     move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        // Tenta drenar do canal para o buffer interno de reprodução
                         if let Ok(rx) = playback_rx_clone.try_lock() {
                             while let Ok(samples) = rx.try_recv() {
                                 current_playback_buffer.extend(samples);
@@ -320,15 +324,22 @@ impl VoiceEngine {
                             if !current_playback_buffer.is_empty() {
                                 *sample = current_playback_buffer.remove(0);
                             } else {
-                                *sample = 0.0; // Silêncio se não houver pacotes prontos
+                                *sample = 0.0;
                             }
                         }
                     },
-                    |err| eprintln!("⚠️ Erro no stream de saída de áudio: {}", err),
+                    |_err| {},
                     None,
-                )?;
-                stream.play()?;
-                Some(stream)
+                ) {
+                    Ok(stream) => {
+                        let _ = stream.play();
+                        Some(stream)
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Não foi possível abrir o dispositivo de saída de áudio: {}", e);
+                        None
+                    }
+                }
             }
             None => None,
         };
