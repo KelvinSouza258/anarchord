@@ -354,9 +354,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut peer_metadata: HashMap<libp2p::PeerId, (String, String)> = HashMap::new(); // PeerId -> (Nick, PubKey)
     let mut port_reported = false;
 
+    // Rastreamento de pares ativos falando/transmitindo áudio (pubkey -> (nome, Instant da última recepção))
+    let mut active_speakers: HashMap<String, (String, std::time::Instant)> = HashMap::new();
+    let mut speaker_check_interval = tokio::time::interval(std::time::Duration::from_millis(200));
+
     // Loop de eventos da malha P2P + Teclado + Auto-Discovery
     loop {
         tokio::select! {
+            // Monitora quando pares pararam de falar/transmitir (inatividade > 600ms)
+            _ = speaker_check_interval.tick() => {
+                let now = std::time::Instant::now();
+                active_speakers.retain(|_pubkey, (name, last_seen)| {
+                    if now.duration_since(*last_seen).as_millis() > 600 {
+                        println!("🔇 [VOZ] {} parou de falar.", name);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             // Auto-conexão com nós descobertos via Tracker / DHT
             Some(discovered_addr) = rx_peer_discovery.recv() => {
                 if let Ok(multiaddr) = discovered_addr.parse::<libp2p::Multiaddr>() {
@@ -584,7 +600,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // 2. Tenta decodificar como pacote de voz P2P
                         else if let Ok(voice_pkt) = VoicePacket::from_bytes(&message.data) {
                             if voice_pkt.sender_pubkey != identity.public_key_hex() {
-                                println!("🔊 [ÁUDIO RECEBIDO] de {} ({} bytes, energia: {})", voice_pkt.sender_name, voice_pkt.audio_data.len(), voice_pkt.energy_level);
+                                let now = std::time::Instant::now();
+                                if let std::collections::hash_map::Entry::Vacant(e) = active_speakers.entry(voice_pkt.sender_pubkey.clone()) {
+                                    println!("🔊 [VOZ] {} começou a falar...", voice_pkt.sender_name);
+                                    e.insert((voice_pkt.sender_name.clone(), now));
+                                } else if let Some(speaker) = active_speakers.get_mut(&voice_pkt.sender_pubkey) {
+                                    speaker.1 = now;
+                                }
+
                                 // Insere no JitterBuffer do remetente
                                 let jb = remote_jitter_buffers
                                     .entry(voice_pkt.sender_pubkey.clone())
