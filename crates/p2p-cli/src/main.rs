@@ -1503,6 +1503,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(
+                        libp2p::mdns::Event::Discovered(list)
+                    )) => {
+                        for (peer_id, multiaddr) in list {
+                            if peer_id != node.peer_id && !connected_peers.contains(&peer_id) {
+                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🔍 Par local descoberto via mDNS: {} em {}", peer_id, multiaddr)));
+                                if args.daemon {
+                                    println!("🔍 Par local descoberto via mDNS: {} em {}", peer_id, multiaddr);
+                                }
+                                let _ = node.swarm.dial(multiaddr);
+                            }
+                        }
+                    }
+                    libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(
+                        libp2p::mdns::Event::Expired(list)
+                    )) => {
+                        for (peer_id, multiaddr) in list {
+                            tracing::debug!("mDNS expired: {} em {}", peer_id, multiaddr);
+                        }
+                    }
                     _ => {}
                 }
             }

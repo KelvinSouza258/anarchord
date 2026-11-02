@@ -74,10 +74,17 @@ impl P2PNode {
                 .with_agent_version(user_agent);
                 let identify = identify::Behaviour::new(identify_config);
 
-                // 4. Ping
+                // 4. mDNS: Descoberta automática instantânea em redes locais (LAN / Wi-Fi / Localhost)
+                let mdns = libp2p::mdns::tokio::Behaviour::new(
+                    libp2p::mdns::Config::default(),
+                    key.public().to_peer_id(),
+                )
+                .map_err(|e| NodeError::SwarmInit(format!("Falha ao inicializar mDNS: {}", e)))?;
+
+                // 5. Ping
                 let ping = ping::Behaviour::new(ping::Config::default());
 
-                // 5. AutoNAT & DCUtR (Hole Punching)
+                // 6. AutoNAT & DCUtR (Hole Punching)
                 let autonat = autonat::Behaviour::new(key.public().to_peer_id(), autonat::Config::default());
                 let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
 
@@ -85,6 +92,7 @@ impl P2PNode {
                     kademlia,
                     gossipsub,
                     identify,
+                    mdns,
                     ping,
                     autonat,
                     dcutr,

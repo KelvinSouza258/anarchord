@@ -1,6 +1,6 @@
 use libp2p::{
     autonat, dcutr, gossipsub, identify, kad::{self, store::MemoryStore},
-    ping, relay, swarm::NetworkBehaviour,
+    mdns, ping, relay, swarm::NetworkBehaviour,
 };
 
 #[derive(NetworkBehaviour)]
@@ -8,6 +8,7 @@ pub struct AppBehaviour {
     pub kademlia: kad::Behaviour<MemoryStore>,
     pub gossipsub: gossipsub::Behaviour,
     pub identify: identify::Behaviour,
+    pub mdns: mdns::tokio::Behaviour,
     pub ping: ping::Behaviour,
     pub autonat: autonat::Behaviour,
     pub dcutr: dcutr::Behaviour,
