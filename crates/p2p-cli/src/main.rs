@@ -42,6 +42,14 @@ struct Args {
     #[arg(long, default_value = "geral")]
     channel: String,
 
+    /// Entrar automaticamente em uma sala de voz P2P ao iniciar (útil para nós bots/rádio)
+    #[arg(long)]
+    auto_voice: Option<String>,
+
+    /// Executar como Daemon sem ler stdin do terminal
+    #[arg(long, default_value_t = false)]
+    daemon: bool,
+
     /// Desativar descoberta automática via IPFS Amino DHT e Open Trackers BitTorrent
     #[arg(long, default_value_t = false)]
     no_auto_bootstrap: bool,
@@ -160,6 +168,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut current_voice_channel: Option<String> = None;
     let mut current_voice_topic: Option<IdentTopic> = None;
+
+    if let Some(v_chan) = &args.auto_voice {
+        let v_topic_name = format!("p2p-discord/voice/{}", v_chan);
+        let v_topic = IdentTopic::new(v_topic_name);
+        if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&v_topic) {
+            println!("❌ Falha ao entrar no canal de voz automático: {:?}", e);
+        } else {
+            current_voice_channel = Some(v_chan.clone());
+            current_voice_topic = Some(v_topic);
+            println!("🔊 Conectado automaticamente à sala de voz [🔊 {}]!", v_chan);
+        }
+    }
     let voice_seq = Arc::new(AtomicU64::new(1));
     let (tx_voice_to_broadcast, mut rx_voice_to_broadcast) = tokio::sync::mpsc::unbounded_channel::<VoicePacket>();
 
@@ -238,8 +258,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
 
-            // Entrada do teclado
-            line = stdin_lines.next_line() => {
+            // Entrada do teclado (desativada quando rodando em modo daemon)
+            line = stdin_lines.next_line(), if !args.daemon => {
                 match line {
                     Ok(Some(text)) => {
                         let trimmed = text.trim();
