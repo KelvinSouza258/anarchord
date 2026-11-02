@@ -1,3 +1,17 @@
+FROM rust:latest AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libasound2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --release -p p2p-cli
+
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
@@ -10,11 +24,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copia o binário Linux já compilado nativamente (sem precisar compilar do zero no Docker)
-COPY p2p-cli-linux /usr/local/bin/p2p-cli
+COPY --from=builder /app/target/release/p2p-cli /usr/local/bin/p2p-cli
 RUN chmod +x /usr/local/bin/p2p-cli
 
-# Diretório padrão para download de arquivos P2P
 RUN mkdir -p /app/downloads
 
 ENTRYPOINT ["p2p-cli"]

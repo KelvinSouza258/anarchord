@@ -20,3 +20,5 @@ Thumbs.db
 # OS Temporary Files
 tmp/
 *.tmp
+p2p-cli-linux
+downloads/
