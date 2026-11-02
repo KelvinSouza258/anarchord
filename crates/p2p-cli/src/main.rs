@@ -241,22 +241,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let actual_port = rx_assigned_port.recv().await.unwrap_or(args.port);
             assigned_port_clone.store(actual_port, Ordering::SeqCst);
             let info_hash = make_info_hash("global-discord-discovery");
-            for tracker in OPENTRACKER_SERVERS {
-                match TorrentTrackerClient::discover_peers(tracker, &info_hash, &bt_peer_id, actual_port) {
-                    Ok(peers) => {
-                        for peer in peers {
-                            if is_daemon {
-                                println!("📡 Par descoberto via BitTorrent Tracker: {}", peer);
+
+            // Loop contínuo de reanúncio e redescoberta periódica (a cada 10 segundos)
+            loop {
+                for tracker in OPENTRACKER_SERVERS {
+                    match TorrentTrackerClient::discover_peers(tracker, &info_hash, &bt_peer_id, actual_port) {
+                        Ok(peers) => {
+                            for peer in peers {
+                                if is_daemon {
+                                    println!("📡 Par descoberto via BitTorrent Tracker: {}", peer);
+                                }
+                                let tcp_addr = format!("/ip4/{}/tcp/{}", peer.ip(), peer.port());
+                                let quic_addr = format!("/ip4/{}/udp/{}/quic-v1", peer.ip(), peer.port());
+                                let _ = tx_peer_discovery.send(tcp_addr);
+                                let _ = tx_peer_discovery.send(quic_addr);
                             }
-                            let tcp_addr = format!("/ip4/{}/tcp/{}", peer.ip(), peer.port());
-                            let quic_addr = format!("/ip4/{}/udp/{}/quic-v1", peer.ip(), peer.port());
-                            let _ = tx_peer_discovery.send(tcp_addr);
-                            let _ = tx_peer_discovery.send(quic_addr);
+                            break;
                         }
-                        break;
+                        Err(_) => {}
                     }
-                    Err(_) => {}
                 }
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
             }
         });
     }
