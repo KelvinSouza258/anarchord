@@ -85,6 +85,7 @@ pub struct BlockBody {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Block {
     pub body: BlockBody,
+    #[serde(with = "crate::b64")]
     pub signature: Vec<u8>,
 }
 

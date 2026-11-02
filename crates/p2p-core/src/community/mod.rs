@@ -62,12 +62,17 @@ pub fn screen_topic(space: &Space) -> String {
     }
 }
 
+/// Tópico dos quadros de uma transmissão de tela: só quem assiste se inscreve
+pub fn screen_stream_topic(space: &Space, stream_id: &str) -> String {
+    format!("{}/{}", screen_topic(space), stream_id)
+}
+
 /// Se o tópico é de conteúdo de um servidor (canal, voz ou tela), devolve o id do servidor.
 /// Esse conteúdo trafega cifrado com MLS.
 pub fn parse_server_content_topic(topic: &str) -> Option<&str> {
     let rest = topic.strip_prefix(TOPIC_PREFIX)?.strip_prefix("/server/")?;
     let (id, tail) = rest.split_at(rest.find('/')?);
-    let content = tail.starts_with("/channel/") || tail.starts_with("/voice/") || tail == "/screens";
+    let content = tail.starts_with("/channel/") || tail.starts_with("/voice/") || tail.starts_with("/screens");
     (content && is_valid_server_id(id)).then_some(id)
 }
 
@@ -119,11 +124,24 @@ pub enum ServerMessage {
     /// Ação de moderador ainda não incluída na cadeia
     Action(ModAction),
     /// Pedido de entrada no grupo cifrado (MLS): pacote de chave de quem publicou
-    KeyPackage { server_id: String, key_package: Vec<u8> },
+    KeyPackage {
+        server_id: String,
+        #[serde(with = "crate::b64")]
+        key_package: Vec<u8>,
+    },
     /// Commit MLS do dono (adiciona ou remove membros e troca a chave do grupo)
-    Commit { server_id: String, commit: Vec<u8> },
+    Commit {
+        server_id: String,
+        #[serde(with = "crate::b64")]
+        commit: Vec<u8>,
+    },
     /// Welcome MLS para quem foi admitido no grupo
-    Welcome { server_id: String, target: String, welcome: Vec<u8> },
+    Welcome {
+        server_id: String,
+        target: String,
+        #[serde(with = "crate::b64")]
+        welcome: Vec<u8>,
+    },
 }
 
 impl ServerMessage {
@@ -762,6 +780,8 @@ mod tests {
         assert_eq!(parse_server_content_topic(&server_control_topic(&id)), None);
         assert_eq!(parse_server_content_topic(&channel_topic(&Space::Lobby, "geral")), None);
         assert_eq!(screen_topic(&Space::Lobby), "p2p-anarchord/screens");
+        assert_eq!(screen_stream_topic(&Space::Lobby, "screen:ab12cd34"), "p2p-anarchord/screens/screen:ab12cd34");
+        assert_eq!(parse_server_content_topic(&screen_stream_topic(&space, "screen:ab12cd34")), Some(id.as_str()), "quadros de servidor são cifrados");
     }
 
     #[test]

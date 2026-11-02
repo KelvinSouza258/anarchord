@@ -43,6 +43,7 @@ pub struct CertBody {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ModeratorCert {
     pub body: CertBody,
+    #[serde(with = "crate::b64")]
     pub signature: Vec<u8>,
 }
 
@@ -128,6 +129,7 @@ pub struct ModActionBody {
 pub struct ModAction {
     pub body: ModActionBody,
     pub cert: ModeratorCert,
+    #[serde(with = "crate::b64")]
     pub signature: Vec<u8>,
 }
 

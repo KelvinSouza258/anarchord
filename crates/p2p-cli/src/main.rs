@@ -24,7 +24,7 @@ use p2p_core::{
     node::{parse_agent_version, P2PNode, DHT_DISCOVERY_NAMESPACE},
     protocol::AppBehaviourEvent,
     relay::RelayManager,
-    screen::{max_width_for_quality, KeyframeGate, ScreenCaptureEngine, ScreenPacket},
+    screen::{max_width_for_quality, KeyframeGate, ScreenAnnounce, ScreenCaptureEngine, ScreenPacket},
     tracker::{make_info_hash, TorrentTrackerClient},
     voice::{AudioCodec, AudioDeviceManager, JitterBuffer, VoiceEngine, VoicePacket},
 };
@@ -634,8 +634,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Subsistema de Compartilhamento de Tela P2P (Screen Share H.264)
     let screen_topic = IdentTopic::new(community::screen_topic(&Space::Lobby));
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&screen_topic);
-    // Para onde vão os quadros da minha transmissão (Lobby ou servidor, definido ao iniciar)
+    // Minha transmissão: quadros vão no tópico da stream (só quem assiste se inscreve) e um anúncio
+    // leve vai a cada 2 s no tópico de telas do espaço
     let mut screen_publish_topic = screen_topic.clone();
+    let mut my_stream: Option<(IdentTopic, ScreenAnnounce)> = None;
+    let mut screen_announce_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    // Streams anunciadas: stream_id -> tópico dos quadros; e o tópico que estou assistindo
+    let mut stream_topics: HashMap<String, IdentTopic> = HashMap::new();
+    let mut watching_topic: Option<IdentTopic> = None;
     let screen_capture_engine = Arc::new(ScreenCaptureEngine::new());
     let (tx_screen_out, mut rx_screen_out) = tokio::sync::mpsc::unbounded_channel::<ScreenPacket>();
     let mut tx_viewer_frame_opt: Option<std::sync::mpsc::SyncSender<(p2p_core::screen::VideoCodec, Vec<u8>)>> = None;
@@ -647,6 +653,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Se o argumento --synth-video foi informado (útil para bots como Oracle-Bot), inicia transmissão automática
     if args.synth_video {
         let stream_id = format!("screen:{}", &identity.public_key_hex()[..8]);
+        screen_publish_topic = IdentTopic::new(community::screen_stream_topic(&Space::Lobby, &stream_id));
+        my_stream = Some((
+            screen_topic.clone(),
+            ScreenAnnounce { stream_id: stream_id.clone(), sender_pubkey: identity.public_key_hex(), sender_name: my_nick.clone(), width: 0, height: 0 },
+        ));
         let tx_frame = tx_screen_out.clone();
         screen_capture_engine.start_synthetic_video_stream(
             stream_id.clone(),
@@ -694,6 +705,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             // Monitora quando pares pararam de falar/transmitir (inatividade > 600ms)
+            // Anuncia a minha transmissão; expira streams sem anúncio; larga a stream se a janela fechou
+            _ = screen_announce_interval.tick() => {
+                if let Some((topic, announce)) = &my_stream {
+                    if let Ok(bytes) = announce.to_bytes() {
+                        let _ = publish_content(&mut node, &mut mls, topic, bytes);
+                    }
+                }
+                active_screen_streams.retain(|sid, (_, _, _, _, last_seen)| {
+                    let alive = last_seen.elapsed() < std::time::Duration::from_secs(6);
+                    if !alive {
+                        stream_topics.remove(sid);
+                    }
+                    alive
+                });
+                if !screen_viewer_active.load(Ordering::Relaxed) && !args.daemon {
+                    if let Some(topic) = watching_topic.take() {
+                        let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
+                        current_watching_stream = None;
+                    }
+                }
+            }
             _ = speaker_check_interval.tick() => {
                 let now = std::time::Instant::now();
                 active_speakers.retain(|_pubkey, (name, last_seen)| {
@@ -710,6 +742,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Publicação de quadros de vídeo da tela capturada para a malha P2P
             Some(screen_pkt) = rx_screen_out.recv() => {
+                if let Some((_, announce)) = my_stream.as_mut() {
+                    announce.width = screen_pkt.width;
+                    announce.height = screen_pkt.height;
+                }
                 if let Ok(pkt_bytes) = screen_pkt.to_bytes() {
                     match publish_content(&mut node, &mut mls, &screen_publish_topic, pkt_bytes) {
                         Ok(()) => {
@@ -818,8 +854,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = tx_ui_event.send(UiEvent::SystemLog("Você já está transmitindo sua tela. Use /screen stop para parar.".to_string()));
                                 } else {
                                     let max_width = max_width_for_quality(quality);
-                                    screen_publish_topic = IdentTopic::new(community::screen_topic(&active.space));
                                     let stream_id = format!("screen:{}", &identity.public_key_hex()[..8]);
+                                    screen_publish_topic = IdentTopic::new(community::screen_stream_topic(&active.space, &stream_id));
+                                    my_stream = Some((
+                                        IdentTopic::new(community::screen_topic(&active.space)),
+                                        ScreenAnnounce { stream_id: stream_id.clone(), sender_pubkey: identity.public_key_hex(), sender_name: my_nick.clone(), width: 0, height: 0 },
+                                    ));
                                     let tx_frame = tx_screen_out.clone();
                                     screen_capture_engine.start_capture(
                                         stream_id.clone(),
@@ -838,6 +878,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ChatAction::ScreenStop => {
                                 if screen_capture_engine.is_streaming() {
                                     screen_capture_engine.stop_capture();
+                                    my_stream = None;
                                     let _ = tx_ui_event.send(UiEvent::SystemLog("📺 Transmissão de tela ENCERRADA.".to_string()));
                                 } else {
                                     let _ = tx_ui_event.send(UiEvent::SystemLog("Nenhuma transmissão de tela em andamento.".to_string()));
@@ -853,6 +894,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 });
 
                                 if let Some((sid, presenter_nick)) = target_stream {
+                                    // Só agora passa a receber os quadros dessa stream
+                                    if let Some(previous) = watching_topic.take() {
+                                        let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&previous);
+                                    }
+                                    if let Some(topic) = stream_topics.get(&sid) {
+                                        let _ = node.swarm.behaviour_mut().gossipsub.subscribe(topic);
+                                        watching_topic = Some(topic.clone());
+                                    }
                                     // Cria ou recria o canal com capacidade para que quadros antigos sejam descartados se a janela travar
                                     let (tx_vf, rx_vf) = std::sync::mpsc::sync_channel::<(p2p_core::screen::VideoCodec, Vec<u8>)>(VIEWER_QUEUE_FRAMES);
                                     let rx_vf_arc = Arc::new(std::sync::Mutex::new(rx_vf));
@@ -1106,6 +1155,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if topic == active.topic.hash() {
                             publish_channel_members(&node, &peer_metadata, &active.channel, &active.topic, &tx_ui_event);
                         }
+                        if my_stream.is_some() && topic == screen_publish_topic.hash() {
+                            screen_capture_engine.request_keyframe();
+                        }
                         // Alguém entrou no tópico de controle de um servidor que conhecemos: entrega a cadeia
                         // (servidor fechado: só para quem está na allow-list)
                         if let Some(server_id) = community::parse_server_control_topic(topic.as_str()).map(str::to_string) {
@@ -1256,7 +1308,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             match file_msg {
                                 FileTransferMessage::Offer(offer) => {
                                     // Verifica se o arquivo é direcionado a nós
-                                    if offer.recipient_pubkey == identity.public_key_hex() {
+                                    if offer.recipient_pubkey == identity.public_key_hex() && offer.file_size > p2p_core::file_transfer::MAX_FILE_SIZE {
+                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!(
+                                            "❌ Oferta de '{}' recusada: {:.0} MB passa do limite de {} MB.",
+                                            offer.sender_name,
+                                            offer.file_size as f64 / (1024.0 * 1024.0),
+                                            p2p_core::file_transfer::MAX_FILE_SIZE / (1024 * 1024)
+                                        )));
+                                    } else if offer.recipient_pubkey == identity.public_key_hex() {
                                         if args.daemon {
                                             println!("\n📥 [TRANSFERÊNCIA DE ARQUIVO] Recebida proposta de '{}':", offer.sender_name);
                                             println!("   📄 Arquivo : {}", offer.file_name);
@@ -1354,16 +1413,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     // Salva na pasta downloads do usuário se existir, senão downloads local
                                                     let home_dir = std::env::var("HOME").ok().map(std::path::PathBuf::from);
                                                     let download_dir = home_dir.map(|h| h.join("downloads")).unwrap_or_else(|| std::path::PathBuf::from("downloads"));
-                                                    let _ = std::fs::create_dir_all(&download_dir);
-                                                    let save_path = download_dir.join(&file_name);
-                                                    if let Ok(_) = std::fs::write(&save_path, &completed_bytes) {
+                                                    // Nome vindo do remetente: sanitizado, sem sair da pasta e sem sobrescrever
+                                                    match p2p_core::file_transfer::save_received_file(&download_dir, &file_name, &completed_bytes) {
+                                                    Ok(save_path) => {
                                                         let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Arquivo '{}' salvo com sucesso em {:?}", file_name, save_path)));
                                                         if args.daemon {
                                                             println!("\n💾 [ARQUIVO CONCLUÍDO] '{}' salvo com sucesso em: {:?}", file_name, save_path);
                                                             println!("   🔒 Integridade SHA-256 verificada com sucesso!\n");
                                                         }
-                                                    } else if args.daemon {
-                                                        println!("❌ Erro ao salvar arquivo em {:?}", save_path);
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("❌ Erro ao salvar '{}': {}", file_name, e)));
+                                                        if args.daemon {
+                                                            println!("❌ Erro ao salvar arquivo '{}': {}", file_name, e);
+                                                        }
+                                                    }
                                                     }
                                                 }
                                                 Err(e) => {
@@ -1413,6 +1477,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             let (codec, data) = (screen_pkt.codec, screen_pkt.video_data);
                                             viewer_gate.forward(screen_pkt.is_keyframe, || tx_vf.try_send((codec, data)).is_ok());
                                         }
+                                    }
+                                }
+                            }
+                        }
+                        // 5. Anúncio de transmissão de tela: lista a stream; quadros só para quem assistir
+                        else if let Ok(announce) = ScreenAnnounce::from_bytes(&data) {
+                            if announce.sender_pubkey != identity.public_key_hex() && sender_matches(&announce.sender_pubkey) {
+                                let stream_id = announce.stream_id.clone();
+                                let is_new = !active_screen_streams.contains_key(&stream_id);
+                                active_screen_streams.insert(
+                                    stream_id.clone(),
+                                    (announce.sender_name.clone(), announce.sender_pubkey.clone(), announce.width, announce.height, std::time::Instant::now()),
+                                );
+                                let topic = IdentTopic::new(format!("{}/{}", message.topic.as_str(), stream_id));
+                                stream_topics.insert(stream_id.clone(), topic.clone());
+                                if is_new {
+                                    let notif = format!("📺 Nova tela compartilhada por '{}'. Digite /screen watch {}", announce.sender_name, announce.sender_name);
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog(notif.clone()));
+                                    if args.daemon {
+                                        // O daemon só existe para testes: assiste automaticamente para validar o vídeo
+                                        println!("\n{}", notif);
+                                        let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&topic);
                                     }
                                 }
                             }

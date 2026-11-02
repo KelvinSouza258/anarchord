@@ -132,6 +132,11 @@ impl FrameEncoder {
     }
 
     /// Indica se já passou o intervalo do keyframe periódico (ou se nenhum foi enviado ainda)
+    /// O próximo frame sai como keyframe (ex.: alguém acabou de começar a assistir)
+    pub fn request_keyframe(&mut self) {
+        self.last_keyframe = None;
+    }
+
     pub fn keyframe_due(&self) -> bool {
         self.last_keyframe.map_or(true, |t| t.elapsed() >= Self::KEYFRAME_INTERVAL)
     }

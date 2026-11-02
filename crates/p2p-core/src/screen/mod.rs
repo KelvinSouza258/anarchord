@@ -51,6 +51,28 @@ pub struct ScreenPacket {
     pub video_data: Vec<u8>,
 }
 
+/// Anúncio leve de uma transmissão, publicado a cada ~2 s no tópico de telas do espaço.
+/// Os quadros vão num tópico próprio da stream ([`crate::community::screen_stream_topic`]),
+/// assinado só por quem está assistindo.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScreenAnnounce {
+    pub stream_id: String,
+    pub sender_pubkey: String,
+    pub sender_name: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ScreenAnnounce {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
+}
+
 impl ScreenPacket {
     pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
@@ -75,6 +97,8 @@ pub struct ScreenCaptureEngine {
     /// de uma sessão anterior (que ficam com a flag antiga) encerram mesmo que um novo start
     /// aconteça logo após o stop, antes de elas perceberem a parada.
     session: Mutex<Arc<AtomicBool>>,
+    /// Pedido de keyframe imediato (alguém começou a assistir)
+    keyframe_request: Arc<AtomicBool>,
 }
 
 impl Default for ScreenCaptureEngine {
@@ -87,6 +111,7 @@ impl ScreenCaptureEngine {
     pub fn new() -> Self {
         Self {
             session: Mutex::new(Arc::new(AtomicBool::new(false))),
+            keyframe_request: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -173,6 +198,7 @@ impl ScreenCaptureEngine {
 
         // Capacidade 1 + try_send: o encoder sempre pega o frame mais recente, sem fila acumulando atraso
         let (tx_raw, rx_raw) = std::sync::mpsc::sync_channel::<RawFrame>(1);
+        let keyframe_request = Arc::clone(&self.keyframe_request);
 
         std::thread::spawn(move || {
             source.run(&is_running_capture, frame_interval, &mut |frame| {
@@ -183,10 +209,14 @@ impl ScreenCaptureEngine {
 
         std::thread::spawn(move || {
             let mut encoder = FrameEncoder::new(fps);
+            let keyframe_request = Arc::clone(&keyframe_request);
             let mut last_frame: Option<RawFrame> = None;
 
             while is_running.load(Ordering::Relaxed) {
                 let start_time = Instant::now();
+                if keyframe_request.swap(false, Ordering::SeqCst) {
+                    encoder.request_keyframe();
+                }
 
                 let frame = match rx_raw.recv_timeout(frame_interval) {
                     Ok(f) => f,
@@ -217,6 +247,12 @@ impl ScreenCaptureEngine {
                 }
             }
         });
+    }
+
+    /// Faz o próximo quadro da transmissão sair como keyframe, para quem acabou de começar a
+    /// assistir não esperar o keyframe periódico
+    pub fn request_keyframe(&self) {
+        self.keyframe_request.store(true, Ordering::SeqCst);
     }
 
     pub fn stop_capture(&self) {

@@ -1,3 +1,4 @@
+pub mod b64;
 pub mod identity;
 pub mod community;
 pub mod api;
@@ -28,4 +29,4 @@ pub use voice::{
     AudioCodec, AudioDeviceManager, AudioEngineError, JitterBuffer, VoiceEngine, VoicePacket,
     calculate_vad_energy, CHANNELS, FRAME_SIZE, SAMPLE_RATE,
 };
-pub use screen::{ScreenCaptureEngine, ScreenInfo, ScreenPacket, VideoCodec};
+pub use screen::{ScreenAnnounce, ScreenCaptureEngine, ScreenInfo, ScreenPacket, VideoCodec};
