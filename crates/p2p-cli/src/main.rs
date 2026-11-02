@@ -573,12 +573,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut active_speakers: HashMap<String, (String, std::time::Instant)> = HashMap::new();
     let mut speaker_check_interval = tokio::time::interval(std::time::Duration::from_millis(200));
 
-    // Subsistema de Compartilhamento de Tela P2P (Screen Share)
+    // Subsistema de Compartilhamento de Tela P2P (Screen Share H.264)
     let screen_topic = IdentTopic::new("p2p-discord/screens");
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&screen_topic);
     let screen_capture_engine = Arc::new(ScreenCaptureEngine::new());
     let (tx_screen_out, mut rx_screen_out) = tokio::sync::mpsc::unbounded_channel::<ScreenPacket>();
-    let (tx_viewer_frame, rx_viewer_frame) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (tx_viewer_frame, rx_viewer_frame) = std::sync::mpsc::channel::<(p2p_core::screen::VideoCodec, Vec<u8>)>();
     let rx_viewer_frame_arc = Arc::new(std::sync::Mutex::new(rx_viewer_frame));
     let screen_viewer_active = Arc::new(AtomicBool::new(false));
     let mut current_watching_stream: Option<String> = None;
@@ -592,14 +592,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             stream_id.clone(),
             identity.public_key_hex(),
             args.nick.clone(),
-            15, // 15 FPS
-            65, // JPEG quality
+            30, // 30 FPS fluido com H.264
             move |pkt| {
                 let _ = tx_frame.send(pkt);
             },
         );
         if args.daemon {
-            println!("📺 [VÍDEO SINTÉTICO] Transmissão animada P2P iniciada automaticamente (Stream ID: {})", stream_id);
+            println!("📺 [VÍDEO H.264] Transmissão animada P2P iniciada automaticamente a 30 FPS (Stream ID: {})", stream_id);
         }
     }
 
@@ -709,13 +708,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         identity.public_key_hex(),
                                         args.nick.clone(),
                                         monitor_idx,
-                                        15, // 15 FPS
-                                        65, // JPEG quality
+                                        30, // 30 FPS com H.264
                                         move |pkt| {
                                             let _ = tx_frame.send(pkt);
                                         },
                                     );
-                                    let _ = tx_ui_event.send(UiEvent::SystemLog(format!("📺 Transmissão de tela INICIADA (Stream ID: {}). Use /screen stop para encerrar.", stream_id)));
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog(format!("📺 Transmissão H.264 (30 FPS) INICIADA (Stream ID: {}). Use /screen stop para encerrar.", stream_id)));
                                 }
                             }
                             ChatAction::ScreenStop => {
@@ -1089,13 +1087,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         identity.public_key_hex(),
                                         args.nick.clone(),
                                         monitor_idx,
-                                        15,
-                                        65,
+                                        30, // 30 FPS com H.264
                                         move |pkt| {
                                             let _ = tx_frame.send(pkt);
                                         },
                                     );
-                                    println!("📺 Transmissão de tela INICIADA (Stream ID: {}). Use /screen stop para encerrar.", stream_id);
+                                    println!("📺 Transmissão H.264 (30 FPS) INICIADA (Stream ID: {}). Use /screen stop para encerrar.", stream_id);
                                 }
                                 continue;
                             }
@@ -1443,7 +1440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Se estivermos assistindo este fluxo, repassa o quadro para o exibidor da janela
                                 if let Some(watching_id) = &current_watching_stream {
                                     if watching_id == &stream_id && screen_viewer_active.load(Ordering::Relaxed) {
-                                        let _ = tx_viewer_frame.send(screen_pkt.jpeg_data);
+                                        let _ = tx_viewer_frame.send((screen_pkt.codec, screen_pkt.video_data));
                                     }
                                 }
                             }

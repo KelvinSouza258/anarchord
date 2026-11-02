@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "created_at": 1793621790,
+  "user_id": "587f3bae7457995f2009c6fb46f3e26180652939da01ee1f26b06a3e08471276",
+  "profile": {
+    "display_name": "Alice",
+    "bio": null,
+    "avatar_base64": null,
+    "banner_color": "#5865F2"
+  },
+  "keys": {
+    "algorithm": "Ed25519",
+    "private_key_pem": "-----BEGIN PRIVATE KEY-----\nMFECAQEwBQYDK2VwBCIEIGL51TueqUrMurBzT8kw4WEAMt2/J/Dzqpiwf+XaeQm8\ngSEAWH87rnRXmV8gCcb7RvPiYYBlKTnaAe4fJrBqPghHEnY=\n-----END PRIVATE KEY-----\n",
+    "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWH87rnRXmV8gCcb7RvPiYYBlKTnaAe4fJrBqPghHEnY=\n-----END PUBLIC KEY-----\n"
+  }
+}
