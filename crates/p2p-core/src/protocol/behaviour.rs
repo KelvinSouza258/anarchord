@@ -13,4 +13,6 @@ pub struct AppBehaviour {
     pub autonat: autonat::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub relay_client: relay::client::Behaviour,
+    /// Pedaços de arquivo do enxame, direto entre dois pares
+    pub files: libp2p::request_response::Behaviour<crate::files::FileCodec>,
 }

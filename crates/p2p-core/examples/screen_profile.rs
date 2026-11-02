@@ -4,7 +4,7 @@ use openh264::encoder::{Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Rat
 use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
 use openh264::{nal_units, OpenH264API};
 use p2p_core::api::ChatMessage;
-use p2p_core::file_transfer::FileTransferMessage;
+use p2p_core::files::SwarmMessage;
 use p2p_core::screen::{ScreenPacket, VideoCodec};
 use p2p_core::voice::VoicePacket;
 use std::time::{Duration, Instant};
@@ -110,7 +110,7 @@ fn main() {
         let t = Instant::now();
         let _ = serde_json::from_slice::<ChatMessage>(&json);
         let _ = VoicePacket::from_bytes(&json);
-        let _ = FileTransferMessage::from_bytes(&json);
+        let _ = SwarmMessage::from_bytes(&json);
         s_try.add(t.elapsed());
 
         let t = Instant::now();

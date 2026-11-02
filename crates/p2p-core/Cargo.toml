@@ -22,7 +22,8 @@ libp2p = { version = "0.54", features = [
     "noise",
     "yamux",
     "mdns",
-    "macros"
+    "macros",
+    "request-response"
 ] }
 
 # Criptografia e Identidade (Ed25519)
@@ -50,6 +51,8 @@ openmls_rust_crypto = "0.6.0"
 openmls_basic_credential = "0.6.0"
 openmls_traits = "0.6.0"
 base64 = "0.23.1"
+chacha20poly1305 = "0.10.1"
+async-trait = "0.1"
 
 # Captura de tela nativa só existe em desktop; Android/iOS entregam frames pelo app hospedeiro
 # (screen::capture::external)

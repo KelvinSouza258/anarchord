@@ -1,4 +1,5 @@
 pub mod b64;
+pub mod files;
 pub mod identity;
 pub mod community;
 pub mod api;
@@ -21,10 +22,6 @@ pub use node::{
 pub use bootstrap::{IPFS_BOOTSTRAP_NODES, OPENTRACKER_SERVERS, get_ipfs_bootstrap_multiaddrs};
 pub use tracker::{TorrentTrackerClient, make_info_hash};
 pub use relay::{RelayManager, MAX_RELAY_RESERVATIONS};
-pub use file_transfer::{
-    calculate_file_hash, chunk_file, FileChunk, FileDecision, FileOffer, FileReceiver,
-    FileTransferMessage, CHUNK_SIZE,
-};
 pub use voice::{
     AudioCodec, AudioDeviceManager, AudioEngineError, JitterBuffer, VoiceEngine, VoicePacket,
     calculate_vad_energy, CHANNELS, FRAME_SIZE, SAMPLE_RATE,

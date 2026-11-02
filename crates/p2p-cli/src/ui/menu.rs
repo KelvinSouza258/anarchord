@@ -106,6 +106,8 @@ pub fn main_menu(ctx: &MenuContext) -> Menu {
     }
     items.extend([
         run("🎙️ Mutar / desmutar microfone", "/mute"),
+        ask("📎 Compartilhar arquivo na sala…", "Caminho do arquivo", "/share \"{}\""),
+        run("📁 Arquivos (ofertas, downloads e compartilhados)", "/files"),
         run("📺 Compartilhar minha tela", "/screen start"),
         run("⏹️ Parar compartilhamento de tela", "/screen stop"),
         run("👥 Pares conectados", "/peers"),
@@ -198,7 +200,8 @@ pub const HELP_LINES: &[&str] = &[
     "",
     "COMANDOS",
     "  /join <canal>            /voice join <sala>     /voice leave     /mute",
-    "  /send <par> <arquivo>    /accept <hash>         /reject <hash>",
+    "  /share <arquivo>         compartilha na sala atual (quem quiser baixa com /get)",
+    "  /send <par> <arquivo>    /get <id>      /reject <id>      /files      /unshare <id>",
     "  /screen start [monitor] [720|1080]   /screen stop   /screen watch <par>",
     "  /server create <nome>    /server accept         /server switch <nome|lobby>",
     "  /server invite           /server channel add <nome> [voz]",

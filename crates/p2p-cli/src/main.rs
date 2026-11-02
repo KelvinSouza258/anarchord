@@ -17,9 +17,7 @@ use p2p_core::{
         format_duration, server_control_topic, server_dht_key, short_id, ChannelType, ModKind, ServerEvent, ServerMessage,
         ServerRegistry, Space,
     },
-    file_transfer::{
-        calculate_file_hash, chunk_file, FileDecision, FileOffer, FileReceiver, FileTransferMessage,
-    },
+    files::{self as swarm_files, FileAction, FileEngine, FileEvent, FileKey, FileRequest, FileState, Manifest, ShareTarget, SwarmMessage},
     identity::UserIdentity,
     node::{parse_agent_version, P2PNode, DHT_DISCOVERY_NAMESPACE},
     protocol::AppBehaviourEvent,
@@ -103,9 +101,14 @@ pub enum ChatAction {
     JoinVoice(String),
     LeaveVoice,
     JoinTextChannel(String),
+    /// Compartilha um arquivo na sala atual
+    ShareFile(String),
+    /// Oferece um arquivo só a um par
     SendFile { recipient_query: String, file_path: String },
-    AcceptFile(String),
+    GetFile(String),
     RejectFile(String),
+    ListFiles,
+    Unshare(String),
     ScreenStart { monitor_idx: usize, quality: u32 },
     ScreenStop,
     ScreenWatch(String),
@@ -188,17 +191,26 @@ pub fn parse_user_input(input: &str) -> ChatAction {
             }
         }
     }
-    if trimmed.starts_with("/accept ") {
-        let hash = trimmed.trim_start_matches("/accept ").trim();
-        if !hash.is_empty() {
-            return ChatAction::AcceptFile(hash.to_string());
+    if let Some(path) = trimmed.strip_prefix("/share ") {
+        let clean_path = path.trim().trim_matches('"').trim_matches('\'');
+        if !clean_path.is_empty() {
+            return ChatAction::ShareFile(clean_path.to_string());
         }
     }
-    if trimmed.starts_with("/reject ") {
-        let hash = trimmed.trim_start_matches("/reject ").trim();
-        if !hash.is_empty() {
-            return ChatAction::RejectFile(hash.to_string());
+    // /accept continua funcionando como sinônimo de /get
+    for prefix in ["/get ", "/accept "] {
+        if let Some(id) = trimmed.strip_prefix(prefix).map(str::trim).filter(|id| !id.is_empty()) {
+            return ChatAction::GetFile(id.to_string());
         }
+    }
+    if let Some(id) = trimmed.strip_prefix("/reject ").map(str::trim).filter(|id| !id.is_empty()) {
+        return ChatAction::RejectFile(id.to_string());
+    }
+    if let Some(id) = trimmed.strip_prefix("/unshare ").map(str::trim).filter(|id| !id.is_empty()) {
+        return ChatAction::Unshare(id.to_string());
+    }
+    if trimmed == "/files" {
+        return ChatAction::ListFiles;
     }
     ChatAction::SendTextMessage(trimmed.to_string())
 }
@@ -612,17 +624,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Reservas em relays públicos quando o AutoNAT detecta NAT (habilita DCUtR / hole punching)
     let mut relay_manager = RelayManager::new();
 
-    // Gerenciamento de Transferência Direta de Arquivos P2P
-    // Tópico global do Gossipsub para ofertas e sinalização direta
-    let files_topic = IdentTopic::new("p2p-anarchord/direct-files");
-    let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&files_topic);
-
-    // Ofertas recebidas pendentes de aprovação pelo usuário: file_hash -> FileOffer
-    let mut pending_incoming_offers: HashMap<String, FileOffer> = HashMap::new();
-    // Receptores de arquivos em andamento (após aceitação): file_hash -> FileReceiver
-    let mut active_file_receivers: HashMap<String, FileReceiver> = HashMap::new();
-    // Arquivos locais que este nó ofereceu e estão aguardando o destinatário aceitar: file_hash -> (caminho, bytes)
-    let mut pending_outgoing_files: HashMap<String, (String, Vec<u8>)> = HashMap::new();
+    // Arquivos em enxame: ofertas na sala, pedaços pedidos direto a quem tem (protocolo /anarchord/files/1)
+    let download_dir = std::env::var("HOME").ok().map(PathBuf::from).map(|h| h.join("downloads")).unwrap_or_else(|| PathBuf::from("downloads"));
+    // Parciais separados por identidade: vários nós na mesma máquina não se misturam
+    let partial_dir = download_dir.join(".parcial").join(&identity.public_key_hex()[..8]);
+    let mut file_engine = FileEngine::new(partial_dir, download_dir);
+    let mut file_requests: HashMap<libp2p::request_response::OutboundRequestId, (PeerId, FileRequest)> = HashMap::new();
+    // Manifestos montados fora do loop (ler e calcular o hash de um arquivo grande leva tempo)
+    let (tx_manifest, mut rx_manifest) = tokio::sync::mpsc::unbounded_channel::<ManifestJob>();
+    let mut files_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    let resumed = file_engine.resume(std::time::Instant::now());
+    apply_file_actions(resumed, &mut file_engine, &mut node, &mut mls, &mut file_requests, &tx_ui_event, args.daemon);
 
     // Rastreamento de pares ativos falando/transmitindo áudio (pubkey -> (nome, Instant da última recepção))
     let mut active_speakers: HashMap<String, (String, std::time::Instant)> = HashMap::new();
@@ -741,6 +753,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             // Publicação de quadros de vídeo da tela capturada para a malha P2P
+            // Manifesto pronto: passa a semear e publica a oferta
+            Some(job) = rx_manifest.recv() => {
+                match job.manifest {
+                    Ok(manifest) => {
+                        let (_, actions) = file_engine.share(manifest, job.path, job.key, job.target, &my_nick);
+                        apply_file_actions(actions, &mut file_engine, &mut node, &mut mls, &mut file_requests, &tx_ui_event, args.daemon);
+                    }
+                    Err(e) => ui_log(&tx_ui_event, format!("❌ Erro ao ler '{}': {}", job.path.display(), e)),
+                }
+            }
+            _ = files_tick.tick() => {
+                let actions = file_engine.tick(std::time::Instant::now());
+                apply_file_actions(actions, &mut file_engine, &mut node, &mut mls, &mut file_requests, &tx_ui_event, args.daemon);
+            }
             Some(screen_pkt) = rx_screen_out.recv() => {
                 if let Some((_, announce)) = my_stream.as_mut() {
                     announce.width = screen_pkt.width;
@@ -968,88 +994,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let space = active.space.clone();
                                 enter_channel(&mut node, &servers, &mut active, space, new_channel, &peer_metadata, &tx_ui_event);
                             }
-                            ChatAction::SendFile { recipient_query, file_path } => {
-                                let target_pubkey = peer_metadata.iter().find_map(|(pid, (nick, pubkey))| {
-                                    if nick.eq_ignore_ascii_case(&recipient_query) || pid.to_string().starts_with(&recipient_query) || pubkey.starts_with(&recipient_query) {
-                                        Some(pubkey.clone())
-                                    } else {
-                                        None
-                                    }
-                                });
-
-                                let recipient_pubkey = match target_pubkey {
-                                    Some(pk) => pk,
-                                    None => {
-                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("❌ Destinatário '{}' não encontrado.", recipient_query)));
+                            ChatAction::ShareFile(file_path) => {
+                                // Em servidor, os pedaços vão cifrados com uma chave que só viaja na oferta (MLS)
+                                let key = match active.server_id() {
+                                    Some(id) if !mls.has_group(id) => {
+                                        ui_log(&tx_ui_event, "🔐 Ainda sem a chave do grupo cifrado deste servidor: espere o dono te admitir.".to_string());
                                         continue;
                                     }
+                                    Some(_) => Some(FileKey::generate()),
+                                    None => None,
                                 };
-
-                                let p = std::path::Path::new(&file_path);
-                                match std::fs::read(p) {
-                                    Ok(data) => {
-                                        let file_size = data.len() as u64;
-                                        let file_hash = calculate_file_hash(&data);
-                                        let file_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("arquivo.bin").to_string();
-                                        let chunks = chunk_file(&file_hash, &data);
-                                        let total_chunks = chunks.len() as u32;
-
-                                        let offer = FileOffer {
-                                            file_hash: file_hash.clone(),
-                                            file_name: file_name.clone(),
-                                            file_size,
-                                            total_chunks,
-                                            sender_pubkey: identity.public_key_hex(),
-                                            sender_name: my_nick.clone(),
-                                            recipient_pubkey: recipient_pubkey.clone(),
-                                        };
-
-                                        pending_outgoing_files.insert(file_hash.clone(), (file_name.clone(), data));
-
-                                        let msg = FileTransferMessage::Offer(offer);
-                                        if let Ok(bytes) = msg.to_bytes() {
-                                            let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
-                                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Proposta de envio de '{}' enviada para [{}]. Aguardando aceite...", file_name, recipient_query)));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("❌ Erro ao ler arquivo '{}': {:?}", file_path, e)));
-                                    }
+                                let target = ShareTarget::Topic(active.topic.hash().into_string());
+                                build_manifest(&tx_manifest, &tx_ui_event, &identity, &my_nick, &file_path, key, target);
+                            }
+                            ChatAction::SendFile { recipient_query, file_path } => {
+                                let target = peer_metadata.iter().find_map(|(pid, (nick, pubkey))| {
+                                    (nick.eq_ignore_ascii_case(&recipient_query) || pid.to_string().starts_with(&recipient_query) || pubkey.starts_with(&recipient_query))
+                                        .then_some(*pid)
+                                });
+                                match target {
+                                    Some(peer) => build_manifest(&tx_manifest, &tx_ui_event, &identity, &my_nick, &file_path, None, ShareTarget::Peer(peer)),
+                                    None => ui_log(&tx_ui_event, format!("❌ Destinatário '{}' não encontrado.", recipient_query)),
                                 }
                             }
-                            ChatAction::AcceptFile(hash_query) => {
-                                let target_key = pending_incoming_offers.keys().find(|k| k.starts_with(&hash_query)).cloned();
-                                if let Some(hash) = target_key {
-                                    if let Some(offer) = pending_incoming_offers.remove(&hash) {
-                                        active_file_receivers.insert(hash.clone(), FileReceiver::new(offer.file_name.clone(), offer.file_size, offer.total_chunks));
-                                        let decision = FileDecision {
-                                            file_hash: hash.clone(),
-                                            accepted: true,
-                                            responder_pubkey: identity.public_key_hex(),
-                                        };
-                                        let msg = FileTransferMessage::Decision(decision);
-                                        if let Ok(bytes) = msg.to_bytes() {
-                                            let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
-                                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Aceitou arquivo '{}'!", offer.file_name)));
-                                        }
-                                    }
+                            ChatAction::GetFile(query) => match file_engine.get(&query, std::time::Instant::now()) {
+                                Ok(actions) => apply_file_actions(actions, &mut file_engine, &mut node, &mut mls, &mut file_requests, &tx_ui_event, args.daemon),
+                                Err(e) => ui_log(&tx_ui_event, format!("❌ {}", e)),
+                            },
+                            ChatAction::RejectFile(query) => match file_engine.dismiss(&query) {
+                                Ok(name) => ui_log(&tx_ui_event, format!("Oferta de '{}' recusada.", name)),
+                                Err(e) => ui_log(&tx_ui_event, format!("❌ {}", e)),
+                            },
+                            ChatAction::Unshare(query) => match file_engine.unshare(&query) {
+                                Ok(name) => ui_log(&tx_ui_event, format!("📁 '{}' não está mais sendo compartilhado nem baixado.", name)),
+                                Err(e) => ui_log(&tx_ui_event, format!("❌ {}", e)),
+                            },
+                            ChatAction::ListFiles => {
+                                let list = file_engine.list(std::time::Instant::now());
+                                if list.is_empty() {
+                                    ui_log(&tx_ui_event, "📁 Nenhum arquivo. Compartilhe com /share <arquivo>.".to_string());
                                 }
-                            }
-                            ChatAction::RejectFile(hash_query) => {
-                                let target_key = pending_incoming_offers.keys().find(|k| k.starts_with(&hash_query)).cloned();
-                                if let Some(hash) = target_key {
-                                    if let Some(offer) = pending_incoming_offers.remove(&hash) {
-                                        let decision = FileDecision {
-                                            file_hash: hash.clone(),
-                                            accepted: false,
-                                            responder_pubkey: identity.public_key_hex(),
-                                        };
-                                        let msg = FileTransferMessage::Decision(decision);
-                                        if let Ok(bytes) = msg.to_bytes() {
-                                            let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
-                                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Rejeitou arquivo '{}'.", offer.file_name)));
-                                        }
-                                    }
+                                for file in list {
+                                    let state = match file.state {
+                                        FileState::Offered => format!("oferecido por {} · /get {}", file.from, file.cid.short()),
+                                        FileState::Downloading { progress, peers } => format!("baixando {:.0}% de {} par(es)", progress * 100.0, peers),
+                                        FileState::Seeding => "compartilhando".to_string(),
+                                    };
+                                    ui_log(&tx_ui_event, format!("📁 [{}] {} ({}) — {}", file.cid.short(), file.name, human_size(file.size), state));
                                 }
                             }
                             ChatAction::SendTextMessage(trimmed) => {
@@ -1303,143 +1294,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        // 3. Tenta decodificar como mensagem de transferência direta de arquivo P2P
-                        else if let Ok(file_msg) = FileTransferMessage::from_bytes(&data) {
-                            match file_msg {
-                                FileTransferMessage::Offer(offer) => {
-                                    // Verifica se o arquivo é direcionado a nós
-                                    if offer.recipient_pubkey == identity.public_key_hex() && offer.file_size > p2p_core::file_transfer::MAX_FILE_SIZE {
-                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!(
-                                            "❌ Oferta de '{}' recusada: {:.0} MB passa do limite de {} MB.",
-                                            offer.sender_name,
-                                            offer.file_size as f64 / (1024.0 * 1024.0),
-                                            p2p_core::file_transfer::MAX_FILE_SIZE / (1024 * 1024)
-                                        )));
-                                    } else if offer.recipient_pubkey == identity.public_key_hex() {
-                                        if args.daemon {
-                                            println!("\n📥 [TRANSFERÊNCIA DE ARQUIVO] Recebida proposta de '{}':", offer.sender_name);
-                                            println!("   📄 Arquivo : {}", offer.file_name);
-                                            println!("   📏 Tamanho : {:.2} MB ({} bytes em {} blocos de 64KB)", offer.file_size as f64 / (1024.0 * 1024.0), offer.file_size, offer.total_chunks);
-                                            println!("   🔑 Hash    : {}", offer.file_hash);
-                                        }
-                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Proposta de arquivo '{}' de {}. Use /accept {}", offer.file_name, offer.sender_name, &offer.file_hash[..8])));
-
-                                        // Se estiver rodando como Daemon (modo bot/servidor), aceita automaticamente
-                                        if args.daemon {
-                                            println!("🤖 [MODO DAEMON] Aceitando transferência automaticamente...");
-                                            active_file_receivers.insert(
-                                                offer.file_hash.clone(),
-                                                FileReceiver::new(offer.file_name.clone(), offer.file_size, offer.total_chunks),
-                                            );
-                                            let decision = FileDecision {
-                                                file_hash: offer.file_hash.clone(),
-                                                accepted: true,
-                                                responder_pubkey: identity.public_key_hex(),
-                                            };
-                                            let msg = FileTransferMessage::Decision(decision);
-                                            if let Ok(bytes) = msg.to_bytes() {
-                                                let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
-                                            }
-                                        } else {
-                                            println!("   💡 Para aceitar: /accept {}", &offer.file_hash[..8]);
-                                            println!("   💡 Para rejeitar: /reject {}\n", &offer.file_hash[..8]);
-                                            pending_incoming_offers.insert(offer.file_hash.clone(), offer);
-                                        }
-                                    }
+                        // 3. Enxame de arquivos: oferta, mapa de pedaços ou pedido de quem tem
+                        else if let Ok(swarm_msg) = SwarmMessage::from_bytes(&data) {
+                            let authentic = match &swarm_msg {
+                                SwarmMessage::Offer(offer) => {
+                                    offer.publisher != identity.public_key_hex()
+                                        && sender_matches(&offer.publisher)
+                                        && message.source.as_ref().and_then(pubkey_hex_from_peer_id).as_deref() == Some(offer.publisher.as_str())
                                 }
-                                FileTransferMessage::Decision(decision) => {
-                                    if let Some((file_name, data)) = pending_outgoing_files.get(&decision.file_hash) {
-                                        if decision.accepted {
-                                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Transferência aceita de '{}'! Enviando blocos...", file_name)));
-                                            if args.daemon {
-                                                println!("\n🎉 O destinatário ACEITOU a transferência de '{}'! Transmitindo blocos P2P...", file_name);
-                                            }
-                                            // Pequeno delay para garantir sincronização do Gossipsub
-                                            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-
-                                            let chunks = chunk_file(&decision.file_hash, data);
-                                            let total = chunks.len();
-                                            for (idx, chunk) in chunks.into_iter().enumerate() {
-                                                let msg = FileTransferMessage::Chunk(chunk);
-                                                if let Ok(bytes) = msg.to_bytes() {
-                                                    if let Err(e) = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes) {
-                                                        if args.daemon {
-                                                            println!("❌ Falha ao publicar bloco #{}: {:?}", idx + 1, e);
-                                                        }
-                                                    }
-                                                }
-                                                let pct = ((idx + 1) as f32 / total as f32) * 100.0;
-                                                let _ = tx_ui_event.send(UiEvent::FileTransferProgress {
-                                                    file_name: file_name.clone(),
-                                                    percentage: pct,
-                                                    is_download: false,
-                                                });
-                                                if args.daemon && ((idx + 1) % 10 == 0 || (idx + 1) == total) {
-                                                    println!("   📤 Enviado: {:.1}% ({}/{} blocos)", pct, idx + 1, total);
-                                                }
-                                                // Intervalo entre blocos para fluidez de rede
-                                                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-                                            }
-                                            if args.daemon {
-                                                println!("✅ Arquivo '{}' enviado com sucesso!\n", file_name);
-                                            }
-                                            pending_outgoing_files.remove(&decision.file_hash);
-                                        } else {
-                                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Transferência de '{}' foi recusada pelo destinatário.", file_name)));
-                                            if args.daemon {
-                                                println!("\n❌ O destinatário REJEITOU a transferência de '{}'.", file_name);
-                                            }
-                                            pending_outgoing_files.remove(&decision.file_hash);
-                                        }
-                                    }
-                                }
-                                FileTransferMessage::Chunk(chunk) => {
-                                    if let Some(receiver) = active_file_receivers.get_mut(&chunk.file_hash) {
-                                        let file_hash_clone = chunk.file_hash.clone();
-                                        let pct = receiver.add_chunk(chunk.chunk_index, chunk.data);
-                                        let _ = tx_ui_event.send(UiEvent::FileTransferProgress {
-                                            file_name: receiver.file_name.clone(),
-                                            percentage: pct,
-                                            is_download: true,
-                                        });
-                                        if args.daemon && ((chunk.chunk_index + 1) % 10 == 0 || receiver.is_complete()) {
-                                            println!("   📥 Baixando '{}': {:.1}%", receiver.file_name, pct);
-                                        }
-
-                                        if receiver.is_complete() {
-                                            let file_name = receiver.file_name.clone();
-                                            match receiver.assemble_and_verify(&file_hash_clone) {
-                                                Ok(completed_bytes) => {
-                                                    // Salva na pasta downloads do usuário se existir, senão downloads local
-                                                    let home_dir = std::env::var("HOME").ok().map(std::path::PathBuf::from);
-                                                    let download_dir = home_dir.map(|h| h.join("downloads")).unwrap_or_else(|| std::path::PathBuf::from("downloads"));
-                                                    // Nome vindo do remetente: sanitizado, sem sair da pasta e sem sobrescrever
-                                                    match p2p_core::file_transfer::save_received_file(&download_dir, &file_name, &completed_bytes) {
-                                                    Ok(save_path) => {
-                                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Arquivo '{}' salvo com sucesso em {:?}", file_name, save_path)));
-                                                        if args.daemon {
-                                                            println!("\n💾 [ARQUIVO CONCLUÍDO] '{}' salvo com sucesso em: {:?}", file_name, save_path);
-                                                            println!("   🔒 Integridade SHA-256 verificada com sucesso!\n");
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("❌ Erro ao salvar '{}': {}", file_name, e)));
-                                                        if args.daemon {
-                                                            println!("❌ Erro ao salvar arquivo '{}': {}", file_name, e);
-                                                        }
-                                                    }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    if args.daemon {
-                                                        println!("❌ Falha na verificação de integridade do arquivo: {}", e);
-                                                    }
-                                                }
-                                            }
-                                            active_file_receivers.remove(&file_hash_clone);
-                                        }
-                                    }
-                                }
+                                _ => true,
+                            };
+                            if let (true, Some(source)) = (authentic, message.source) {
+                                let actions = file_engine.on_gossip(source, message.topic.as_str(), swarm_msg, std::time::Instant::now());
+                                apply_file_actions(actions, &mut file_engine, &mut node, &mut mls, &mut file_requests, &tx_ui_event, args.daemon);
                             }
                         }
                         // 4. Tenta decodificar como quadro de compartilhamento de tela P2P (ScreenPacket)
@@ -1532,16 +1399,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tracing::debug!("mDNS expired: {} em {}", peer_id, multiaddr);
                         }
                     }
+                    // Protocolo de arquivos: pedidos de outros pares e respostas aos nossos
+                    libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Files(event)) => {
+                        let now = std::time::Instant::now();
+                        let actions = match event {
+                            libp2p::request_response::Event::Message { peer, message, .. } => match message {
+                                libp2p::request_response::Message::Request { request, channel, .. } => {
+                                    // Arquivo de servidor: só responde a membros do grupo cifrado
+                                    let requester = pubkey_hex_from_peer_id(&peer);
+                                    let allow = |topic: &str| match community::parse_server_content_topic(topic) {
+                                        Some(server_id) => requester.as_ref().is_some_and(|pk| mls.members(server_id).contains(pk)),
+                                        None => true,
+                                    };
+                                    let (response, actions) = file_engine.handle_request(peer, request, &allow, now);
+                                    let _ = node.swarm.behaviour_mut().files.send_response(channel, response);
+                                    actions
+                                }
+                                libp2p::request_response::Message::Response { request_id, response } => match file_requests.remove(&request_id) {
+                                    Some((peer, request)) => file_engine.on_response(peer, request, response, now),
+                                    None => Vec::new(),
+                                },
+                            },
+                            libp2p::request_response::Event::OutboundFailure { request_id, error, .. } => match file_requests.remove(&request_id) {
+                                Some((peer, request)) => {
+                                    tracing::debug!("Pedido de arquivo para {} falhou: {}", peer, error);
+                                    file_engine.on_failure(peer, request, now)
+                                }
+                                None => Vec::new(),
+                            },
+                            _ => Vec::new(),
+                        };
+                        apply_file_actions(actions, &mut file_engine, &mut node, &mut mls, &mut file_requests, &tx_ui_event, args.daemon);
+                    }
                     // Outros nós Anarchord encontrados na DHT: os endereços deles ficam disponíveis
                     // para o Kademlia enquanto a consulta está ativa, então discamos pelo PeerId
                     libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Kademlia(
                         libp2p::kad::Event::OutboundQueryProgressed {
                             result: libp2p::kad::QueryResult::GetProviders(Ok(
-                                libp2p::kad::GetProvidersOk::FoundProviders { providers, .. }
+                                libp2p::kad::GetProvidersOk::FoundProviders { key, providers }
                             )),
                             ..
                         }
                     )) => {
+                        // Provedores de um arquivo que estamos baixando
+                        let file_cid = file_engine.downloading().find(|cid| swarm_files::dht_key(cid) == key).copied();
+                        if let Some(cid) = file_cid {
+                            let found: Vec<PeerId> = providers.iter().filter(|p| **p != node.peer_id).copied().collect();
+                            let actions = file_engine.add_providers(&cid, found, std::time::Instant::now());
+                            apply_file_actions(actions, &mut file_engine, &mut node, &mut mls, &mut file_requests, &tx_ui_event, args.daemon);
+                        }
                         for provider in providers {
                             if provider != node.peer_id && !connected_peers.contains(&provider) {
                                 tracing::debug!("Par Anarchord encontrado via DHT: {}", provider);
@@ -1564,6 +1470,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Anuncia também os servidores acompanhados, para novos membros nos acharem pela DHT
                             for id in servers.list().filter(|s| s.has_chain()).map(|s| s.server_id.clone()).collect::<Vec<_>>() {
                                 node.dht_provide(server_dht_key(&id));
+                            }
+                            // E os arquivos públicos que estamos semeando
+                            for cid in file_engine.providing() {
+                                node.dht_provide(swarm_files::dht_key(&cid));
                             }
                         }
                     }
@@ -1704,6 +1614,108 @@ enum PublishError {
 }
 
 /// Publica conteúdo (chat, voz, tela). Em tópicos de servidor, cifra antes com o grupo MLS.
+/// Manifesto montado em segundo plano, pronto para compartilhar
+struct ManifestJob {
+    manifest: std::io::Result<Manifest>,
+    path: PathBuf,
+    key: Option<FileKey>,
+    target: ShareTarget,
+}
+
+/// Lê o arquivo e monta o manifesto numa thread de bloqueio, sem travar o loop
+fn build_manifest(
+    tx: &UnboundedSender<ManifestJob>,
+    tx_ui_event: &UnboundedSender<UiEvent>,
+    identity: &UserIdentity,
+    nick: &str,
+    file_path: &str,
+    key: Option<FileKey>,
+    target: ShareTarget,
+) {
+    let path = std::fs::canonicalize(file_path).unwrap_or_else(|_| PathBuf::from(file_path));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(file_path).to_string();
+    ui_log(tx_ui_event, format!("📁 Preparando '{}' para compartilhar ({})...", name, nick));
+    let (tx, identity) = (tx.clone(), identity.clone());
+    tokio::task::spawn_blocking(move || {
+        let manifest = Manifest::from_file(&path, &identity, key.as_ref(), now_secs());
+        let _ = tx.send(ManifestJob { manifest, path, key, target });
+    });
+}
+
+/// Executa o que o motor do enxame pediu: pedidos, publicações, DHT e avisos na interface
+fn apply_file_actions(
+    actions: Vec<FileAction>,
+    engine: &mut FileEngine,
+    node: &mut P2PNode,
+    mls: &mut ServerGroups,
+    requests: &mut HashMap<libp2p::request_response::OutboundRequestId, (PeerId, FileRequest)>,
+    tx_ui_event: &UnboundedSender<UiEvent>,
+    daemon: bool,
+) {
+    let mut queue: std::collections::VecDeque<FileAction> = actions.into();
+    while let Some(action) = queue.pop_front() {
+        match action {
+            FileAction::Request { peer, request } => {
+                let id = node.swarm.behaviour_mut().files.send_request(&peer, request.clone());
+                requests.insert(id, (peer, request));
+            }
+            FileAction::Publish { topic, message } => {
+                if publish_content(node, mls, &IdentTopic::new(topic), message.to_bytes()).is_err() {
+                    tracing::debug!("Mensagem do enxame não publicada (sem pares no tópico ou sem chave do grupo)");
+                }
+            }
+            FileAction::Provide(cid) => node.dht_provide(swarm_files::dht_key(&cid)),
+            FileAction::FindProviders(cid) => node.dht_find(swarm_files::dht_key(&cid)),
+            FileAction::Event(event) => match event {
+                FileEvent::Offered { cid, name, size, from, direct } => {
+                    let how = if direct { "te enviou" } else { "compartilhou" };
+                    let text = format!("📎 {} {} '{}' ({}). Baixe com /get {}", from, how, name, human_size(size), cid.short());
+                    ui_log(tx_ui_event, text.clone());
+                    if daemon {
+                        // O daemon só existe para testes: baixa tudo o que for oferecido
+                        println!("{}", text);
+                        if let Ok(more) = engine.get(&cid.short(), std::time::Instant::now()) {
+                            queue.extend(more);
+                        }
+                    }
+                }
+                FileEvent::Shared { cid, name } => ui_log(
+                    tx_ui_event,
+                    format!("📤 '{}' compartilhado (id {}). Fica disponível enquanto o app estiver aberto.", name, cid.short()),
+                ),
+                FileEvent::Started { name, .. } => {
+                    ui_log(tx_ui_event, format!("📥 Baixando '{}'...", name));
+                    let _ = tx_ui_event.send(UiEvent::FileTransferProgress { file_name: name, percentage: 0.0, is_download: true });
+                }
+                FileEvent::Progress { name, progress, .. } => {
+                    let percentage = (progress * 100.0).min(99.9);
+                    let _ = tx_ui_event.send(UiEvent::FileTransferProgress { file_name: name, percentage, is_download: true });
+                }
+                FileEvent::Completed { name, path, .. } => {
+                    let _ = tx_ui_event.send(UiEvent::FileTransferProgress { file_name: name.clone(), percentage: 100.0, is_download: true });
+                    ui_log(tx_ui_event, format!("💾 '{}' salvo em {}. Agora você também compartilha com quem pedir.", name, path.display()));
+                    if daemon {
+                        println!("📁 [DAEMON ARQUIVO] '{}' recebido e conferido: {}", name, path.display());
+                    }
+                }
+                FileEvent::Failed { name, reason, .. } => {
+                    let _ = tx_ui_event.send(UiEvent::FileTransferProgress { file_name: name.clone(), percentage: -1.0, is_download: true });
+                    ui_log(tx_ui_event, format!("❌ '{}': {}", name, reason));
+                }
+            },
+        }
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b if b >= 1 << 10 => format!("{:.0} KB", b as f64 / 1024.0),
+        b => format!("{} B", b),
+    }
+}
+
 fn publish_content(node: &mut P2PNode, mls: &mut ServerGroups, topic: &IdentTopic, bytes: Vec<u8>) -> Result<(), PublishError> {
     let topic_name = topic.hash().into_string();
     let payload = match community::parse_server_content_topic(&topic_name) {
@@ -2419,8 +2431,12 @@ mod tests {
         );
         assert_eq!(
             parse_user_input("/accept 8f4a123b"),
-            ChatAction::AcceptFile("8f4a123b".to_string())
+            ChatAction::GetFile("8f4a123b".to_string())
         );
+        assert_eq!(parse_user_input("/get bafk1234"), ChatAction::GetFile("bafk1234".to_string()));
+        assert_eq!(parse_user_input(r#"/share "C:\fotos\a b.png""#), ChatAction::ShareFile(r"C:\fotos\a b.png".to_string()));
+        assert_eq!(parse_user_input("/files"), ChatAction::ListFiles);
+        assert_eq!(parse_user_input("/unshare filme.mkv"), ChatAction::Unshare("filme.mkv".to_string()));
         assert_eq!(
             parse_user_input("/reject 8f4a123b"),
             ChatAction::RejectFile("8f4a123b".to_string())

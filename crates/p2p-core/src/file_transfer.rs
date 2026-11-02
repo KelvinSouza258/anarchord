@@ -1,11 +1,7 @@
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+//! Nomes e destino seguros para arquivos recebidos de outros pares.
+//! A transferência em si fica em [`crate::files`] (enxame).
 
-/// Tamanho máximo aceito numa oferta de arquivo (o arquivo inteiro fica em memória)
-pub const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
+use std::path::{Path, PathBuf};
 
 /// Nome usado quando o nome recebido não sobra nada utilizável
 const FALLBACK_NAME: &str = "arquivo.bin";
@@ -52,10 +48,9 @@ pub fn sanitize_file_name(name: &str) -> String {
     }
 }
 
-/// Grava `data` em `dir` com o nome recebido já sanitizado, sem sobrescrever nada:
-/// se o nome existe, usa `nome (1).ext`, `nome (2).ext`… (criação atômica com `create_new`).
-/// Garante que o arquivo final fica dentro de `dir`. Retorna o caminho gravado.
-pub fn save_received_file(dir: &Path, received_name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
+/// Cria (vazio) o arquivo de destino em `dir` com o nome sanitizado e sem sobrescrever nada,
+/// reservando o nome. Retorna o caminho e o arquivo aberto para escrita.
+pub fn create_unique_file(dir: &Path, received_name: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
     std::fs::create_dir_all(dir)?;
     let base = dir.canonicalize()?;
     let name = sanitize_file_name(received_name);
@@ -69,153 +64,12 @@ pub fn save_received_file(dir: &Path, received_name: &str, data: &[u8]) -> std::
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "destino fora da pasta de downloads"));
         }
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&target) {
-            Ok(mut file) => {
-                file.write_all(data)?;
-                return Ok(target);
-            }
+            Ok(file) => return Ok((target, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
     }
     Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "nomes disponíveis esgotados"))
-}
-
-/// Tamanho padrão de cada bloco de transferência P2P (64 KB)
-pub const CHUNK_SIZE: usize = 64 * 1024;
-
-/// Proposta de envio direto de arquivo (oferta P2P)
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct FileOffer {
-    /// ID único da transferência (hash SHA-256 do arquivo completo)
-    pub file_hash: String,
-    /// Nome original do arquivo (sem caminhos de diretório)
-    pub file_name: String,
-    /// Tamanho total em bytes
-    pub file_size: u64,
-    /// Total de chunks de 64KB necessários
-    pub total_chunks: u32,
-    /// Chave pública Ed25519 do remetente
-    pub sender_pubkey: String,
-    /// Nome/Apelido do remetente
-    pub sender_name: String,
-    /// Chave pública Ed25519 do destinatário pretendido
-    pub recipient_pubkey: String,
-}
-
-/// Resposta do destinatário aceitando ou rejeitando a oferta de arquivo
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct FileDecision {
-    pub file_hash: String,
-    pub accepted: bool,
-    pub responder_pubkey: String,
-}
-
-/// Um bloco individual do arquivo transmitido diretamente entre os pares
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct FileChunk {
-    pub file_hash: String,
-    pub chunk_index: u32,
-    pub total_chunks: u32,
-    pub data: Vec<u8>,
-}
-
-/// Mensagem unificada de transferência direta de arquivos na malha P2P
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum FileTransferMessage {
-    /// Oferta enviada do Remetente -> Destinatário
-    Offer(FileOffer),
-    /// Decisão enviada do Destinatário -> Remetente (Aceite / Rejeição)
-    Decision(FileDecision),
-    /// Chunks de dados enviados do Remetente -> Destinatário
-    Chunk(FileChunk),
-}
-
-impl FileTransferMessage {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
-    }
-}
-
-/// Montador e reconstrutor de arquivos recebidos em chunks
-#[derive(Debug, Clone)]
-pub struct FileReceiver {
-    pub file_name: String,
-    pub file_size: u64,
-    pub total_chunks: u32,
-    pub received_chunks: HashMap<u32, Vec<u8>>,
-}
-
-impl FileReceiver {
-    pub fn new(file_name: String, file_size: u64, total_chunks: u32) -> Self {
-        Self {
-            file_name,
-            file_size,
-            total_chunks,
-            received_chunks: HashMap::new(),
-        }
-    }
-
-    /// Adiciona um pedaço recebido e retorna o progresso atual em porcentagem (0.0 a 100.0)
-    pub fn add_chunk(&mut self, chunk_index: u32, data: Vec<u8>) -> f32 {
-        self.received_chunks.insert(chunk_index, data);
-        (self.received_chunks.len() as f32 / self.total_chunks as f32) * 100.0
-    }
-
-    /// Retorna verdadeiro se todos os chunks foram recebidos
-    pub fn is_complete(&self) -> bool {
-        self.received_chunks.len() == self.total_chunks as usize
-    }
-
-    /// Reconstitui os bytes na ordem correta e valida contra o hash SHA-256 esperado
-    pub fn assemble_and_verify(&self, expected_sha256: &str) -> Result<Vec<u8>, &'static str> {
-        if !self.is_complete() {
-            return Err("Nem todos os blocos foram recebidos ainda");
-        }
-
-        let mut full_bytes = Vec::with_capacity(self.file_size as usize);
-        for i in 0..self.total_chunks {
-            if let Some(chunk_data) = self.received_chunks.get(&i) {
-                full_bytes.extend_from_slice(chunk_data);
-            } else {
-                return Err("Bloco faltante na sequência");
-            }
-        }
-
-        let actual_hash = calculate_file_hash(&full_bytes);
-        if actual_hash != expected_sha256 {
-            return Err("Checksum SHA-256 incorreto; arquivo corrompido");
-        }
-
-        Ok(full_bytes)
-    }
-}
-
-/// Utilitário para fatiar um arquivo em memória em chunks de 64KB prontos para envio
-pub fn chunk_file(file_hash: &str, data: &[u8]) -> Vec<FileChunk> {
-    let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE).collect();
-    let total_chunks = chunks.len() as u32;
-
-    chunks
-        .into_iter()
-        .enumerate()
-        .map(|(index, chunk_slice)| FileChunk {
-            file_hash: file_hash.to_string(),
-            chunk_index: index as u32,
-            total_chunks,
-            data: chunk_slice.to_vec(),
-        })
-        .collect()
-}
-
-/// Calcula a assinatura SHA-256 em hexadecimal de um arquivo / buffer
-pub fn calculate_file_hash(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -248,75 +102,17 @@ mod tests {
     }
 
     #[test]
-    fn test_save_received_file_stays_in_dir_and_never_overwrites() {
+    fn test_unique_file_stays_in_dir_and_never_overwrites() {
         let dir = std::env::temp_dir().join(format!("anarchord_downloads_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let first = save_received_file(&dir, "../../fora.txt", b"um").unwrap();
-        let second = save_received_file(&dir, "fora.txt", b"dois").unwrap();
+        let (first, _) = create_unique_file(&dir, "../../fora.txt").unwrap();
+        std::fs::write(&first, b"um").unwrap();
+        let (second, _) = create_unique_file(&dir, "fora.txt").unwrap();
         let base = dir.canonicalize().unwrap();
         assert_eq!(first, base.join("fora.txt"));
         assert_eq!(second, base.join("fora (1).txt"));
         assert_eq!(std::fs::read(&first).unwrap(), b"um", "não sobrescreve");
         assert!(!dir.parent().unwrap().join("fora.txt").exists(), "nada gravado fora da pasta");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_file_chunking_and_reassembly() {
-        // Gera um arquivo simulado de 150 KB (deve gerar 3 chunks de 64KB)
-        let file_data = vec![0x42u8; 150 * 1024];
-        let file_hash = calculate_file_hash(&file_data);
-
-        let chunks = chunk_file(&file_hash, &file_data);
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].chunk_index, 0);
-        assert_eq!(chunks[0].data.len(), 64 * 1024);
-        assert_eq!(chunks[1].chunk_index, 1);
-        assert_eq!(chunks[1].data.len(), 64 * 1024);
-        assert_eq!(chunks[2].chunk_index, 2);
-        assert_eq!(chunks[2].data.len(), 22 * 1024);
-
-        // Receptor monta o arquivo
-        let mut receiver = FileReceiver::new("teste.png".into(), file_data.len() as u64, chunks.len() as u32);
-        assert!(!receiver.is_complete());
-
-        // Recebe pedaços (inclusive fora de ordem)
-        receiver.add_chunk(chunks[1].chunk_index, chunks[1].data.clone());
-        receiver.add_chunk(chunks[0].chunk_index, chunks[0].data.clone());
-        receiver.add_chunk(chunks[2].chunk_index, chunks[2].data.clone());
-
-        assert!(receiver.is_complete());
-        let assembled = receiver.assemble_and_verify(&file_hash).expect("Deve montar e validar hash");
-        assert_eq!(assembled, file_data);
-    }
-
-    #[test]
-    fn test_corrupted_reassembly_fails() {
-        let file_data = b"conteudo de arquivo original secreto";
-        let file_hash = calculate_file_hash(file_data);
-
-        let mut receiver = FileReceiver::new("doc.txt".into(), file_data.len() as u64, 1);
-        receiver.add_chunk(0, b"conteudo adulterado".to_vec());
-
-        assert!(receiver.is_complete());
-        let result = receiver.assemble_and_verify(&file_hash);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_serialization_messages() {
-        let offer = FileTransferMessage::Offer(FileOffer {
-            file_hash: "abcd123".into(),
-            file_name: "foto.jpg".into(),
-            file_size: 1048576,
-            total_chunks: 16,
-            sender_pubkey: "alice_key".into(),
-            sender_name: "Alice".into(),
-            recipient_pubkey: "bob_key".into(),
-        });
-
-        let bytes = offer.to_bytes().expect("Deve serializar");
-        let decoded = FileTransferMessage::from_bytes(&bytes).expect("Deve desserializar");
-        assert_eq!(offer, decoded);
     }
 }

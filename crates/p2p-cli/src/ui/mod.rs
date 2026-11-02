@@ -296,7 +296,10 @@ impl TerminalUi {
                 }
             }
             UiEvent::FileTransferProgress { file_name, percentage, is_download } => {
-                if percentage >= 100.0 {
+                if percentage < 0.0 {
+                    // Transferência falhou ou foi cancelada
+                    self.file_transfer = None;
+                } else if percentage >= 100.0 {
                     self.file_transfer = None;
                     self.push_system(format!("✅ Arquivo '{}' concluído com sucesso!", file_name));
                 } else {

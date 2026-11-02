@@ -10,6 +10,9 @@ use p2p_core::community::{server_control_topic, ModKind, ServerEvent, ServerMess
 use p2p_core::{
     api::pubkey_hex_from_peer_id, parse_agent_version, protocol::AppBehaviourEvent, ChatMessage, P2PNode, UserIdentity,
 };
+use libp2p::request_response::{self, OutboundRequestId};
+use p2p_core::files::{FileAction, FileEngine, FileEvent, FileRequest, FileResponse, Manifest, ShareTarget, SwarmMessage, PIECE_SIZE};
+use std::collections::HashMap;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -321,4 +324,117 @@ async fn test_server_chain_sync_and_moderation_over_network() {
     let bob_view = bob_servers.get(&server_id).unwrap();
     assert!(bob_view.chain().state().is_banned(&spammer, T0 + 30), "ban definitivo na cadeia");
     assert_eq!(bob_view.pending_actions().count(), 0);
+}
+
+/// Executa as ações do motor do enxame num nó de verdade
+fn run_file_actions(
+    node: &mut P2PNode,
+    actions: Vec<FileAction>,
+    pending: &mut HashMap<OutboundRequestId, (PeerId, FileRequest)>,
+    events: &mut Vec<FileEvent>,
+) {
+    for action in actions {
+        match action {
+            FileAction::Request { peer, request } => {
+                let id = node.swarm.behaviour_mut().files.send_request(&peer, request.clone());
+                pending.insert(id, (peer, request));
+            }
+            FileAction::Publish { topic, message } => {
+                let _ = node.swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(topic), message.to_bytes());
+            }
+            FileAction::Event(event) => events.push(event),
+            FileAction::Provide(_) | FileAction::FindProviders(_) => {}
+        }
+    }
+}
+
+/// Trata um evento do protocolo de arquivos e devolve as ações resultantes
+fn on_files_event(
+    node: &mut P2PNode,
+    engine: &mut FileEngine,
+    event: request_response::Event<FileRequest, FileResponse>,
+    pending: &mut HashMap<OutboundRequestId, (PeerId, FileRequest)>,
+) -> Vec<FileAction> {
+    let now = std::time::Instant::now();
+    match event {
+        request_response::Event::Message { peer, message, .. } => match message {
+            request_response::Message::Request { request, channel, .. } => {
+                let (response, actions) = engine.handle_request(peer, request, &|_| true, now);
+                let _ = node.swarm.behaviour_mut().files.send_response(channel, response);
+                actions
+            }
+            request_response::Message::Response { request_id, response } => match pending.remove(&request_id) {
+                Some((peer, request)) => engine.on_response(peer, request, response, now),
+                None => Vec::new(),
+            },
+        },
+        request_response::Event::OutboundFailure { request_id, .. } => match pending.remove(&request_id) {
+            Some((peer, request)) => engine.on_failure(peer, request, now),
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Enxame de arquivos na rede real: a oferta vai pelo tópico, os pedaços pelo protocolo direto
+#[tokio::test]
+async fn test_swarm_file_transfer_over_network() {
+    let mut alice = node("Alice");
+    let mut bob = node("Bob");
+    let topic = unique_topic("arquivos");
+    alice.swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
+    bob.swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
+    connect_and_wait_subscription(&mut alice, &mut bob, &topic).await;
+
+    let dir = std::env::temp_dir().join(format!("anarchord_two_nodes_files_{}", PeerId::random()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("relatorio.pdf");
+    let data: Vec<u8> = (0..(3 * PIECE_SIZE as usize - 7)).map(|i| (i * 13 % 256) as u8).collect();
+    std::fs::write(&path, &data).unwrap();
+
+    let mut alice_files = FileEngine::new(dir.join("parcial_a"), dir.join("down_a"));
+    let mut bob_files = FileEngine::new(dir.join("parcial_b"), dir.join("down_b"));
+    let (mut alice_pending, mut bob_pending) = (HashMap::new(), HashMap::new());
+    let (mut alice_events, mut bob_events) = (Vec::new(), Vec::new());
+
+    let manifest = Manifest::from_file(&path, &alice.identity, None, 0).unwrap();
+    let (cid, actions) = alice_files.share(manifest, path, None, ShareTarget::Topic(topic.hash().into_string()), "Alice");
+    run_file_actions(&mut alice, actions, &mut alice_pending, &mut alice_events);
+
+    let saved = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match next_event(&mut alice, &mut bob).await {
+                (Side::Bob, SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. }))) => {
+                    let Ok(msg) = SwarmMessage::from_bytes(&message.data) else { continue };
+                    let now = std::time::Instant::now();
+                    let mut actions = bob_files.on_gossip(message.source.unwrap(), message.topic.as_str(), msg, now);
+                    if actions.iter().any(|a| matches!(a, FileAction::Event(FileEvent::Offered { .. }))) {
+                        actions.extend(bob_files.get(&cid.short(), now).unwrap());
+                    }
+                    run_file_actions(&mut bob, actions, &mut bob_pending, &mut bob_events);
+                }
+                (Side::Alice, SwarmEvent::Behaviour(AppBehaviourEvent::Files(event))) => {
+                    let actions = on_files_event(&mut alice, &mut alice_files, event, &mut alice_pending);
+                    run_file_actions(&mut alice, actions, &mut alice_pending, &mut alice_events);
+                }
+                (Side::Bob, SwarmEvent::Behaviour(AppBehaviourEvent::Files(event))) => {
+                    let actions = on_files_event(&mut bob, &mut bob_files, event, &mut bob_pending);
+                    run_file_actions(&mut bob, actions, &mut bob_pending, &mut bob_events);
+                }
+                _ => {}
+            }
+            if let Some(path) = bob_events.iter().find_map(|e| match e {
+                FileEvent::Completed { path, .. } => Some(path.clone()),
+                _ => None,
+            }) {
+                break path;
+            }
+        }
+    })
+    .await
+    .expect("Bob deveria baixar o arquivo de Alice");
+
+    assert_eq!(saved.file_name().unwrap(), "relatorio.pdf");
+    assert_eq!(std::fs::read(&saved).unwrap(), data);
+    let _ = std::fs::remove_dir_all(&dir);
 }

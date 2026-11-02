@@ -144,6 +144,13 @@ impl P2PNode {
                 let autonat = autonat::Behaviour::new(key.public().to_peer_id(), autonat::Config::default());
                 let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
 
+                // 7. Protocolo de arquivos do enxame (pedaços em bytes crus, um stream por pedido)
+                let files = libp2p::request_response::Behaviour::with_codec(
+                    crate::files::FileCodec,
+                    [(crate::files::PROTOCOL, libp2p::request_response::ProtocolSupport::Full)],
+                    libp2p::request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+                );
+
                 Ok(AppBehaviour {
                     kademlia,
                     gossipsub,
@@ -153,6 +160,7 @@ impl P2PNode {
                     autonat,
                     dcutr,
                     relay_client,
+                    files,
                 })
             })
             .map_err(|e| NodeError::SwarmInit(e.to_string()))?
