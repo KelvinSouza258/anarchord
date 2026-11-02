@@ -19,7 +19,7 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 use editor::LineEditor;
-use menu::{channel_command, channel_menu, main_menu, member_menu, Menu, MenuAction, MenuContext, ServerEntry, HELP_LINES};
+use menu::{channel_command, channel_menu, main_menu, member_menu, spaces_menu, Menu, MenuAction, MenuContext, ServerEntry, HELP_LINES};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,6 +109,10 @@ pub struct TerminalUi {
     chat_area: Rect,
     /// Largura do rótulo da aba Chat no título (para saber em qual aba o clique caiu)
     tab_split: u16,
+    /// Linha do texto da barra superior e colunas [início, fim) do espaço atual e do MIC (clicáveis)
+    header_row: u16,
+    header_space_cols: (u16, u16),
+    header_mic_cols: (u16, u16),
     channels_area: Rect,
     popup_area: Rect,
     peers: Vec<(String, String, String)>, // (PeerId, Nick, PubKey) - Todo o Swarm
@@ -152,6 +156,9 @@ impl TerminalUi {
             in_server: false,
             chat_area: Rect::default(),
             tab_split: 0,
+            header_row: u16::MAX,
+            header_space_cols: (0, 0),
+            header_mic_cols: (0, 0),
             channels_area: Rect::default(),
             popup_area: Rect::default(),
             peers: Vec::new(),
@@ -425,6 +432,16 @@ impl TerminalUi {
                     _ => {}
                 }
                 let Some(right_click) = click else { return Vec::new() };
+                if !right_click && row == self.header_row {
+                    let inside = |(start, end): (u16, u16)| col >= start && col < end;
+                    if inside(self.header_mic_cols) {
+                        return vec![UiAction::ToggleMute];
+                    }
+                    if inside(self.header_space_cols) {
+                        self.overlay = Some(Overlay::Menu(vec![spaces_menu(&self.servers)]));
+                    }
+                    return Vec::new();
+                }
                 if !right_click && row == self.chat_area.y && col > self.chat_area.x && col < self.chat_area.x + self.chat_area.width {
                     let tab = if col < self.chat_area.x + 1 + self.tab_split { Tab::Chat } else { Tab::System };
                     self.switch_tab(tab);
@@ -633,13 +650,27 @@ impl TerminalUi {
             "🎙️  [MIC ATIVO]"
         };
 
-        let header = Paragraph::new(Line::from(vec![
+        let spans = vec![
             Span::styled("⚡ ANARCHORD P2P ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(format!("| Usuário: {} ", self.my_nick), Style::default().fg(Color::Cyan)),
             Span::styled(format!("| Chave: {}... ", &self.my_pubkey[..8]), Style::default().fg(Color::DarkGray)),
             Span::styled(format!("| {} #{} ", self.space_name, self.current_channel), Style::default().fg(Color::Green)),
             Span::styled(format!("| {}", muted_str), Style::default().fg(Color::Magenta)),
-        ]))
+        ];
+        // Guarda onde ficaram o espaço (abre a troca Lobby/servidores) e o MIC (liga/desliga)
+        let mut col = chunks[0].x + 1;
+        let ranges: Vec<(u16, u16)> = spans
+            .iter()
+            .map(|span| {
+                let start = col;
+                col = col.saturating_add(span.width() as u16);
+                (start, col)
+            })
+            .collect();
+        self.header_row = chunks[0].y + 1;
+        self.header_space_cols = ranges[3];
+        self.header_mic_cols = ranges[4];
+        let header = Paragraph::new(Line::from(spans))
         .block(Block::default().borders(Borders::ALL).title(" Anarchord Core v0.1.0 "));
         f.render_widget(header, chunks[0]);
 
@@ -1373,6 +1404,30 @@ mod tests {
 
         ui.handle_event(UiEvent::SystemLog("outro evento".into()));
         assert!(!render(&mut ui).contains("Sistema (1)"), "com a aba aberta, não conta como não lida");
+    }
+
+    #[test]
+    fn test_clicking_header_toggles_mic_and_opens_spaces() {
+        let mut ui = ui_for("Alice");
+        render(&mut ui);
+        let click_at = |ui: &mut TerminalUi, col: u16| {
+            let row = ui.header_row;
+            ui.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: col, row, modifiers: KeyModifiers::NONE })
+        };
+        let mic = ui.header_mic_cols.0 + 3;
+        assert!(click_at(&mut ui, mic).iter().any(|a| matches!(a, UiAction::ToggleMute)));
+        assert!(ui.overlay.is_none());
+
+        let space = ui.header_space_cols.0 + 3;
+        assert!(click_at(&mut ui, space).is_empty());
+        let Some(Overlay::Menu(stack)) = &ui.overlay else { panic!("menu de espaços não abriu") };
+        assert!(stack.last().unwrap().find("▶ 🌐 Lobby").is_some());
+
+        // Em outro ponto da barra não faz nada
+        ui.overlay = None;
+        let outside = ui.header_space_cols.0 - 2;
+        assert!(click_at(&mut ui, outside).is_empty());
+        assert!(ui.overlay.is_none());
     }
 
     #[test]

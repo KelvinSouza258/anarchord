@@ -2257,8 +2257,11 @@ fn handle_server_network_message(
                     tx_ui_event,
                     format!("🔐 Você foi removido do grupo cifrado de '{}': não recebe mais o conteúdo do servidor.", name),
                 ),
-                // Perdemos algum Commit: descarta e pede entrada de novo no próximo ciclo
-                Ok(CommitOutcome::OutOfSync) => mls.drop_group(server_id),
+                // Perdemos algum Commit: descarta e pede entrada de novo no próximo ciclo. Um Commit
+                // de época futura não pode ser verificado, então só confiamos nele se quem publicou
+                // (autor assinado do Gossipsub) for o dono; senão qualquer um derrubaria o grupo.
+                Ok(CommitOutcome::OutOfSync) if from_pubkey == Some(owner.as_str()) => mls.drop_group(server_id),
+                Ok(CommitOutcome::OutOfSync) => tracing::debug!("Commit fora de sincronia de quem não é o dono ignorado"),
                 Ok(_) => {}
                 Err(e) => tracing::debug!("Commit MLS inválido: {}", e),
             }
@@ -2267,7 +2270,8 @@ fn handle_server_network_message(
         ServerMessage::Welcome { server_id, target, welcome } => {
             if *target == me && !mls.has_group(server_id) {
                 let name = servers.get(server_id).map(|s| s.name()).unwrap_or_default();
-                match mls.join(server_id, welcome) {
+                let owner = servers.get(server_id).map(|s| s.chain().state().owner.clone()).unwrap_or_default();
+                match mls.join(server_id, welcome, &owner) {
                     Ok(()) => ui_log(
                         tx_ui_event,
                         format!("🔐 Chave do grupo de '{}' recebida: chat, voz e tela cifrados de ponta a ponta.", name),

@@ -211,15 +211,23 @@ impl ServerGroups {
     }
 
     /// Entra no grupo com um Welcome. Falha se o Welcome não é para este nó.
-    pub fn join(&mut self, server_id: &str, welcome: &[u8]) -> Result<(), E2eeError> {
+    /// Entra no grupo pelo Welcome. Só vale Welcome enviado pelo `owner` (identidade pessoal do
+    /// dono, registrada na cadeia): o ID do servidor é público, então qualquer um poderia criar um
+    /// grupo com o mesmo `group_id` e atrair membros para ele, lendo o que mandassem.
+    pub fn join(&mut self, server_id: &str, welcome: &[u8], owner: &str) -> Result<(), E2eeError> {
         let message = MlsMessageIn::tls_deserialize_exact(welcome).map_err(|e| E2eeError::BadMessage(format!("{:?}", e)))?;
         let MlsMessageBodyIn::Welcome(welcome) = message.extract() else {
             return Err(E2eeError::BadMessage("não é um Welcome".into()));
         };
-        let group = StagedWelcome::new_from_welcome(&self.provider, &Self::join_config(), welcome, None)
-            .map_err(mls)?
-            .into_group(&self.provider)
-            .map_err(mls)?;
+        let staged = StagedWelcome::new_from_welcome(&self.provider, &Self::join_config(), welcome, None).map_err(mls)?;
+        // A assinatura do GroupInfo já foi verificada pelo openmls contra a folha de quem enviou
+        let sender = staged.welcome_sender().map_err(mls)?;
+        // Credencial básica não amarra a chave: confere também a chave de assinatura (é a identidade)
+        let key_hex: String = sender.signature_key().as_slice().iter().map(|b| format!("{:02x}", b)).collect();
+        if sender.credential().serialized_content() != owner.as_bytes() || key_hex != owner {
+            return Err(E2eeError::NotOwner);
+        }
+        let group = staged.into_group(&self.provider).map_err(mls)?;
         if group.group_id().as_slice() != server_id.as_bytes() {
             return Err(E2eeError::BadMessage("Welcome de outro grupo".into()));
         }
@@ -404,7 +412,7 @@ mod tests {
                 assert!(matches!(m.process_commit(SERVER, c, owner.me()).unwrap(), CommitOutcome::Applied { .. }));
             }
         }
-        newcomer.join(SERVER, &welcome).unwrap();
+        newcomer.join(SERVER, &welcome, owner.me()).unwrap();
     }
 
     #[test]
@@ -472,6 +480,25 @@ mod tests {
         assert_eq!(carol.decrypt(SERVER, &msg).unwrap().plaintext, b"Carol continua");
     }
 
+    /// Alguém cria um grupo com o mesmo ID do servidor e manda um Welcome: é recusado
+    #[test]
+    fn test_welcome_from_non_owner_is_rejected() {
+        let (_a, mut alice) = node("Alice");
+        let (_e, mut eve) = node("Eve");
+        let (_b, mut bob) = node("Bob");
+        alice.create_group(SERVER).unwrap();
+        eve.create_group(SERVER).unwrap();
+        let kp = bob.key_package().unwrap();
+        let me = bob.me().to_string();
+        let (_commits, fake) = eve.add_member(SERVER, &kp, &me).unwrap();
+        assert!(matches!(bob.join(SERVER, &fake, alice.me()), Err(E2eeError::NotOwner)));
+        assert!(!bob.has_group(SERVER));
+        // O Welcome verdadeiro continua funcionando
+        admit(&mut alice, &mut bob, &mut []);
+        let msg = alice.encrypt(SERVER, b"grupo certo").unwrap();
+        assert_eq!(bob.decrypt(SERVER, &msg).unwrap().plaintext, b"grupo certo");
+    }
+
     #[test]
     fn test_key_package_must_belong_to_publisher() {
         let (_a, mut alice) = node("Alice");
@@ -495,14 +522,14 @@ mod tests {
         let kp = carol.key_package().unwrap();
         let me = carol.me().to_string();
         let (_missed, welcome) = alice.add_member(SERVER, &kp, &me).unwrap();
-        carol.join(SERVER, &welcome).unwrap();
+        carol.join(SERVER, &welcome, alice.me()).unwrap();
 
         let (_c2, mut dave) = node("Dave");
         let kp = dave.key_package().unwrap();
         let me = dave.me().to_string();
         let (commits, dave_welcome) = alice.add_member(SERVER, &kp, &me).unwrap();
         assert!(matches!(carol.process_commit(SERVER, &commits[0], alice.me()).unwrap(), CommitOutcome::Applied { .. }));
-        dave.join(SERVER, &dave_welcome).unwrap();
+        dave.join(SERVER, &dave_welcome, alice.me()).unwrap();
         assert_eq!(bob.process_commit(SERVER, &commits[0], alice.me()).unwrap(), CommitOutcome::OutOfSync);
 
         bob.drop_group(SERVER);
