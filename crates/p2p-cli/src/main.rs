@@ -190,29 +190,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Jitter Buffers para pares remotos (um por PeerId/chave pública)
     let mut remote_jitter_buffers: HashMap<String, JitterBuffer> = HashMap::new();
 
-    // Se a flag --synth-audio estiver ativada, transmite ondas sonoras senoidais periódicas
+    // Se a flag --synth-audio estiver ativada, transmite melodia chiptune retrô de 8-bits
     if args.synth_audio {
         let voice_seq_synth = Arc::clone(&voice_seq);
         let my_pubkey_synth = identity.public_key_hex();
         let my_nick_synth = identity.profile.display_name.clone();
         let tx_synth = tx_voice_to_broadcast.clone();
 
-        println!("📻 Modo Sintetizador de Áudio ativado: gerando áudio a 440Hz contínuo...");
+        println!("📻 Modo Sintetizador 8-Bits ativado: tocando melodia chiptune retrô contínua...");
         std::thread::spawn(move || {
-            let mut phase: f32 = 0.0;
-            let sample_rate = p2p_core::SAMPLE_RATE as f32;
+            let sample_rate = p2p_core::SAMPLE_RATE as f32; // 48000 Hz
             let frame_size = p2p_core::FRAME_SIZE; // 960 amostras (20ms)
-            let freq = 440.0; // Nota Lá (440Hz)
-            let phase_step = (2.0 * std::f32::consts::PI * freq) / sample_rate;
+
+            // Frequências das notas musicais em Hz
+            const REST: f32 = 0.0;
+            const C4: f32 = 261.63;
+            const D4: f32 = 293.66;
+            const E4: f32 = 329.63;
+            const F4: f32 = 349.23;
+            const G4: f32 = 392.00;
+            const A4: f32 = 440.00;
+            const B4: f32 = 493.88;
+            const C5: f32 = 523.25;
+            const D5: f32 = 587.33;
+            const E5: f32 = 659.25;
+            const G5: f32 = 783.99;
+
+            // Melodia estilo Chiptune / Super Mario: (lead, bass, duração_em_frames_de_20ms)
+            let score: [(f32, f32, u32); 43] = [
+                // Intro Mario
+                (E5, C4, 6), (REST, REST, 2), (E5, C4, 6), (REST, REST, 4), (E5, C4, 6), (REST, REST, 4),
+                (C5, G4, 6), (REST, REST, 2), (E5, C4, 6), (REST, REST, 4), (G5, G4, 12), (REST, REST, 6),
+                (G4, G4, 12), (REST, REST, 8),
+
+                // Frase A (Korobeiniki / Aventura 8-bit)
+                (E4, C4, 8), (B4, G4, 4), (C5, E4, 4), (D5, G4, 8), (C5, E4, 4), (B4, G4, 4),
+                (A4, F4, 8), (A4, F4, 4), (C5, A4, 4), (E5, C4, 8), (D5, G4, 4), (C5, E4, 4),
+                (B4, G4, 10), (C5, E4, 4), (D5, G4, 8), (E5, C4, 8),
+                (C5, A4, 8), (A4, F4, 8), (A4, F4, 10), (REST, REST, 6),
+
+                // Arpeggio de fechamento
+                (C4, C4, 4), (E4, C4, 4), (G4, E4, 4), (C5, G4, 4), (E5, C5, 6), (REST, REST, 4),
+                (D5, B4, 6), (C5, C4, 12), (REST, REST, 10),
+            ];
+
+            let mut note_idx = 0;
+            let mut frames_left_in_note = score[0].2;
+            let mut lead_phase: f32 = 0.0;
+            let mut bass_phase: f32 = 0.0;
 
             loop {
                 let start_time = std::time::Instant::now();
+                let (lead_freq, bass_freq, _) = score[note_idx];
+
+                let lead_step = if lead_freq > 0.0 {
+                    (2.0 * std::f32::consts::PI * lead_freq) / sample_rate
+                } else {
+                    0.0
+                };
+
+                let bass_step = if bass_freq > 0.0 {
+                    (2.0 * std::f32::consts::PI * bass_freq) / sample_rate
+                } else {
+                    0.0
+                };
+
                 let mut samples = Vec::with_capacity(frame_size);
 
                 for _ in 0..frame_size {
-                    let sample = (phase.sin()) * 0.5; // 50% de volume para ser agradável
-                    samples.push(sample);
-                    phase = (phase + phase_step) % (2.0 * std::f32::consts::PI);
+                    // Onda quadrada com duty-cycle de 50% para Lead (Canal de pulso NES)
+                    let lead_sample = if lead_freq > 0.0 {
+                        if lead_phase < std::f32::consts::PI { 0.25 } else { -0.25 }
+                    } else {
+                        0.0
+                    };
+
+                    // Onda quadrada com duty-cycle de 25% para Bass (Canal de baixo)
+                    let bass_sample = if bass_freq > 0.0 {
+                        if bass_phase < (std::f32::consts::PI * 0.5) { 0.15 } else { -0.15 }
+                    } else {
+                        0.0
+                    };
+
+                    samples.push(lead_sample + bass_sample);
+
+                    lead_phase = (lead_phase + lead_step) % (2.0 * std::f32::consts::PI);
+                    bass_phase = (bass_phase + bass_step) % (2.0 * std::f32::consts::PI);
+                }
+
+                // Avança na partitura de notas
+                frames_left_in_note -= 1;
+                if frames_left_in_note == 0 {
+                    note_idx = (note_idx + 1) % score.len();
+                    frames_left_in_note = score[note_idx].2;
                 }
 
                 let seq = voice_seq_synth.fetch_add(1, Ordering::SeqCst);
