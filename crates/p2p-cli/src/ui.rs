@@ -352,6 +352,13 @@ impl TerminalUi {
             );
         f.render_widget(input_box, chunks[2]);
 
+        // Posiciona o cursor do terminal no final do texto digitado
+        // x = margem esquerda (1 borda) + 2 caracteres ("❯ ") + comprimento do texto
+        // y = topo do quadro de input + 1 (borda superior)
+        let cursor_x = chunks[2].x + 3 + self.input.chars().count() as u16;
+        let cursor_y = chunks[2].y + 1;
+        f.set_cursor_position((cursor_x, cursor_y));
+
         // 4. Rodapé de Notificações / Status Bar (Redirecionamento de logs de sistema)
         let footer = Paragraph::new(Line::from(vec![
             Span::styled(" 📢 STATUS: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
