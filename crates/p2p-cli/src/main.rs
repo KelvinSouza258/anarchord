@@ -597,6 +597,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rastreamento de nós conectados para desduplicação e metadados de identificação
     let mut connected_peers: HashSet<libp2p::PeerId> = HashSet::new();
     let mut peer_metadata: HashMap<libp2p::PeerId, (String, String)> = HashMap::new(); // PeerId -> (Nick, PubKey)
+    // Pares Anarchord já anunciados na interface desde que conectaram (o Identify se repete a cada
+    // conexão; só a primeira identificação é notificada)
+    let mut identified: HashSet<libp2p::PeerId> = HashSet::new();
+    // Endereços discados que já têm conexão aberta (o tracker devolve os mesmos pares a cada ciclo)
+    let mut dialed_open: HashSet<libp2p::Multiaddr> = HashSet::new();
 
     // Busca periódica de outros nós Anarchord na DHT (registros de provedor)
     let mut dht_search_interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -722,7 +727,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Auto-conexão com nós descobertos via Tracker / DHT
             Some(discovered_addr) = rx_peer_discovery.recv() => {
                 if let Ok(multiaddr) = discovered_addr.parse::<libp2p::Multiaddr>() {
-                    let _ = node.swarm.dial(multiaddr);
+                    // O tracker repete os mesmos pares a cada 10 s: não redisca quem já está conectado
+                    if !dialed_open.contains(&multiaddr) {
+                        let _ = node.swarm.dial(multiaddr);
+                    }
                 }
             }
 
@@ -1031,13 +1039,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         connected_peers.insert(peer_id);
+                        if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                            dialed_open.insert(address.clone());
+                        }
                         // Com a DHT ativa, a maioria das conexões é com nós do IPFS; os pares Anarchord
                         // aparecem na UI quando o Identify confirma a identidade
                         tracing::debug!("Conexão P2P com {} via {:?}", peer_id, endpoint.get_remote_address());
                     }
-                    libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. } => {
+                    libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, num_established, endpoint, .. } => {
+                        if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                            dialed_open.remove(address);
+                        }
                         if num_established == 0 {
                             connected_peers.remove(&peer_id);
+                            identified.remove(&peer_id);
                             relay_manager.remove_peer(&peer_id);
                             if peer_metadata.contains_key(&peer_id) {
                                 let _ = tx_ui_event.send(UiEvent::PeerDisconnected(peer_id.to_string()));
@@ -1067,7 +1082,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Extrai Nickname e PubKey do agent_version ("anarchord:nick:pubkey")
                         if let Some((nick, pubkey)) = parse_agent_version(&info.agent_version) {
-                            peer_metadata.insert(peer_id, (nick.clone(), pubkey.clone()));
+                            // O Identify se repete a cada conexão com o mesmo par: só notifica a
+                            // primeira identificação (ou se o nick mudou)
+                            let changed = peer_metadata.insert(peer_id, (nick.clone(), pubkey.clone())) != Some((nick.clone(), pubkey.clone()));
+                            if !identified.insert(peer_id) && !changed {
+                                continue;
+                            }
                             let _ = tx_ui_event.send(UiEvent::PeerConnected {
                                 peer_id: peer_id.to_string(),
                                 nick: nick.clone(),
@@ -1401,14 +1421,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(
                         libp2p::mdns::Event::Discovered(list)
                     )) => {
+                        // Um par anuncia vários endereços (interfaces × TCP/QUIC): disca uma vez por par,
+                        // com todos os endereços, e só se não houver conexão nem discagem em andamento.
+                        // Descoberta não é notificada: o aviso útil é "Par conectado" (Identify).
+                        let mut by_peer: HashMap<libp2p::PeerId, Vec<libp2p::Multiaddr>> = HashMap::new();
                         for (peer_id, multiaddr) in list {
                             if peer_id != node.peer_id && !connected_peers.contains(&peer_id) {
-                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🔍 Par local descoberto via mDNS: {} em {}", peer_id, multiaddr)));
-                                if args.daemon {
-                                    println!("🔍 Par local descoberto via mDNS: {} em {}", peer_id, multiaddr);
-                                }
-                                let _ = node.swarm.dial(multiaddr);
+                                by_peer.entry(peer_id).or_default().push(multiaddr);
                             }
+                        }
+                        for (peer_id, addresses) in by_peer {
+                            tracing::debug!("Par local descoberto via mDNS: {} ({} endereços)", peer_id, addresses.len());
+                            let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+                                .addresses(addresses)
+                                .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                                .build();
+                            let _ = node.swarm.dial(opts);
                         }
                     }
                     libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(
@@ -1430,11 +1458,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )) => {
                         for provider in providers {
                             if provider != node.peer_id && !connected_peers.contains(&provider) {
-                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🌍 Par Anarchord encontrado via DHT: {}", provider)));
-                                if args.daemon {
-                                    println!("🌍 Par Anarchord encontrado via DHT: {}", provider);
-                                }
-                                let _ = node.swarm.dial(provider);
+                                tracing::debug!("Par Anarchord encontrado via DHT: {}", provider);
+                                let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(provider)
+                                    .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                                    .build();
+                                let _ = node.swarm.dial(opts);
                             }
                         }
                     }

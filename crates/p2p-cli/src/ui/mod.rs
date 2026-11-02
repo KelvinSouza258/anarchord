@@ -93,7 +93,13 @@ pub struct TerminalUi {
     current_voice_channel: Option<String>,
     /// Barra de entrada (cursor, histórico, Tab)
     editor: LineEditor,
+    /// Aba Chat: só conversas
     messages: Vec<String>,
+    /// Aba Sistema: notificações do core (conexões, DHT, sincronização, avisos)
+    system_messages: Vec<String>,
+    active_tab: Tab,
+    /// Notificações chegadas enquanto a aba Sistema não estava aberta
+    system_unread: usize,
     /// Linhas roladas para cima no chat (0 = mostrando as mais recentes)
     chat_scroll: usize,
     /// Menu, diálogo ou ajuda aberto por cima da tela
@@ -101,6 +107,8 @@ pub struct TerminalUi {
     servers: Vec<ServerEntry>,
     in_server: bool,
     chat_area: Rect,
+    /// Largura do rótulo da aba Chat no título (para saber em qual aba o clique caiu)
+    tab_split: u16,
     channels_area: Rect,
     popup_area: Rect,
     peers: Vec<(String, String, String)>, // (PeerId, Nick, PubKey) - Todo o Swarm
@@ -135,11 +143,15 @@ impl TerminalUi {
                 "🚀 Bem-vindo ao Anarchord P2P (100% Descentralizado)!".to_string(),
                 "💡 F1 abre o menu · clique num membro ou canal para ver as opções · /help lista os comandos".to_string(),
             ],
+            system_messages: Vec::new(),
+            active_tab: Tab::Chat,
+            system_unread: 0,
             chat_scroll: 0,
             overlay: None,
             servers: Vec::new(),
             in_server: false,
             chat_area: Rect::default(),
+            tab_split: 0,
             channels_area: Rect::default(),
             popup_area: Rect::default(),
             peers: Vec::new(),
@@ -232,7 +244,7 @@ impl TerminalUi {
             }
             UiEvent::SystemLog(log) => {
                 self.last_status_bar = log.clone();
-                self.messages.push(format!("⚙️  {}", log));
+                self.push_system(format!("⚙️  {}", log));
             }
             UiEvent::SpaceChanged { space_name, channels, is_server } => {
                 self.space_name = space_name;
@@ -256,15 +268,15 @@ impl TerminalUi {
                     self.peers[pos] = (peer_id, nick.clone(), pubkey);
                 } else {
                     self.peers.push((peer_id, nick.clone(), pubkey));
-                    self.messages.push(format!("🤝 Par conectado: {}", nick));
+                    self.push_system(format!("🤝 Par conectado: {}", nick));
                 }
             }
             UiEvent::PeerDisconnected(peer_id) => {
                 if let Some(pos) = self.peers.iter().position(|(pid, _, _)| pid == &peer_id) {
                     let (_, nick, _) = self.peers.remove(pos);
-                    self.messages.push(format!("👋 Par desconectado: {}", nick));
+                    self.push_system(format!("👋 Par desconectado: {}", nick));
                 } else {
-                    self.messages.push(format!("👋 Par desconectado: {}", peer_id));
+                    self.push_system(format!("👋 Par desconectado: {}", peer_id));
                 }
             }
             UiEvent::VoiceActivity { nick, speaking } => {
@@ -279,7 +291,7 @@ impl TerminalUi {
             UiEvent::FileTransferProgress { file_name, percentage, is_download } => {
                 if percentage >= 100.0 {
                     self.file_transfer = None;
-                    self.messages.push(format!("✅ Arquivo '{}' concluído com sucesso!", file_name));
+                    self.push_system(format!("✅ Arquivo '{}' concluído com sucesso!", file_name));
                 } else {
                     self.file_transfer = Some((file_name, percentage, is_download));
                 }
@@ -357,6 +369,7 @@ impl TerminalUi {
                     self.last_status_bar = format!("Opções: {}", options.join("   "));
                 }
             }
+            KeyCode::F(2) => self.switch_tab(self.active_tab.other()),
             KeyCode::PageUp => self.scroll_chat(5),
             KeyCode::PageDown => self.scroll_chat(-5),
             KeyCode::Esc => self.editor.set(""),
@@ -412,6 +425,11 @@ impl TerminalUi {
                     _ => {}
                 }
                 let Some(right_click) = click else { return Vec::new() };
+                if !right_click && row == self.chat_area.y && col > self.chat_area.x && col < self.chat_area.x + self.chat_area.width {
+                    let tab = if col < self.chat_area.x + 1 + self.tab_split { Tab::Chat } else { Tab::System };
+                    self.switch_tab(tab);
+                    return Vec::new();
+                }
                 if let Some(index) = row_in(self.peers_area, col, row) {
                     // A primeira linha é o próprio usuário
                     if let Some(nick) = self.member_rows.get(index).filter(|n| **n != self.my_nick).cloned() {
@@ -495,9 +513,34 @@ impl TerminalUi {
         words
     }
 
-    /// Rola o chat: positivo = mensagens mais antigas
+    /// Notificação do core: vai para a aba Sistema (e conta como não lida se ela estiver fechada)
+    fn push_system(&mut self, text: String) {
+        self.system_messages.push(text);
+        if self.active_tab != Tab::System {
+            self.system_unread += 1;
+        }
+    }
+
+    fn switch_tab(&mut self, tab: Tab) {
+        if tab != self.active_tab {
+            self.active_tab = tab;
+            self.chat_scroll = 0;
+        }
+        if tab == Tab::System {
+            self.system_unread = 0;
+        }
+    }
+
+    fn current_lines(&self) -> &[String] {
+        match self.active_tab {
+            Tab::Chat => &self.messages,
+            Tab::System => &self.system_messages,
+        }
+    }
+
+    /// Rola a aba atual: positivo = mensagens mais antigas
     fn scroll_chat(&mut self, delta: isize) {
-        let max = self.messages.len().saturating_sub(1) as isize;
+        let max = self.current_lines().len().saturating_sub(1) as isize;
         self.chat_scroll = (self.chat_scroll as isize + delta).clamp(0, max) as usize;
     }
 
@@ -610,7 +653,7 @@ impl TerminalUi {
             .split(chunks[1]);
 
         // Se houver arquivo transferindo, divide a janela do chat para mostrar barra de progresso
-        if let Some((name, pct, is_download)) = &self.file_transfer {
+        if let Some((name, pct, is_download)) = self.file_transfer.clone() {
             let chat_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(4), Constraint::Length(3)])
@@ -619,7 +662,7 @@ impl TerminalUi {
             self.chat_area = chat_chunks[0];
             self.render_messages(f, chat_chunks[0]);
 
-            let title = if *is_download {
+            let title = if is_download {
                 format!(" 📥 Baixando arquivo: {} ", name)
             } else {
                 format!(" 📤 Enviando arquivo: {} ", name)
@@ -628,7 +671,7 @@ impl TerminalUi {
             let gauge = Gauge::default()
                 .block(Block::default().borders(Borders::ALL).title(title))
                 .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
-                .percent(*pct as u16);
+                .percent(pct as u16);
             f.render_widget(gauge, chat_chunks[1]);
         } else {
             self.chat_area = main_chunks[0];
@@ -784,12 +827,13 @@ impl TerminalUi {
         self.draw_overlay(f, size);
     }
 
-    fn render_messages(&self, f: &mut ratatui::Frame, area: Rect) {
+    fn render_messages(&mut self, f: &mut ratatui::Frame, area: Rect) {
         let max_lines = area.height.saturating_sub(2) as usize;
-        let end = self.messages.len().saturating_sub(self.chat_scroll);
+        let lines = self.current_lines();
+        let end = lines.len().saturating_sub(self.chat_scroll);
         let start = end.saturating_sub(max_lines);
 
-        let visible_msgs: Vec<ListItem> = self.messages[start..end]
+        let visible_msgs: Vec<ListItem> = lines[start..end]
             .iter()
             .map(|m| {
                 let style = if m.starts_with("⚙️") {
@@ -805,12 +849,31 @@ impl TerminalUi {
             })
             .collect();
 
+        // Título com as duas abas; a ativa em destaque
+        let chat_label = format!(" 💬 Chat #{} ", self.current_channel);
+        let system_label = if self.system_unread > 0 {
+            format!(" ⚙️ Sistema ({}) ", self.system_unread)
+        } else {
+            " ⚙️ Sistema ".to_string()
+        };
+        self.tab_split = chat_label.chars().count() as u16 + 1;
+        let tab_style = |active: bool| {
+            if active {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            }
+        };
+        let mut title = vec![
+            Span::styled(chat_label, tab_style(self.active_tab == Tab::Chat)),
+            Span::raw("│"),
+            Span::styled(system_label, tab_style(self.active_tab == Tab::System)),
+        ];
+        if self.chat_scroll > 0 {
+            title.push(Span::raw(format!(" · ↑ {} acima do fim (PgDn volta) ", self.chat_scroll)));
+        }
         let messages_list = List::new(visible_msgs)
-            .block(Block::default().borders(Borders::ALL).title(format!(
-                " Chat #{}{} ",
-                self.current_channel,
-                if self.chat_scroll > 0 { format!(" · ↑ {} mensagens acima do fim (PgDn volta)", self.chat_scroll) } else { String::new() }
-            )));
+            .block(Block::default().borders(Borders::ALL).title(Line::from(title)).title_bottom(" F2 alterna abas "));
         f.render_widget(messages_list, area);
     }
 
@@ -819,6 +882,22 @@ impl TerminalUi {
         execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
         terminal.show_cursor()?;
         Ok(())
+    }
+}
+
+/// Abas da área de mensagens
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tab {
+    Chat,
+    System,
+}
+
+impl Tab {
+    fn other(self) -> Self {
+        match self {
+            Tab::Chat => Tab::System,
+            Tab::System => Tab::Chat,
+        }
     }
 }
 
@@ -960,7 +1039,9 @@ mod tests {
 
         let screen = render(&mut ui);
         assert!(screen.contains("[Swarm: 0]"), "{}", screen);
-        assert!(screen.contains("Par desconectado: Bob"), "{}", screen);
+        assert!(!screen.contains("Par desconectado: Bob"), "notificação não polui o chat");
+        ui.handle_key(key(KeyCode::F(2)));
+        assert!(render(&mut ui).contains("Par desconectado: Bob"));
     }
 
     #[test]
@@ -1264,9 +1345,49 @@ mod tests {
         ui.handle_key(key(KeyCode::PageUp));
         let screen = render(&mut ui);
         assert!(!screen.contains("mensagem 99"), "rolou para cima:\n{}", screen);
-        assert!(screen.contains("mensagens acima do fim"), "{}", screen);
+        assert!(screen.contains("acima do fim"), "{}", screen);
 
         ui.handle_event(UiEvent::ChannelChanged("jogos".into()));
         assert!(render(&mut ui).contains("Chat #jogos"), "título acompanha o canal");
+    }
+
+    #[test]
+    fn test_core_notifications_go_to_system_tab() {
+        let mut ui = ui_for("Alice");
+        ui.handle_event(UiEvent::SystemLog("Endereço de escuta: /ip4/1.2.3.4".into()));
+        ui.handle_event(UiEvent::SystemLog("📜 Rust Guild sincronizado".into()));
+        ui.handle_event(UiEvent::ChatMessage { channel: "geral".into(), author: "Bob".into(), text: "oi".into() });
+
+        let screen = render(&mut ui);
+        assert!(screen.contains("Bob: oi"), "{}", screen);
+        assert!(!screen.contains("Endereço de escuta"), "chat sem notificações:\n{}", screen);
+        assert!(screen.contains("Sistema (2)"), "contador de não lidas:\n{}", screen);
+        let status_line = screen.lines().last().unwrap_or_default();
+        assert!(status_line.contains("Rust Guild sincronizado"), "barra de status mostra o último evento: {}", status_line);
+
+        ui.handle_key(key(KeyCode::F(2)));
+        let screen = render(&mut ui);
+        assert!(screen.contains("Endereço de escuta"), "{}", screen);
+        assert!(!screen.contains("Bob: oi"), "{}", screen);
+        assert!(!screen.contains("Sistema (2)"), "lidas ao abrir a aba");
+
+        ui.handle_event(UiEvent::SystemLog("outro evento".into()));
+        assert!(!render(&mut ui).contains("Sistema (1)"), "com a aba aberta, não conta como não lida");
+    }
+
+    #[test]
+    fn test_clicking_tab_title_switches_tab() {
+        let mut ui = ui_for("Alice");
+        ui.handle_event(UiEvent::SystemLog("evento do core".into()));
+        render(&mut ui);
+        let (x, y, split) = (ui.chat_area.x, ui.chat_area.y, ui.tab_split);
+        let click_at = |ui: &mut TerminalUi, col: u16| {
+            ui.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: col, row: y, modifiers: KeyModifiers::NONE })
+        };
+        click_at(&mut ui, x + split + 4);
+        assert_eq!(ui.active_tab, Tab::System);
+        assert!(render(&mut ui).contains("evento do core"));
+        click_at(&mut ui, x + 3);
+        assert_eq!(ui.active_tab, Tab::Chat);
     }
 }
