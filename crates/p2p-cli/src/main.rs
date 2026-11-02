@@ -1132,12 +1132,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             if args.daemon {
                                                 println!("\n🎉 O destinatário ACEITOU a transferência de '{}'! Transmitindo blocos P2P...", file_name);
                                             }
+                                            // Pequeno delay para garantir sincronização do Gossipsub
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
                                             let chunks = chunk_file(&decision.file_hash, data);
                                             let total = chunks.len();
                                             for (idx, chunk) in chunks.into_iter().enumerate() {
                                                 let msg = FileTransferMessage::Chunk(chunk);
                                                 if let Ok(bytes) = msg.to_bytes() {
-                                                    let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
+                                                    if let Err(e) = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes) {
+                                                        if args.daemon {
+                                                            println!("❌ Falha ao publicar bloco #{}: {:?}", idx + 1, e);
+                                                        }
+                                                    }
                                                 }
                                                 let pct = ((idx + 1) as f32 / total as f32) * 100.0;
                                                 let _ = tx_ui_event.send(UiEvent::FileTransferProgress {
@@ -1148,6 +1155,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 if args.daemon && ((idx + 1) % 10 == 0 || (idx + 1) == total) {
                                                     println!("   📤 Enviado: {:.1}% ({}/{} blocos)", pct, idx + 1, total);
                                                 }
+                                                // Intervalo entre blocos para fluidez de rede
+                                                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
                                             }
                                             if args.daemon {
                                                 println!("✅ Arquivo '{}' enviado com sucesso!\n", file_name);
@@ -1179,12 +1188,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             let file_name = receiver.file_name.clone();
                                             match receiver.assemble_and_verify(&file_hash_clone) {
                                                 Ok(completed_bytes) => {
-                                                    // Salva na pasta downloads local
-                                                    let download_dir = std::path::Path::new("downloads");
-                                                    let _ = std::fs::create_dir_all(download_dir);
+                                                    // Salva na pasta downloads do usuário se existir, senão downloads local
+                                                    let home_dir = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+                                                    let download_dir = home_dir.map(|h| h.join("downloads")).unwrap_or_else(|| std::path::PathBuf::from("downloads"));
+                                                    let _ = std::fs::create_dir_all(&download_dir);
                                                     let save_path = download_dir.join(&file_name);
                                                     if let Ok(_) = std::fs::write(&save_path, &completed_bytes) {
-                                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Arquivo '{}' salvo com sucesso em downloads/", file_name)));
+                                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Arquivo '{}' salvo com sucesso em {:?}", file_name, save_path)));
                                                         if args.daemon {
                                                             println!("\n💾 [ARQUIVO CONCLUÍDO] '{}' salvo com sucesso em: {:?}", file_name, save_path);
                                                             println!("   🔒 Integridade SHA-256 verificada com sucesso!\n");
