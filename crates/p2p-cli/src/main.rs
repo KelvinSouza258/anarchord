@@ -1,4 +1,5 @@
 mod ui;
+mod screen_viewer;
 
 use clap::Parser;
 use futures::StreamExt;
@@ -13,9 +14,11 @@ use p2p_core::{
     identity::UserIdentity,
     node::P2PNode,
     protocol::AppBehaviourEvent,
+    screen::{ScreenCaptureEngine, ScreenPacket},
     tracker::{make_info_hash, TorrentTrackerClient},
     voice::{AudioCodec, AudioDeviceManager, JitterBuffer, VoiceEngine, VoicePacket},
 };
+use screen_viewer::ScreenViewer;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -79,6 +82,10 @@ pub enum ChatAction {
     SendFile { recipient_query: String, file_path: String },
     AcceptFile(String),
     RejectFile(String),
+    ScreenStart(usize),
+    ScreenStop,
+    ScreenWatch(String),
+    ScreenList,
     SendTextMessage(String),
     Empty,
 }
@@ -100,6 +107,26 @@ pub fn parse_user_input(input: &str) -> ChatAction {
     }
     if trimmed == "/mute" {
         return ChatAction::ToggleMute;
+    }
+    if trimmed == "/screen start" {
+        return ChatAction::ScreenStart(0);
+    }
+    if trimmed.starts_with("/screen start ") {
+        let idx_str = trimmed.trim_start_matches("/screen start ").trim();
+        let idx = idx_str.parse::<usize>().unwrap_or(0);
+        return ChatAction::ScreenStart(idx);
+    }
+    if trimmed == "/screen stop" {
+        return ChatAction::ScreenStop;
+    }
+    if trimmed == "/screen list" {
+        return ChatAction::ScreenList;
+    }
+    if trimmed.starts_with("/screen watch ") {
+        let target = trimmed.trim_start_matches("/screen watch ").trim();
+        if !target.is_empty() {
+            return ChatAction::ScreenWatch(target.to_string());
+        }
     }
     if trimmed.starts_with("/voice join ") {
         let v_channel = trimmed.trim_start_matches("/voice join ").trim();
@@ -542,6 +569,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut active_speakers: HashMap<String, (String, std::time::Instant)> = HashMap::new();
     let mut speaker_check_interval = tokio::time::interval(std::time::Duration::from_millis(200));
 
+    // Subsistema de Compartilhamento de Tela P2P (Screen Share)
+    let screen_topic = IdentTopic::new("p2p-discord/screens");
+    let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&screen_topic);
+    let screen_capture_engine = Arc::new(ScreenCaptureEngine::new());
+    let (tx_screen_out, mut rx_screen_out) = tokio::sync::mpsc::unbounded_channel::<ScreenPacket>();
+    let (tx_viewer_frame, rx_viewer_frame) = std::sync::mpsc::channel::<Vec<u8>>();
+    let rx_viewer_frame_arc = Arc::new(std::sync::Mutex::new(rx_viewer_frame));
+    let screen_viewer_active = Arc::new(AtomicBool::new(false));
+    let mut current_watching_stream: Option<String> = None;
+    let mut active_screen_streams: HashMap<String, (String, String, u32, u32, std::time::Instant)> = HashMap::new(); // stream_id -> (nick, pubkey, w, h, last_seen)
+
     // Loop de eventos da malha P2P + Teclado + Auto-Discovery
     loop {
         tokio::select! {
@@ -560,6 +598,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
+            // Publicação de quadros de vídeo da tela capturada para a malha P2P
+            Some(screen_pkt) = rx_screen_out.recv() => {
+                if let Ok(pkt_bytes) = screen_pkt.to_bytes() {
+                    let _ = node.swarm.behaviour_mut().gossipsub.publish(screen_topic.clone(), pkt_bytes);
+                }
+            }
+
             // Auto-conexão com nós descobertos via Tracker / DHT
             Some(discovered_addr) = rx_peer_discovery.recv() => {
                 if let Ok(multiaddr) = discovered_addr.parse::<libp2p::Multiaddr>() {
@@ -620,6 +665,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(engine) = &voice_engine {
                                     let muted = engine.toggle_mute();
                                     let _ = tx_ui_event.send(UiEvent::SystemLog(if muted { "Microfone MUTADO.".to_string() } else { "Microfone ATIVADO.".to_string() }));
+                                }
+                            }
+                            ChatAction::ScreenList => {
+                                let screens = ScreenCaptureEngine::list_screens();
+                                let mut msg = format!("Telas locais detectadas ({}): ", screens.len());
+                                for (i, s) in screens.iter().enumerate() {
+                                    msg.push_str(&format!("[{}] {} ({}x{}){} | ", i, s.name, s.width, s.height, if s.is_primary { " (Primária)" } else { "" }));
+                                }
+                                let _ = tx_ui_event.send(UiEvent::SystemLog(msg));
+                            }
+                            ChatAction::ScreenStart(monitor_idx) => {
+                                if screen_capture_engine.is_streaming_handle().load(Ordering::Relaxed) {
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog("Você já está transmitindo sua tela. Use /screen stop para parar.".to_string()));
+                                } else {
+                                    let stream_id = format!("screen:{}", &identity.public_key_hex()[..8]);
+                                    let tx_frame = tx_screen_out.clone();
+                                    screen_capture_engine.start_capture(
+                                        stream_id.clone(),
+                                        identity.public_key_hex(),
+                                        args.nick.clone(),
+                                        monitor_idx,
+                                        15, // 15 FPS
+                                        65, // JPEG quality
+                                        move |pkt| {
+                                            let _ = tx_frame.send(pkt);
+                                        },
+                                    );
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog(format!("📺 Transmissão de tela INICIADA (Stream ID: {}). Use /screen stop para encerrar.", stream_id)));
+                                }
+                            }
+                            ChatAction::ScreenStop => {
+                                if screen_capture_engine.is_streaming_handle().load(Ordering::Relaxed) {
+                                    screen_capture_engine.stop_capture();
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog("📺 Transmissão de tela ENCERRADA.".to_string()));
+                                } else {
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog("Nenhuma transmissão de tela em andamento.".to_string()));
+                                }
+                            }
+                            ChatAction::ScreenWatch(target_query) => {
+                                let target_stream = active_screen_streams.iter().find_map(|(sid, (nick, pubkey, _, _, _))| {
+                                    if nick.eq_ignore_ascii_case(&target_query) || sid.starts_with(&target_query) || pubkey.starts_with(&target_query) {
+                                        Some((sid.clone(), nick.clone()))
+                                    } else {
+                                        None
+                                    }
+                                });
+
+                                if let Some((sid, presenter_nick)) = target_stream {
+                                    current_watching_stream = Some(sid.clone());
+                                    screen_viewer_active.store(true, Ordering::SeqCst);
+                                    ScreenViewer::spawn_window(
+                                        presenter_nick.clone(),
+                                        1280,
+                                        720,
+                                        Arc::clone(&rx_viewer_frame_arc),
+                                        Arc::clone(&screen_viewer_active),
+                                    );
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog(format!("📺 Assistindo transmissão de '{}'. Pressione ESC na janela para fechar.", presenter_nick)));
+                                } else {
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog(format!("⚠️ Nenhuma tela ativa encontrada para '{}'. Verifique os pares ou aguarde.", target_query)));
                                 }
                             }
                             ChatAction::JoinVoice(channel_id) => {
@@ -941,6 +1046,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 continue;
                             }
+                            ChatAction::ScreenList => {
+                                let screens = ScreenCaptureEngine::list_screens();
+                                println!("\n📺 --- TELAS / MONITORES DETECTADOS ({}) ---", screens.len());
+                                for (i, s) in screens.iter().enumerate() {
+                                    println!("  [{}] {} ({}x{}){}", i, s.name, s.width, s.height, if s.is_primary { " (Primária)" } else { "" });
+                                }
+                                println!("-----------------------------------------------\n");
+                                continue;
+                            }
+                            ChatAction::ScreenStart(monitor_idx) => {
+                                if screen_capture_engine.is_streaming_handle().load(Ordering::Relaxed) {
+                                    println!("⚠️  Você já está transmitindo sua tela. Use /screen stop para parar.");
+                                } else {
+                                    let stream_id = format!("screen:{}", &identity.public_key_hex()[..8]);
+                                    let tx_frame = tx_screen_out.clone();
+                                    screen_capture_engine.start_capture(
+                                        stream_id.clone(),
+                                        identity.public_key_hex(),
+                                        args.nick.clone(),
+                                        monitor_idx,
+                                        15,
+                                        65,
+                                        move |pkt| {
+                                            let _ = tx_frame.send(pkt);
+                                        },
+                                    );
+                                    println!("📺 Transmissão de tela INICIADA (Stream ID: {}). Use /screen stop para encerrar.", stream_id);
+                                }
+                                continue;
+                            }
+                            ChatAction::ScreenStop => {
+                                if screen_capture_engine.is_streaming_handle().load(Ordering::Relaxed) {
+                                    screen_capture_engine.stop_capture();
+                                    println!("📺 Transmissão de tela ENCERRADA.");
+                                } else {
+                                    println!("⚠️  Nenhuma transmissão de tela em andamento.");
+                                }
+                                continue;
+                            }
+                            ChatAction::ScreenWatch(target_query) => {
+                                let target_stream = active_screen_streams.iter().find_map(|(sid, (nick, pubkey, _, _, _))| {
+                                    if nick.eq_ignore_ascii_case(&target_query) || sid.starts_with(&target_query) || pubkey.starts_with(&target_query) {
+                                        Some((sid.clone(), nick.clone()))
+                                    } else {
+                                        None
+                                    }
+                                });
+
+                                if let Some((sid, presenter_nick)) = target_stream {
+                                    current_watching_stream = Some(sid.clone());
+                                    screen_viewer_active.store(true, Ordering::SeqCst);
+                                    ScreenViewer::spawn_window(
+                                        presenter_nick.clone(),
+                                        1280,
+                                        720,
+                                        Arc::clone(&rx_viewer_frame_arc),
+                                        Arc::clone(&screen_viewer_active),
+                                    );
+                                    println!("📺 Assistindo transmissão de '{}'. Pressione ESC na janela para fechar.", presenter_nick);
+                                } else {
+                                    println!("⚠️ Nenhuma tela ativa encontrada para '{}'. Verifique os pares ou aguarde.", target_query);
+                                }
+                                continue;
+                            }
                             ChatAction::SendTextMessage(trimmed) => {
                                 // Cria mensagem assinada
                                 let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -1220,6 +1389,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                             active_file_receivers.remove(&file_hash_clone);
                                         }
+                                    }
+                                }
+                            }
+                        }
+                        // 4. Tenta decodificar como quadro de compartilhamento de tela P2P (ScreenPacket)
+                        else if let Ok(screen_pkt) = ScreenPacket::from_bytes(&message.data) {
+                            if screen_pkt.sender_pubkey != identity.public_key_hex() {
+                                let stream_id = screen_pkt.stream_id.clone();
+                                let is_new = !active_screen_streams.contains_key(&stream_id);
+                                active_screen_streams.insert(
+                                    stream_id.clone(),
+                                    (
+                                        screen_pkt.sender_name.clone(),
+                                        screen_pkt.sender_pubkey.clone(),
+                                        screen_pkt.width,
+                                        screen_pkt.height,
+                                        std::time::Instant::now(),
+                                    ),
+                                );
+
+                                if is_new {
+                                    let notif = format!("📺 Nova tela compartilhada por '{}' (Stream ID: {}). Digite /screen watch {}", screen_pkt.sender_name, &stream_id[..stream_id.len().min(15)], screen_pkt.sender_name);
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog(notif.clone()));
+                                    if args.daemon {
+                                        println!("\n{}", notif);
+                                    }
+                                }
+
+                                // Se estivermos assistindo este fluxo, repassa o quadro para o exibidor da janela
+                                if let Some(watching_id) = &current_watching_stream {
+                                    if watching_id == &stream_id && screen_viewer_active.load(Ordering::Relaxed) {
+                                        let _ = tx_viewer_frame.send(screen_pkt.jpeg_data);
                                     }
                                 }
                             }

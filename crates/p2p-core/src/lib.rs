@@ -7,6 +7,7 @@ pub mod bootstrap;
 pub mod tracker;
 pub mod voice;
 pub mod file_transfer;
+pub mod screen;
 
 pub use identity::UserIdentity;
 pub use server::{ServerMetadata, ServerPayload, Channel, ChannelType};
@@ -22,3 +23,4 @@ pub use voice::{
     AudioCodec, AudioDeviceManager, AudioEngineError, JitterBuffer, VoiceEngine, VoicePacket,
     calculate_vad_energy, CHANNELS, FRAME_SIZE, SAMPLE_RATE,
 };
+pub use screen::{ScreenCaptureEngine, ScreenInfo, ScreenPacket};
