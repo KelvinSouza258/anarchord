@@ -61,8 +61,6 @@ impl ScreenViewer {
             let mut frames_this_second = 0u32;
             let mut bytes_this_second = 0usize;
             let mut total_bytes_received = 0u64;
-            let mut current_fps = 0u32;
-            let mut current_kbps = 0.0f32;
             let mut current_codec_name = "H.264";
 
             while window.is_open() && !window.is_key_down(Key::Escape) && is_active.load(Ordering::Relaxed) {
@@ -83,15 +81,16 @@ impl ScreenViewer {
                             current_codec_name = "H.264";
                             if let Some(ref mut decoder) = h264_decoder {
                                 let mut rendered = false;
-                                if let Ok(Some(yuv)) = decoder.decode(&data) {
-                                    Self::render_yuv_to_buffer(&yuv, &mut rgba_staging, &mut current_buffer, &mut curr_w, &mut curr_h);
-                                    rendered = true;
-                                } else {
-                                    for packet in nal_units(&data) {
-                                        if let Ok(Some(yuv)) = decoder.decode(packet) {
-                                            Self::render_yuv_to_buffer(&yuv, &mut rgba_staging, &mut current_buffer, &mut curr_w, &mut curr_h);
-                                            rendered = true;
-                                        }
+                                for packet in nal_units(&data) {
+                                    if let Ok(Some(yuv)) = decoder.decode(packet) {
+                                        Self::render_yuv_to_buffer(&yuv, &mut rgba_staging, &mut current_buffer, &mut curr_w, &mut curr_h);
+                                        rendered = true;
+                                    }
+                                }
+                                if !rendered {
+                                    if let Ok(Some(yuv)) = decoder.decode(&data) {
+                                        Self::render_yuv_to_buffer(&yuv, &mut rgba_staging, &mut current_buffer, &mut curr_w, &mut curr_h);
+                                        rendered = true;
                                     }
                                 }
 
@@ -129,8 +128,8 @@ impl ScreenViewer {
                 // Atualiza a barra de título com estatísticas a cada 500ms
                 if last_metrics_update.elapsed() >= Duration::from_millis(500) {
                     let elapsed_sec = last_metrics_update.elapsed().as_secs_f32();
-                    current_fps = (frames_this_second as f32 / elapsed_sec).round() as u32;
-                    current_kbps = (bytes_this_second as f32 / 1024.0) / elapsed_sec;
+                    let current_fps = (frames_this_second as f32 / elapsed_sec).round() as u32;
+                    let current_kbps = (bytes_this_second as f32 / 1024.0) / elapsed_sec;
 
                     let total_mb = (total_bytes_received as f64) / (1024.0 * 1024.0);
 
@@ -178,12 +177,19 @@ impl ScreenViewer {
             current_buffer.resize(*curr_w * *curr_h, 0);
         }
 
-        for (i, pixel) in rgba_staging.chunks_exact(4).enumerate() {
-            if i < current_buffer.len() {
+        let mut chunks = rgba_staging.chunks_exact(4);
+        let mut i = 0;
+        let limit = current_buffer.len().min(rgba_staging.len() / 4);
+
+        while i < limit {
+            if let Some(pixel) = chunks.next() {
                 let r = pixel[0] as u32;
                 let g = pixel[1] as u32;
                 let b = pixel[2] as u32;
                 current_buffer[i] = (r << 16) | (g << 8) | b;
+                i += 1;
+            } else {
+                break;
             }
         }
     }

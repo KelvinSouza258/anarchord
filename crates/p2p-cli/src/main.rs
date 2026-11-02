@@ -360,7 +360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Frequências das notas musicais em Hz
             const REST: f32 = 0.0;
             const C4: f32 = 261.63;
-            const D4: f32 = 293.66;
+            const _D4: f32 = 293.66;
             const E4: f32 = 329.63;
             const F4: f32 = 349.23;
             const G4: f32 = 392.00;
@@ -578,8 +578,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&screen_topic);
     let screen_capture_engine = Arc::new(ScreenCaptureEngine::new());
     let (tx_screen_out, mut rx_screen_out) = tokio::sync::mpsc::unbounded_channel::<ScreenPacket>();
-    let (tx_viewer_frame, rx_viewer_frame) = std::sync::mpsc::channel::<(p2p_core::screen::VideoCodec, Vec<u8>)>();
-    let rx_viewer_frame_arc = Arc::new(std::sync::Mutex::new(rx_viewer_frame));
+    let mut tx_viewer_frame_opt: Option<std::sync::mpsc::SyncSender<(p2p_core::screen::VideoCodec, Vec<u8>)>> = None;
     let screen_viewer_active = Arc::new(AtomicBool::new(false));
     let mut current_watching_stream: Option<String> = None;
     let mut active_screen_streams: HashMap<String, (String, String, u32, u32, std::time::Instant)> = HashMap::new(); // stream_id -> (nick, pubkey, w, h, last_seen)
@@ -623,7 +622,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Publicação de quadros de vídeo da tela capturada para a malha P2P
             Some(screen_pkt) = rx_screen_out.recv() => {
                 if let Ok(pkt_bytes) = screen_pkt.to_bytes() {
-                    let _ = node.swarm.behaviour_mut().gossipsub.publish(screen_topic.clone(), pkt_bytes);
+                    match node.swarm.behaviour_mut().gossipsub.publish(screen_topic.clone(), pkt_bytes) {
+                        Ok(_) => {
+                            if screen_pkt.frame_seq % 60 == 0 {
+                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("📺 [VÍDEO ENVIADO] Quadro #{} transmitido na malha ({:.1} KB)", screen_pkt.frame_seq, screen_pkt.video_data.len() as f32 / 1024.0)));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("⚠️ Erro ao publicar quadro de vídeo: {:?}", e)));
+                        }
+                    }
                 }
             }
 
@@ -734,13 +742,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 });
 
                                 if let Some((sid, presenter_nick)) = target_stream {
+                                    // Cria ou recria o canal com capacidade para que quadros antigos sejam descartados se a janela travar
+                                    let (tx_vf, rx_vf) = std::sync::mpsc::sync_channel::<(p2p_core::screen::VideoCodec, Vec<u8>)>(30);
+                                    let rx_vf_arc = Arc::new(std::sync::Mutex::new(rx_vf));
+                                    tx_viewer_frame_opt = Some(tx_vf);
+
                                     current_watching_stream = Some(sid.clone());
                                     screen_viewer_active.store(true, Ordering::SeqCst);
                                     ScreenViewer::spawn_window(
                                         presenter_nick.clone(),
                                         1280,
                                         720,
-                                        Arc::clone(&rx_viewer_frame_arc),
+                                        rx_vf_arc,
                                         Arc::clone(&screen_viewer_active),
                                     );
                                     let _ = tx_ui_event.send(UiEvent::SystemLog(format!("📺 Assistindo transmissão de '{}'. Pressione ESC na janela para fechar.", presenter_nick)));
@@ -1115,13 +1128,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 });
 
                                 if let Some((sid, presenter_nick)) = target_stream {
+                                    // Cria ou recria o canal com capacidade para que quadros antigos sejam descartados se a janela travar
+                                    let (tx_vf, rx_vf) = std::sync::mpsc::sync_channel::<(p2p_core::screen::VideoCodec, Vec<u8>)>(30);
+                                    let rx_vf_arc = Arc::new(std::sync::Mutex::new(rx_vf));
+                                    tx_viewer_frame_opt = Some(tx_vf);
+
                                     current_watching_stream = Some(sid.clone());
                                     screen_viewer_active.store(true, Ordering::SeqCst);
                                     ScreenViewer::spawn_window(
                                         presenter_nick.clone(),
                                         1280,
                                         720,
-                                        Arc::clone(&rx_viewer_frame_arc),
+                                        rx_vf_arc,
                                         Arc::clone(&screen_viewer_active),
                                     );
                                     println!("📺 Assistindo transmissão de '{}'. Pressione ESC na janela para fechar.", presenter_nick);
@@ -1435,12 +1453,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if args.daemon {
                                         println!("\n{}", notif);
                                     }
+                                } else if args.daemon && screen_pkt.frame_seq % 60 == 0 {
+                                    println!("📺 [DAEMON VÍDEO] Recebendo transmissão de '{}': quadro #{} ({:.1} KB, {}x{})", screen_pkt.sender_name, screen_pkt.frame_seq, screen_pkt.video_data.len() as f32 / 1024.0, screen_pkt.width, screen_pkt.height);
                                 }
 
                                 // Se estivermos assistindo este fluxo, repassa o quadro para o exibidor da janela
                                 if let Some(watching_id) = &current_watching_stream {
                                     if watching_id == &stream_id && screen_viewer_active.load(Ordering::Relaxed) {
-                                        let _ = tx_viewer_frame.send((screen_pkt.codec, screen_pkt.video_data));
+                                        if let Some(tx_vf) = &tx_viewer_frame_opt {
+                                            // try_send descarta quadros caso o consumidor esteja momentaneamente ocupado, evitando travar a malha
+                                            let _ = tx_vf.try_send((screen_pkt.codec, screen_pkt.video_data));
+                                        }
                                     }
                                 }
                             }

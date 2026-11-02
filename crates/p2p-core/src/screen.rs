@@ -83,17 +83,17 @@ impl ScreenCaptureEngine {
 
     /// Cria um encoder H.264 com configurações otimizadas para Screen Sharing em tempo real:
     /// - Keyframe a cada 30 frames (1 segundo) para que novos espectadores não fiquem em tela preta
-    /// - UsageType::ScreenContentRealTime para nitidez máxima de fontes e janelas
-    /// - SpsPpsStrategy::ConstantId com SPS/PPS embutido em todo Keyframe
+    /// - UsageType::ScreenContentRealTime para nitidez máxima de texto e janelas
+    /// - RateControlMode::Off com skip_frames(false): garante codificação direta sem pular frames por bitrate
     fn create_h264_encoder(fps: u32) -> Option<Encoder> {
         let api = OpenH264API::from_source();
         let config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Quality)
+            .rate_control_mode(RateControlMode::Off)
+            .skip_frames(false)
             .max_frame_rate(FrameRate::from_hz(fps as f32))
             .sps_pps_strategy(SpsPpsStrategy::ConstantId)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(30))
-            .scene_change_detect(true);
+            .intra_frame_period(IntraFramePeriod::from_num_frames(30));
 
         Encoder::with_api_config(api, config).ok()
     }
@@ -142,7 +142,7 @@ impl ScreenCaptureEngine {
                                     &image,
                                     target_w,
                                     target_h,
-                                    image::imageops::FilterType::Triangle,
+                                    image::imageops::FilterType::Nearest,
                                 )
                             } else {
                                 image
@@ -166,11 +166,20 @@ impl ScreenCaptureEngine {
                 let (codec, is_keyframe, video_bytes) = if let Some(ref mut enc) = h264_encoder {
                     let rgba_src = RgbaSliceU8::new(&raw_rgba, (width as usize, height as usize));
                     let yuv = YUVBuffer::from_rgb_source(rgba_src);
+                    let should_force_key = (frame_seq % 30 == 0) || frame_seq == 0;
+                    if should_force_key {
+                        enc.force_intra_frame();
+                    }
                     match enc.encode(&yuv) {
                         Ok(stream) => {
                             let bytes = stream.to_vec();
-                            let is_key = (frame_seq % 30 == 0) || frame_seq == 0;
-                            (VideoCodec::H264, is_key, bytes)
+                            if bytes.is_empty() {
+                                // Se o encoder H.264 gerar 0 bytes (ex: Skip), envia fallback JPEG para garantir fluidez
+                                let jpeg = Self::encode_jpeg(&raw_rgba, width, height, 60);
+                                (VideoCodec::Jpeg, true, jpeg)
+                            } else {
+                                (VideoCodec::H264, should_force_key, bytes)
+                            }
                         }
                         Err(_) => {
                             let jpeg = Self::encode_jpeg(&raw_rgba, width, height, 50);
@@ -243,11 +252,19 @@ impl ScreenCaptureEngine {
                 let (codec, is_keyframe, video_bytes) = if let Some(ref mut enc) = h264_encoder {
                     let rgba_src = RgbaSliceU8::new(&raw_rgba, (width as usize, height as usize));
                     let yuv = YUVBuffer::from_rgb_source(rgba_src);
+                    let should_force_key = (frame_seq % 30 == 0) || frame_seq == 0;
+                    if should_force_key {
+                        enc.force_intra_frame();
+                    }
                     match enc.encode(&yuv) {
                         Ok(stream) => {
                             let bytes = stream.to_vec();
-                            let is_key = (frame_seq % 30 == 0) || frame_seq == 0;
-                            (VideoCodec::H264, is_key, bytes)
+                            if bytes.is_empty() {
+                                let jpeg = Self::encode_jpeg(&raw_rgba, width, height, 60);
+                                (VideoCodec::Jpeg, true, jpeg)
+                            } else {
+                                (VideoCodec::H264, should_force_key, bytes)
+                            }
                         }
                         Err(_) => {
                             let jpeg = Self::encode_jpeg(&raw_rgba, width, height, 50);

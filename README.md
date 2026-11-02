@@ -26,7 +26,8 @@ Built in **Rust** from the ground up, it eliminates centralized servers, trackin
 * 💬 **Mesh Text Channels & Terminal UI (TUI):** Built on `libp2p-gossipsub` with end-to-end cryptographic message signing (`Ed25519`) and a reactive, interactive dashboard built with **Ratatui** (featuring dynamic online peers, audio meters, blinking input cursor, and mouse support).
 * 📁 **Direct P2P File Transfer:** Point-to-point chunked file delivery with SHA-256 verification, handshakes (`Offer` / `Accept`), and live progress gauges.
 * 🎙️ **Real-Time Voice Architecture (Opus 48kHz):** Full-duplex microphone capture, low-latency Opus audio compression, Jitter Buffering, VAD (Voice Activity Detection), and multi-peer audio mixing.
-* 📺 **P2P Screen Sharing & Native Video Viewer:** Screen and window capture engine via `xcap` with high-speed JPEG compression, loop testing support (`--synth-video`), and an ultra-lightweight native graphical viewer window via `minifb`.
+* 📺 **P2P Screen Sharing & Real-Time H.264 Video Stream:** Screen and display capture engine via `xcap` with hardware/native **H.264** compression (`openh264` at 30 FPS with periodic SPS/PPS IDR keyframes, <2ms downscaling, and JPEG fallback), live viewer window via `minifb` displaying real-time FPS, bitrate, and transfer metrics.
+* 🐳 **Multi-Stage Docker & 100% Isolated End-to-End Test Suite:** Fully reproducible local testing harness (`docker-compose.test.yml` + `tests/run_docker_tests.py`) simulating multi-peer topologies (Alice, Bob, Carol + Local-Bootstrap) across isolated NAT subnets with zero leaks to the global DHT.
 * 🚪 **Dynamic OS Ephemeral Ports:** No need to configure or hardcode ports; the OS assigns available ports on boot and announces them automatically.
 * 🤝 **Intelligent Connection Deduplication:** Detects simultaneous handshakes and tears down redundant connections without dropping the primary session.
 * 🛡️ **NAT Traversal & Firewall Punching:** Built-in **DCUtR** (Direct Connection Upgrade through Relay) and **AutoNAT** protocols.
@@ -138,10 +139,12 @@ While inside the chat console, you can use built-in slash commands:
 
 ### Phase 4: Screen Sharing & Native Video Streaming ✅ (Completed)
 - [x] Cross-platform screen and window capture engine via `xcap`.
-- [x] High-performance pure Rust JPEG encoder (`jpeg-encoder`) with resolution scaling.
-- [x] Real-time P2P video frame distribution (`ScreenPacket`).
-- [x] Ultra-lightweight native graphical viewer window via `minifb` (`/screen watch <peer>`).
+- [x] Real-time H.264 video codec integration (`openh264` 30 FPS) with periodic SPS/PPS intra-frames and high-speed downscaling.
+- [x] Pure Rust JPEG fallback encoder (`jpeg-encoder`).
+- [x] Real-time P2P video frame distribution (`ScreenPacket`) across Gossipsub mesh.
+- [x] Ultra-lightweight native graphical viewer window via `minifb` (`/screen watch <peer>`) with real-time FPS, bitrate, and data metrics.
 - [x] Automated loop video transmission (`--synth-video`) for server/bot testing.
+- [x] Multi-peer isolated Docker test suite (`tests/run_docker_tests.py`) verifying 3+ concurrent nodes.
 
 ### Phase 5: Modern Desktop GUI & Mobile App ⏳ (Upcoming)
 - [ ] Cross-platform desktop application with **Tauri** (Rust backend + React / Tailwind CSS).

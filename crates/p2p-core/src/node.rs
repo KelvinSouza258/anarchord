@@ -46,11 +46,16 @@ impl P2PNode {
                 let kad_config = kad::Config::new(kad_protocol);
                 let kademlia = kad::Behaviour::with_config(key.public().to_peer_id(), kad_store, kad_config);
 
-                // 2. GossipSub (Chat de Texto em Malha e Transferência P2P)
+                // 2. GossipSub (Chat de Texto em Malha, Áudio e Vídeo P2P)
                 let gossip_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_millis(500))
                     .validation_mode(gossipsub::ValidationMode::Permissive)
-                    .max_transmit_size(1024 * 1024) // 1MB limite para permitir pacotes de chunks P2P
+                    .max_transmit_size(1024 * 1024) // 1MB limite para permitir pacotes de chunks P2P e vídeo
+                    .mesh_n(2)           // Alvo da malha D reduzido para funcionar até com 2 nós em testes locais
+                    .mesh_n_low(1)       // Mínimo D_lo = 1 (enxerta par assim que houver 1 conectado)
+                    .mesh_n_high(12)     // Máximo D_hi
+                    .mesh_outbound_min(0)// D_out = 0 (permite malhas com apenas 1 nó sem forçar outbound)
+                    .flood_publish(true) // Publica para todos os pares inscritos no tópico imediatamente!
                     .build()
                     .map_err(|e| NodeError::SwarmInit(e.to_string()))
                     .expect("Configuração GossipSub válida");
