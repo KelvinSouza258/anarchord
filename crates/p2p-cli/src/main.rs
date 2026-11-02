@@ -114,12 +114,15 @@ pub fn parse_user_input(input: &str) -> ChatAction {
         }
     }
     if trimmed.starts_with("/send ") {
-        let parts: Vec<&str> = trimmed.trim_start_matches("/send ").split_whitespace().collect();
-        if parts.len() >= 2 {
-            return ChatAction::SendFile {
-                recipient_query: parts[0].to_string(),
-                file_path: parts[1..].join(" "),
-            };
+        let remainder = trimmed.trim_start_matches("/send ").trim();
+        if let Some((recipient, path_part)) = remainder.split_once(' ') {
+            let clean_path = path_part.trim().trim_matches('"').trim_matches('\'').to_string();
+            if !recipient.is_empty() && !clean_path.is_empty() {
+                return ChatAction::SendFile {
+                    recipient_query: recipient.to_string(),
+                    file_path: clean_path,
+                };
+            }
         }
     }
     if trimmed.starts_with("/accept ") {
