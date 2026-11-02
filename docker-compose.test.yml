@@ -1,0 +1,84 @@
+version: '3.8'
+
+networks:
+  # Rede privada 1: Simula a LAN da casa de Alice (atrás de NAT)
+  nat_alice_lan:
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.168.10.0/24
+
+  # Rede privada 2: Simula a LAN da casa de Bob (atrás de outro NAT isolado)
+  nat_bob_lan:
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.168.20.0/24
+
+  # Rede pública (Internet WAN): Onde vive o Relay e nós de descoberta pública
+  public_wan:
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+
+services:
+  # =========================================================================
+  # Nó Público / Relay / Tracker na Internet WAN (IP Fixo: 172.28.0.10)
+  # =========================================================================
+  relay_bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: anarchord_relay
+    command: [
+      "--nick", "Public-Relay",
+      "--daemon",
+      "--port", "9000",
+      "--auto-voice", "geral"
+    ]
+    networks:
+      public_wan:
+        ipv4_address: 172.28.0.10
+    ports:
+      - "9000:9000"
+
+  # =========================================================================
+  # Peer Alice (Atrás do NAT A, comunicando com a WAN)
+  # =========================================================================
+  peer_alice:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: anarchord_alice
+    depends_on:
+      - relay_bootstrap
+    command: [
+      "--nick", "Alice",
+      "--daemon",
+      "--auto-voice", "geral",
+      "--connect", "/ip4/172.28.0.10/tcp/9000"
+    ]
+    networks:
+      - nat_alice_lan
+      - public_wan
+
+  # =========================================================================
+  # Peer Bob (Atrás do NAT B isolado de Alice, comunicando com a WAN)
+  # =========================================================================
+  peer_bob:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: anarchord_bob
+    depends_on:
+      - relay_bootstrap
+    command: [
+      "--nick", "Bob",
+      "--daemon",
+      "--auto-voice", "geral",
+      "--connect", "/ip4/172.28.0.10/tcp/9000"
+    ]
+    networks:
+      - nat_bob_lan
+      - public_wan

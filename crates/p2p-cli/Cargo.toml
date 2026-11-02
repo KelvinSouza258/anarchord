@@ -15,3 +15,5 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 rustyline = "14.0"
 opus1 = "0.3.0"
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }

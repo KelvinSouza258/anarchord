@@ -1,3 +1,5 @@
+mod ui;
+
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::gossipsub::IdentTopic;
@@ -16,12 +18,13 @@ use p2p_core::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
+use ui::{TerminalUi, UiAction, UiEvent};
 
 #[derive(Parser, Debug, PartialEq)]
 #[command(author = "Victor Gerin", version = "0.1.0", about = "P2P Discord Daemon & CLI")]
@@ -458,8 +461,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Leitura interativa do teclado (stdin)
+    // Leitura interativa do teclado (stdin no modo daemon ou canal do Ratatui)
     let mut stdin_lines = BufReader::new(tokio::io::stdin()).lines();
+
+    // Canais de comunicação com a TUI do Ratatui
+    let (tx_ui_event, rx_ui_event) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
+    let (tx_ui_action, mut rx_ui_action) = tokio::sync::mpsc::unbounded_channel::<UiAction>();
+
+    let is_muted_flag = voice_engine
+        .as_ref()
+        .map(|e| e.is_muted_handle())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+
+    if !args.daemon {
+        let ui = TerminalUi::new(
+            identity.profile.display_name.clone(),
+            identity.public_key_hex(),
+            Arc::clone(&is_muted_flag),
+        );
+        tokio::spawn(async move {
+            let _ = ui.run(rx_ui_event, tx_ui_action).await;
+        });
+    }
 
     // Rastreamento de nós conectados para desduplicação e metadados de identificação
     let mut connected_peers: HashSet<libp2p::PeerId> = HashSet::new();
@@ -490,6 +513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let now = std::time::Instant::now();
                 active_speakers.retain(|_pubkey, (name, last_seen)| {
                     if now.duration_since(*last_seen).as_millis() > 600 {
+                        let _ = tx_ui_event.send(UiEvent::VoiceActivity { nick: name.clone(), speaking: false });
                         println!("🔇 [VOZ] {} parou de falar.", name);
                         false
                     } else {
@@ -525,8 +549,158 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
 
-            // Entrada do teclado (desativada quando rodando em modo daemon)
-            line = stdin_lines.next_line(), if !args.daemon => {
+            // Ações disparadas pela UI do Ratatui
+            Some(action) = rx_ui_action.recv(), if !args.daemon => {
+                match action {
+                    UiAction::Quit => {
+                        println!("Encerrando nó P2P...");
+                        break;
+                    }
+                    UiAction::ToggleMute => {
+                        if let Some(engine) = &voice_engine {
+                            let muted = engine.toggle_mute();
+                            let _ = tx_ui_event.send(UiEvent::SystemLog(if muted {
+                                "Microfone MUTADO.".to_string()
+                            } else {
+                                "Microfone ATIVADO.".to_string()
+                            }));
+                        }
+                    }
+                    UiAction::SendMessage(text) => {
+                        let parsed = parse_user_input(&text);
+                        match parsed {
+                            ChatAction::Empty => {}
+                            ChatAction::Quit => break,
+                            ChatAction::ListPeers => {
+                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Pares conectados: {}", connected_peers.len())));
+                            }
+                            ChatAction::ListDevices => {
+                                let _ = tx_ui_event.send(UiEvent::SystemLog("Dispositivos de áudio listados.".to_string()));
+                            }
+                            ChatAction::ToggleMute => {
+                                if let Some(engine) = &voice_engine {
+                                    let muted = engine.toggle_mute();
+                                    let _ = tx_ui_event.send(UiEvent::SystemLog(if muted { "Microfone MUTADO.".to_string() } else { "Microfone ATIVADO.".to_string() }));
+                                }
+                            }
+                            ChatAction::JoinVoice(channel_id) => {
+                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Entrou na sala de voz: {}", channel_id)));
+                            }
+                            ChatAction::LeaveVoice => {
+                                let _ = tx_ui_event.send(UiEvent::SystemLog("Saiu da sala de voz.".to_string()));
+                            }
+                            ChatAction::JoinTextChannel(new_channel) => {
+                                let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Mudou para canal #{}", new_channel)));
+                            }
+                            ChatAction::SendFile { recipient_query, file_path } => {
+                                let target_pubkey = peer_metadata.iter().find_map(|(pid, (nick, pubkey))| {
+                                    if nick.eq_ignore_ascii_case(&recipient_query) || pid.to_string().starts_with(&recipient_query) || pubkey.starts_with(&recipient_query) {
+                                        Some(pubkey.clone())
+                                    } else {
+                                        None
+                                    }
+                                });
+
+                                let recipient_pubkey = match target_pubkey {
+                                    Some(pk) => pk,
+                                    None => {
+                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("❌ Destinatário '{}' não encontrado.", recipient_query)));
+                                        continue;
+                                    }
+                                };
+
+                                let p = std::path::Path::new(&file_path);
+                                match std::fs::read(p) {
+                                    Ok(data) => {
+                                        let file_size = data.len() as u64;
+                                        let file_hash = calculate_file_hash(&data);
+                                        let file_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("arquivo.bin").to_string();
+                                        let chunks = chunk_file(&file_hash, &data);
+                                        let total_chunks = chunks.len() as u32;
+
+                                        let offer = FileOffer {
+                                            file_hash: file_hash.clone(),
+                                            file_name: file_name.clone(),
+                                            file_size,
+                                            total_chunks,
+                                            sender_pubkey: identity.public_key_hex(),
+                                            sender_name: args.nick.clone(),
+                                            recipient_pubkey: recipient_pubkey.clone(),
+                                        };
+
+                                        pending_outgoing_files.insert(file_hash.clone(), (file_name.clone(), data));
+
+                                        let msg = FileTransferMessage::Offer(offer);
+                                        if let Ok(bytes) = msg.to_bytes() {
+                                            let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
+                                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Proposta de envio de '{}' enviada para [{}]. Aguardando aceite...", file_name, recipient_query)));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("❌ Erro ao ler arquivo '{}': {:?}", file_path, e)));
+                                    }
+                                }
+                            }
+                            ChatAction::AcceptFile(hash_query) => {
+                                let target_key = pending_incoming_offers.keys().find(|k| k.starts_with(&hash_query)).cloned();
+                                if let Some(hash) = target_key {
+                                    if let Some(offer) = pending_incoming_offers.remove(&hash) {
+                                        active_file_receivers.insert(hash.clone(), FileReceiver::new(offer.file_name.clone(), offer.file_size, offer.total_chunks));
+                                        let decision = FileDecision {
+                                            file_hash: hash.clone(),
+                                            accepted: true,
+                                            responder_pubkey: identity.public_key_hex(),
+                                        };
+                                        let msg = FileTransferMessage::Decision(decision);
+                                        if let Ok(bytes) = msg.to_bytes() {
+                                            let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
+                                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Aceitou arquivo '{}'!", offer.file_name)));
+                                        }
+                                    }
+                                }
+                            }
+                            ChatAction::RejectFile(hash_query) => {
+                                let target_key = pending_incoming_offers.keys().find(|k| k.starts_with(&hash_query)).cloned();
+                                if let Some(hash) = target_key {
+                                    if let Some(offer) = pending_incoming_offers.remove(&hash) {
+                                        let decision = FileDecision {
+                                            file_hash: hash.clone(),
+                                            accepted: false,
+                                            responder_pubkey: identity.public_key_hex(),
+                                        };
+                                        let msg = FileTransferMessage::Decision(decision);
+                                        if let Ok(bytes) = msg.to_bytes() {
+                                            let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
+                                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Rejeitou arquivo '{}'.", offer.file_name)));
+                                        }
+                                    }
+                                }
+                            }
+                            ChatAction::SendTextMessage(trimmed) => {
+                                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                                let payload = format!("{}:{}:{}", current_channel, trimmed, now);
+                                let signature = identity.sign(payload.as_bytes()).to_vec();
+
+                                let msg = ChatMessage {
+                                    channel_id: current_channel.clone(),
+                                    author_pubkey: identity.public_key_hex(),
+                                    author_name: args.nick.clone(),
+                                    text: trimmed.clone(),
+                                    timestamp: now,
+                                    signature,
+                                };
+
+                                if let Ok(json_bytes) = serde_json::to_vec(&msg) {
+                                    let _ = node.swarm.behaviour_mut().gossipsub.publish(current_topic.clone(), json_bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Entrada do teclado (quando rodando em modo daemon)
+            line = stdin_lines.next_line(), if args.daemon => {
                 match line {
                     Ok(Some(text)) => {
                         let action = parse_user_input(&text);
@@ -787,12 +961,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let _ = node.swarm.close_connection(connection_id);
                         } else {
                             connected_peers.insert(peer_id);
+                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Conexão P2P estabelecida com: {}", peer_id)));
                             println!("🤝 Conexão P2P Direta estabelecida com: {} via {:?}", peer_id, endpoint.get_remote_address());
                         }
                     }
                     libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. } => {
                         if num_established == 0 {
                             connected_peers.remove(&peer_id);
+                            let _ = tx_ui_event.send(UiEvent::PeerDisconnected(peer_id.to_string()));
                             println!("👋 Conexão fechada com: {} (Motivo: {:?})", peer_id, cause);
                         }
                     }
@@ -806,6 +982,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let nick = parts[1].to_string();
                                 let pubkey = parts[2].to_string();
                                 peer_metadata.insert(peer_id, (nick.clone(), pubkey.clone()));
+                                let _ = tx_ui_event.send(UiEvent::PeerConnected {
+                                    peer_id: peer_id.to_string(),
+                                    nick: nick.clone(),
+                                    pubkey: pubkey.clone(),
+                                });
                                 println!("✨ Identidade confirmada: {} é '{}' (User ID: {})", peer_id, nick, pubkey);
                             }
                         }
@@ -816,6 +997,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // 1. Tenta decodificar como mensagem de chat de texto
                         if let Ok(chat_msg) = serde_json::from_slice::<ChatMessage>(&message.data) {
                             if chat_msg.author_pubkey != identity.public_key_hex() {
+                                let _ = tx_ui_event.send(UiEvent::ChatMessage {
+                                    channel: chat_msg.channel_id.clone(),
+                                    author: chat_msg.author_name.clone(),
+                                    text: chat_msg.text.clone(),
+                                });
                                 println!("\n📩 [#{}] {}: {}", chat_msg.channel_id, chat_msg.author_name, chat_msg.text);
                             }
                         }
@@ -824,6 +1010,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if voice_pkt.sender_pubkey != identity.public_key_hex() {
                                 let now = std::time::Instant::now();
                                 if let std::collections::hash_map::Entry::Vacant(e) = active_speakers.entry(voice_pkt.sender_pubkey.clone()) {
+                                    let _ = tx_ui_event.send(UiEvent::VoiceActivity {
+                                        nick: voice_pkt.sender_name.clone(),
+                                        speaking: true,
+                                    });
                                     println!("🔊 [VOZ] {} começou a falar...", voice_pkt.sender_name);
                                     e.insert((voice_pkt.sender_name.clone(), now));
                                 } else if let Some(speaker) = active_speakers.get_mut(&voice_pkt.sender_pubkey) {
@@ -894,6 +1084,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 FileTransferMessage::Decision(decision) => {
                                     if let Some((file_name, data)) = pending_outgoing_files.get(&decision.file_hash) {
                                         if decision.accepted {
+                                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Transferência aceita de '{}'! Enviando blocos...", file_name)));
                                             println!("\n🎉 O destinatário ACEITOU a transferência de '{}'! Transmitindo blocos P2P...", file_name);
                                             let chunks = chunk_file(&decision.file_hash, data);
                                             let total = chunks.len();
@@ -902,14 +1093,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 if let Ok(bytes) = msg.to_bytes() {
                                                     let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
                                                 }
+                                                let pct = ((idx + 1) as f32 / total as f32) * 100.0;
+                                                let _ = tx_ui_event.send(UiEvent::FileTransferProgress {
+                                                    file_name: file_name.clone(),
+                                                    percentage: pct,
+                                                    is_download: false,
+                                                });
                                                 if (idx + 1) % 10 == 0 || (idx + 1) == total {
-                                                    let pct = ((idx + 1) as f32 / total as f32) * 100.0;
                                                     println!("   📤 Enviado: {:.1}% ({}/{} blocos)", pct, idx + 1, total);
                                                 }
                                             }
                                             println!("✅ Arquivo '{}' enviado com sucesso!\n", file_name);
                                             pending_outgoing_files.remove(&decision.file_hash);
                                         } else {
+                                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Transferência de '{}' foi recusada pelo destinatário.", file_name)));
                                             println!("\n❌ O destinatário REJEITOU a transferência de '{}'.", file_name);
                                             pending_outgoing_files.remove(&decision.file_hash);
                                         }
@@ -919,6 +1116,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if let Some(receiver) = active_file_receivers.get_mut(&chunk.file_hash) {
                                         let file_hash_clone = chunk.file_hash.clone();
                                         let pct = receiver.add_chunk(chunk.chunk_index, chunk.data);
+                                        let _ = tx_ui_event.send(UiEvent::FileTransferProgress {
+                                            file_name: receiver.file_name.clone(),
+                                            percentage: pct,
+                                            is_download: true,
+                                        });
                                         if (chunk.chunk_index + 1) % 10 == 0 || receiver.is_complete() {
                                             println!("   📥 Baixando '{}': {:.1}%", receiver.file_name, pct);
                                         }
@@ -932,6 +1134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     let _ = std::fs::create_dir_all(download_dir);
                                                     let save_path = download_dir.join(&file_name);
                                                     if let Ok(_) = std::fs::write(&save_path, &completed_bytes) {
+                                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Arquivo '{}' salvo com sucesso em downloads/", file_name)));
                                                         println!("\n💾 [ARQUIVO CONCLUÍDO] '{}' salvo com sucesso em: {:?}", file_name, save_path);
                                                         println!("   🔒 Integridade SHA-256 verificada com sucesso!\n");
                                                     } else {
