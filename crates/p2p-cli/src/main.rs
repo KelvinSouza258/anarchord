@@ -20,44 +20,94 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, PartialEq)]
 #[command(author = "Victor Gerin", version = "0.1.0", about = "P2P Discord Daemon & CLI")]
-struct Args {
+pub struct Args {
     /// Nome de exibição (apelido no chat)
     #[arg(short, long, default_value = "Peer")]
-    nick: String,
+    pub nick: String,
 
     /// Porta local para escutar conexões UDP/QUIC e TCP (0 = porta dinâmica aleatória)
     #[arg(short, long, default_value_t = 0)]
-    port: u16,
+    pub port: u16,
 
     /// Caminho do arquivo de identidade e perfil do usuário (JSON com chaves PEM)
     #[arg(long, default_value = "identity.json")]
-    identity_file: PathBuf,
+    pub identity_file: PathBuf,
 
     /// Conectar diretamente a um endereço multiaddr conhecido (opcional)
     #[arg(long)]
-    connect: Option<String>,
+    pub connect: Option<String>,
 
     /// Sala inicial de chat
     #[arg(long, default_value = "geral")]
-    channel: String,
+    pub channel: String,
 
     /// Entrar automaticamente em uma sala de voz P2P ao iniciar (útil para nós bots/rádio)
     #[arg(long)]
-    auto_voice: Option<String>,
+    pub auto_voice: Option<String>,
 
     /// Executar como Daemon sem ler stdin do terminal
     #[arg(long, default_value_t = false)]
-    daemon: bool,
+    pub daemon: bool,
 
     /// Transmitir tom sintético de teste de áudio (440Hz / 880Hz) continuamente na sala de voz
     #[arg(long, default_value_t = false)]
-    synth_audio: bool,
+    pub synth_audio: bool,
 
     /// Desativar descoberta automática via IPFS Amino DHT e Open Trackers BitTorrent
     #[arg(long, default_value_t = false)]
-    no_auto_bootstrap: bool,
+    pub no_auto_bootstrap: bool,
+}
+
+/// Ação interpretada a partir de uma linha digitada no chat
+#[derive(Debug, PartialEq, Clone)]
+pub enum ChatAction {
+    Quit,
+    ListPeers,
+    ListDevices,
+    ToggleMute,
+    JoinVoice(String),
+    LeaveVoice,
+    JoinTextChannel(String),
+    SendTextMessage(String),
+    Empty,
+}
+
+/// Analisa a linha digitada pelo usuário e extrai a ação correspondente
+pub fn parse_user_input(input: &str) -> ChatAction {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return ChatAction::Empty;
+    }
+    if trimmed == "/quit" {
+        return ChatAction::Quit;
+    }
+    if trimmed == "/peers" {
+        return ChatAction::ListPeers;
+    }
+    if trimmed == "/devices" {
+        return ChatAction::ListDevices;
+    }
+    if trimmed == "/mute" {
+        return ChatAction::ToggleMute;
+    }
+    if trimmed.starts_with("/voice join ") {
+        let v_channel = trimmed.trim_start_matches("/voice join ").trim();
+        if !v_channel.is_empty() {
+            return ChatAction::JoinVoice(v_channel.to_string());
+        }
+    }
+    if trimmed == "/voice leave" {
+        return ChatAction::LeaveVoice;
+    }
+    if trimmed.starts_with("/join ") {
+        let new_channel = trimmed.trim_start_matches("/join ").trim();
+        if !new_channel.is_empty() {
+            return ChatAction::JoinTextChannel(new_channel.to_string());
+        }
+    }
+    ChatAction::SendTextMessage(trimmed.to_string())
 }
 
 #[tokio::main]
@@ -437,64 +487,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             line = stdin_lines.next_line(), if !args.daemon => {
                 match line {
                     Ok(Some(text)) => {
-                        let trimmed = text.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        if trimmed == "/quit" {
-                            println!("Encerrando nó P2P...");
-                            break;
-                        }
-
-                        if trimmed == "/peers" {
-                            println!("\n👥 --- PARES CONECTADOS ({}) ---", connected_peers.len());
-                            if connected_peers.is_empty() {
-                                println!("  (Nenhum par direto no momento. Aguardando descoberta...)");
-                            } else {
-                                for peer in &connected_peers {
-                                    if let Some((nick, pubkey)) = peer_metadata.get(peer) {
-                                        println!("  🟢 Par: {} | Apelido: {} | User ID: {}", peer, nick, pubkey);
-                                    } else {
-                                        println!("  🟢 Par: {} (Identificando...)", peer);
+                        let action = parse_user_input(&text);
+                        match action {
+                            ChatAction::Empty => continue,
+                            ChatAction::Quit => {
+                                println!("Encerrando nó P2P...");
+                                break;
+                            }
+                            ChatAction::ListPeers => {
+                                println!("\n👥 --- PARES CONECTADOS ({}) ---", connected_peers.len());
+                                if connected_peers.is_empty() {
+                                    println!("  (Nenhum par direto no momento. Aguardando descoberta...)");
+                                } else {
+                                    for peer in &connected_peers {
+                                        if let Some((nick, pubkey)) = peer_metadata.get(peer) {
+                                            println!("  🟢 Par: {} | Apelido: {} | User ID: {}", peer, nick, pubkey);
+                                        } else {
+                                            println!("  🟢 Par: {} (Identificando...)", peer);
+                                        }
                                     }
                                 }
+                                println!("--------------------------------\n");
+                                continue;
                             }
-                            println!("--------------------------------\n");
-                            continue;
-                        }
-
-                        if trimmed == "/devices" {
-                            let inputs = AudioDeviceManager::list_input_devices();
-                            let outputs = AudioDeviceManager::list_output_devices();
-                            println!("\n🎤 --- DISPOSITIVOS DE ENTRADA (MICROFONES) ---");
-                            for dev in inputs {
-                                println!("  🎙️  {}", dev);
-                            }
-                            println!("🔊 --- DISPOSITIVOS DE SAÍDA (ALTO-FALANTES) ---");
-                            for dev in outputs {
-                                println!("  🔈 {}", dev);
-                            }
-                            println!("-----------------------------------------------\n");
-                            continue;
-                        }
-
-                        if trimmed == "/mute" {
-                            if let Some(engine) = &voice_engine {
-                                let muted = engine.toggle_mute();
-                                if muted {
-                                    println!("🔇 Microfone MUTADO.");
-                                } else {
-                                    println!("🎙️  Microfone ATIVADO.");
+                            ChatAction::ListDevices => {
+                                let inputs = AudioDeviceManager::list_input_devices();
+                                let outputs = AudioDeviceManager::list_output_devices();
+                                println!("\n🎤 --- DISPOSITIVOS DE ENTRADA (MICROFONES) ---");
+                                for dev in inputs {
+                                    println!("  🎙️  {}", dev);
                                 }
-                            } else {
-                                println!("⚠️  Engine de áudio não inicializada.");
+                                println!("🔊 --- DISPOSITIVOS DE SAÍDA (ALTO-FALANTES) ---");
+                                for dev in outputs {
+                                    println!("  🔈 {}", dev);
+                                }
+                                println!("-----------------------------------------------\n");
+                                continue;
                             }
-                            continue;
-                        }
-
-                        if trimmed.starts_with("/voice join ") {
-                            let v_channel = trimmed.trim_start_matches("/voice join ").trim();
-                            if !v_channel.is_empty() {
+                            ChatAction::ToggleMute => {
+                                if let Some(engine) = &voice_engine {
+                                    let muted = engine.toggle_mute();
+                                    if muted {
+                                        println!("🔇 Microfone MUTADO.");
+                                    } else {
+                                        println!("🎙️  Microfone ATIVADO.");
+                                    }
+                                } else {
+                                    println!("⚠️  Engine de áudio não inicializada.");
+                                }
+                                continue;
+                            }
+                            ChatAction::JoinVoice(v_channel) => {
                                 if let Some(prev) = &current_voice_topic {
                                     let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(prev);
                                 }
@@ -503,63 +546,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&v_topic) {
                                     println!("❌ Falha ao entrar no canal de voz: {:?}", e);
                                 } else {
-                                    current_voice_channel = Some(v_channel.to_string());
+                                    current_voice_channel = Some(v_channel.clone());
                                     current_voice_topic = Some(v_topic);
                                     println!("🔊 Você conectou à sala de voz [🔊 {}]!", v_channel);
                                     println!("💡 Dica: Fale no microfone ou use /mute para silenciar.");
                                 }
+                                continue;
                             }
-                            continue;
-                        }
-
-                        if trimmed == "/voice leave" {
-                            if let Some(prev) = current_voice_topic.take() {
-                                let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&prev);
-                                println!("🔇 Você saiu da sala de voz [{}].", current_voice_channel.take().unwrap_or_default());
-                            } else {
-                                println!("⚠️  Você não está conectado a nenhuma sala de voz.");
-                            }
-                            continue;
-                        }
-
-                        if trimmed.starts_with("/join ") {
-                            let new_channel = trimmed.trim_start_matches("/join ").trim();
-                            if !new_channel.is_empty() && new_channel != current_channel {
-                                // Desinscreve do canal antigo
-                                let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&current_topic);
-                                
-                                // Inscreve no novo canal
-                                current_channel = new_channel.to_string();
-                                topic_name = format!("p2p-discord/channel/{}", current_channel);
-                                current_topic = IdentTopic::new(topic_name.clone());
-                                if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&current_topic) {
-                                    println!("❌ Erro ao entrar no canal #{}: {:?}", current_channel, e);
+                            ChatAction::LeaveVoice => {
+                                if let Some(prev) = current_voice_topic.take() {
+                                    let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&prev);
+                                    println!("🔇 Você saiu da sala de voz [{}].", current_voice_channel.take().unwrap_or_default());
                                 } else {
-                                    println!("🚀 Você entrou no canal [#{}]!", current_channel);
+                                    println!("⚠️  Você não está conectado a nenhuma sala de voz.");
                                 }
+                                continue;
                             }
-                            continue;
-                        }
+                            ChatAction::JoinTextChannel(new_channel) => {
+                                if new_channel != current_channel {
+                                    let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&current_topic);
+                                    current_channel = new_channel.clone();
+                                    topic_name = format!("p2p-discord/channel/{}", current_channel);
+                                    current_topic = IdentTopic::new(topic_name.clone());
+                                    if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&current_topic) {
+                                        println!("❌ Erro ao entrar no canal #{}: {:?}", current_channel, e);
+                                    } else {
+                                        println!("🚀 Você entrou no canal [#{}]!", current_channel);
+                                    }
+                                }
+                                continue;
+                            }
+                            ChatAction::SendTextMessage(trimmed) => {
+                                // Cria mensagem assinada
+                                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                                let payload = format!("{}:{}:{}", current_channel, trimmed, now);
+                                let signature = identity.sign(payload.as_bytes()).to_vec();
 
-                        // Cria mensagem assinada
-                        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-                        let payload = format!("{}:{}:{}", current_channel, trimmed, now);
-                        let signature = identity.sign(payload.as_bytes()).to_vec();
+                                let msg = ChatMessage {
+                                    channel_id: current_channel.clone(),
+                                    author_pubkey: identity.public_key_hex(),
+                                    author_name: args.nick.clone(),
+                                    text: trimmed.clone(),
+                                    timestamp: now,
+                                    signature,
+                                };
 
-                        let msg = ChatMessage {
-                            channel_id: current_channel.clone(),
-                            author_pubkey: identity.public_key_hex(),
-                            author_name: args.nick.clone(),
-                            text: trimmed.to_string(),
-                            timestamp: now,
-                            signature,
-                        };
-
-                        if let Ok(json_bytes) = serde_json::to_vec(&msg) {
-                            if let Err(e) = node.swarm.behaviour_mut().gossipsub.publish(current_topic.clone(), json_bytes) {
-                                println!("⚠️  Aguardando outros pares na sala para enviar mensagem... ({:?})", e);
-                            } else {
-                                println!("💬 [Você]: {}", trimmed);
+                                if let Ok(json_bytes) = serde_json::to_vec(&msg) {
+                                    if let Err(e) = node.swarm.behaviour_mut().gossipsub.publish(current_topic.clone(), json_bytes) {
+                                        println!("⚠️  Aguardando outros pares na sala para enviar mensagem... ({:?})", e);
+                                    } else {
+                                        println!("💬 [Você]: {}", trimmed);
+                                    }
+                                }
                             }
                         }
                     }
@@ -691,4 +729,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("👋 Anarchord encerrado com sucesso.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_user_input_commands() {
+        assert_eq!(parse_user_input(""), ChatAction::Empty);
+        assert_eq!(parse_user_input("   "), ChatAction::Empty);
+        assert_eq!(parse_user_input("/quit"), ChatAction::Quit);
+        assert_eq!(parse_user_input("  /quit  "), ChatAction::Quit);
+        assert_eq!(parse_user_input("/peers"), ChatAction::ListPeers);
+        assert_eq!(parse_user_input("/devices"), ChatAction::ListDevices);
+        assert_eq!(parse_user_input("/mute"), ChatAction::ToggleMute);
+        assert_eq!(parse_user_input("/voice leave"), ChatAction::LeaveVoice);
+    }
+
+    #[test]
+    fn test_parse_user_input_channels() {
+        assert_eq!(
+            parse_user_input("/join dev-chat"),
+            ChatAction::JoinTextChannel("dev-chat".to_string())
+        );
+        assert_eq!(
+            parse_user_input("/voice join musica"),
+            ChatAction::JoinVoice("musica".to_string())
+        );
+        // Texto comum
+        assert_eq!(
+            parse_user_input("Olá mundo descentralizado!"),
+            ChatAction::SendTextMessage("Olá mundo descentralizado!".to_string())
+        );
+    }
+
+    #[test]
+    fn test_clap_cli_args_parsing() {
+        // Testa flags padrão
+        let args = Args::parse_from(["p2p-cli"]);
+        assert_eq!(args.nick, "Peer");
+        assert_eq!(args.port, 0);
+        assert_eq!(args.channel, "geral");
+        assert!(!args.daemon);
+        assert!(!args.synth_audio);
+        assert!(!args.no_auto_bootstrap);
+        assert_eq!(args.auto_voice, None);
+
+        // Testa flags customizadas
+        let custom_args = Args::parse_from([
+            "p2p-cli",
+            "--nick", "Satoshi",
+            "--port", "4001",
+            "--channel", "crypto",
+            "--auto-voice", "geral",
+            "--daemon",
+            "--synth-audio",
+            "--no-auto-bootstrap",
+        ]);
+        assert_eq!(custom_args.nick, "Satoshi");
+        assert_eq!(custom_args.port, 4001);
+        assert_eq!(custom_args.channel, "crypto");
+        assert_eq!(custom_args.auto_voice, Some("geral".to_string()));
+        assert!(custom_args.daemon);
+        assert!(custom_args.synth_audio);
+        assert!(custom_args.no_auto_bootstrap);
+    }
 }
