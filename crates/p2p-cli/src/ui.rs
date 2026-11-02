@@ -62,7 +62,7 @@ pub struct TerminalUi {
     current_channel: String,
     input: String,
     messages: Vec<String>,
-    peers: Vec<(String, String)>, // (Nick, PubKey)
+    peers: Vec<(String, String, String)>, // (PeerId, Nick, PubKey)
     speakers: Vec<String>,        // Nomes de quem está falando agora
     file_transfer: Option<(String, f32, bool)>, // (nome, pct, is_download)
     is_muted: Arc<AtomicBool>,
@@ -121,14 +121,21 @@ impl TerminalUi {
                             self.last_status_bar = log.clone();
                             self.messages.push(format!("⚙️  {}", log));
                         }
-                        UiEvent::PeerConnected { peer_id: _, nick, pubkey } => {
-                            if !self.peers.iter().any(|(n, _)| n == &nick) {
-                                self.peers.push((nick.clone(), pubkey));
+                        UiEvent::PeerConnected { peer_id, nick, pubkey } => {
+                            if let Some(pos) = self.peers.iter().position(|(pid, _, _)| pid == &peer_id) {
+                                self.peers[pos] = (peer_id, nick.clone(), pubkey);
+                            } else {
+                                self.peers.push((peer_id, nick.clone(), pubkey));
                                 self.messages.push(format!("🤝 Par conectado: {}", nick));
                             }
                         }
                         UiEvent::PeerDisconnected(peer_id) => {
-                            self.messages.push(format!("👋 Par desconectado: {}", peer_id));
+                            if let Some(pos) = self.peers.iter().position(|(pid, _, _)| pid == &peer_id) {
+                                let (_, nick, _) = self.peers.remove(pos);
+                                self.messages.push(format!("👋 Par desconectado: {}", nick));
+                            } else {
+                                self.messages.push(format!("👋 Par desconectado: {}", peer_id));
+                            }
                         }
                         UiEvent::VoiceActivity { nick, speaking } => {
                             if speaking {
@@ -204,7 +211,7 @@ impl TerminalUi {
                                         && row < self.peers_area.y + self.peers_area.height
                                     {
                                         let index = (row - self.peers_area.y - 1) as usize;
-                                        if let Some((nick, _pubkey)) = self.peers.get(index) {
+                                        if let Some((_pid, nick, _pubkey)) = self.peers.get(index) {
                                             // Preenche a barra de input para enviar arquivo para esse par!
                                             self.input = format!("/send {} \"\"", nick);
                                             self.messages.push(format!("💡 Selecionado '{}'. Digite o caminho do arquivo entre as aspas e dê ENTER.", nick));
@@ -295,7 +302,7 @@ impl TerminalUi {
         let peer_items: Vec<ListItem> = self
             .peers
             .iter()
-            .map(|(nick, pk)| {
+            .map(|(_pid, nick, pk)| {
                 let short_pk = if pk.len() >= 6 { &pk[..6] } else { pk };
                 ListItem::new(Line::from(vec![
                     Span::styled("🟢 ", Style::default().fg(Color::Green)),
