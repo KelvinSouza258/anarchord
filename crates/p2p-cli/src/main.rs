@@ -939,7 +939,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             event = node.swarm.select_next_some() => {
                 match event {
                     libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
-                        println!("📡 Endereço de escuta ativo: {}", address);
+                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Endereço de escuta: {}", address)));
+                        if args.daemon {
+                            println!("📡 Endereço de escuta ativo: {}", address);
+                        }
                         if !port_reported {
                             // Extrai a porta atribuída pelo OS (TCP ou UDP)
                             for proto in address.iter() {
@@ -956,20 +959,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                         if connected_peers.contains(&peer_id) {
-                            println!("⚠️  Conexão redundante detectada com o par {}. Fechando conexão secundária...", peer_id);
+                            if args.daemon {
+                                println!("⚠️  Conexão redundante detectada com o par {}. Fechando conexão secundária...", peer_id);
+                            }
                             // Fecha apenas ESTA conexão específica, mantendo a primeira intacta!
                             let _ = node.swarm.close_connection(connection_id);
                         } else {
                             connected_peers.insert(peer_id);
-                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Conexão P2P estabelecida com: {}", peer_id)));
-                            println!("🤝 Conexão P2P Direta estabelecida com: {} via {:?}", peer_id, endpoint.get_remote_address());
+                            let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Conexão P2P com {}", peer_id)));
+                            if args.daemon {
+                                println!("🤝 Conexão P2P Direta estabelecida com: {} via {:?}", peer_id, endpoint.get_remote_address());
+                            }
                         }
                     }
                     libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. } => {
                         if num_established == 0 {
                             connected_peers.remove(&peer_id);
                             let _ = tx_ui_event.send(UiEvent::PeerDisconnected(peer_id.to_string()));
-                            println!("👋 Conexão fechada com: {} (Motivo: {:?})", peer_id, cause);
+                            if args.daemon {
+                                println!("👋 Conexão fechada com: {} (Motivo: {:?})", peer_id, cause);
+                            }
                         }
                     }
                     libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Identify(
@@ -1053,10 +1062,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 FileTransferMessage::Offer(offer) => {
                                     // Verifica se o arquivo é direcionado a nós
                                     if offer.recipient_pubkey == identity.public_key_hex() {
-                                        println!("\n📥 [TRANSFERÊNCIA DE ARQUIVO] Recebida proposta de '{}':", offer.sender_name);
-                                        println!("   📄 Arquivo : {}", offer.file_name);
-                                        println!("   📏 Tamanho : {:.2} MB ({} bytes em {} blocos de 64KB)", offer.file_size as f64 / (1024.0 * 1024.0), offer.file_size, offer.total_chunks);
-                                        println!("   🔑 Hash    : {}", offer.file_hash);
+                                        if args.daemon {
+                                            println!("\n📥 [TRANSFERÊNCIA DE ARQUIVO] Recebida proposta de '{}':", offer.sender_name);
+                                            println!("   📄 Arquivo : {}", offer.file_name);
+                                            println!("   📏 Tamanho : {:.2} MB ({} bytes em {} blocos de 64KB)", offer.file_size as f64 / (1024.0 * 1024.0), offer.file_size, offer.total_chunks);
+                                            println!("   🔑 Hash    : {}", offer.file_hash);
+                                        }
+                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Proposta de arquivo '{}' de {}. Use /accept {}", offer.file_name, offer.sender_name, &offer.file_hash[..8])));
 
                                         // Se estiver rodando como Daemon (modo bot/servidor), aceita automaticamente
                                         if args.daemon {

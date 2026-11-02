@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -66,6 +66,8 @@ pub struct TerminalUi {
     speakers: Vec<String>,        // Nomes de quem está falando agora
     file_transfer: Option<(String, f32, bool)>, // (nome, pct, is_download)
     is_muted: Arc<AtomicBool>,
+    peers_area: Rect,
+    last_status_bar: String,
 }
 
 impl TerminalUi {
@@ -77,12 +79,14 @@ impl TerminalUi {
             input: String::new(),
             messages: vec![
                 "🚀 Bem-vindo ao Anarchord P2P (100% Descentralizado)!".to_string(),
-                "💡 Digite sua mensagem e pressione ENTER. Use /quit para sair.".to_string(),
+                "💡 Clique em um par com o mouse para iniciar o envio de arquivo, ou digite /help.".to_string(),
             ],
             peers: Vec::new(),
             speakers: Vec::new(),
             file_transfer: None,
             is_muted,
+            peers_area: Rect::default(),
+            last_status_bar: "Sistema pronto. Conectado à malha P2P.".to_string(),
         }
     }
 
@@ -94,7 +98,7 @@ impl TerminalUi {
         // Setup Terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -114,6 +118,7 @@ impl TerminalUi {
                             self.messages.push(format!("[#{}] {}: {}", channel, author, text));
                         }
                         UiEvent::SystemLog(log) => {
+                            self.last_status_bar = log.clone();
                             self.messages.push(format!("⚙️  {}", log));
                         }
                         UiEvent::PeerConnected { peer_id: _, nick, pubkey } => {
@@ -145,40 +150,69 @@ impl TerminalUi {
                     }
                 }
 
-                // Processa teclado do usuário de forma não bloqueante
+                // Processa teclado e mouse do usuário de forma não bloqueante
                 _ = event_interval.tick() => {
                     while event::poll(std::time::Duration::from_millis(0))? {
-                        if let Event::Key(key) = event::read()? {
-                            match key.code {
-                                KeyCode::Enter => {
-                                    let line = std::mem::take(&mut self.input);
-                                    let trimmed = line.trim();
-                                    if !trimmed.is_empty() {
-                                        if trimmed == "/quit" {
-                                            let _ = tx_actions.send(UiAction::Quit);
-                                            self.cleanup_terminal(&mut terminal)?;
-                                            return Ok(());
-                                        } else if trimmed == "/mute" {
-                                            let _ = tx_actions.send(UiAction::ToggleMute);
-                                        } else {
-                                            self.messages.push(format!("[#{}] {}: {}", self.current_channel, self.my_nick, trimmed));
-                                            let _ = tx_actions.send(UiAction::SendMessage(line));
+                        match event::read()? {
+                            Event::Key(key) => {
+                                // No Windows, crossterm gera KeyEventKind::Press e KeyEventKind::Release!
+                                // Ignoramos Release para não duplicar cada clique de tecla.
+                                if key.kind != KeyEventKind::Press {
+                                    continue;
+                                }
+
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        let line = std::mem::take(&mut self.input);
+                                        let trimmed = line.trim();
+                                        if !trimmed.is_empty() {
+                                            if trimmed == "/quit" {
+                                                let _ = tx_actions.send(UiAction::Quit);
+                                                self.cleanup_terminal(&mut terminal)?;
+                                                return Ok(());
+                                            } else if trimmed == "/mute" {
+                                                let _ = tx_actions.send(UiAction::ToggleMute);
+                                            } else {
+                                                self.messages.push(format!("[#{}] {}: {}", self.current_channel, self.my_nick, trimmed));
+                                                let _ = tx_actions.send(UiAction::SendMessage(line));
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        let _ = tx_actions.send(UiAction::Quit);
+                                        self.cleanup_terminal(&mut terminal)?;
+                                        return Ok(());
+                                    }
+                                    KeyCode::Char(c) => {
+                                        self.input.push(c);
+                                    }
+                                    KeyCode::Backspace => {
+                                        self.input.pop();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Event::Mouse(mouse) => {
+                                if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                                    let col = mouse.column;
+                                    let row = mouse.row;
+
+                                    // Verifica se o clique foi dentro da área da lista de pares online
+                                    if col >= self.peers_area.x
+                                        && col < self.peers_area.x + self.peers_area.width
+                                        && row > self.peers_area.y
+                                        && row < self.peers_area.y + self.peers_area.height
+                                    {
+                                        let index = (row - self.peers_area.y - 1) as usize;
+                                        if let Some((nick, _pubkey)) = self.peers.get(index) {
+                                            // Preenche a barra de input para enviar arquivo para esse par!
+                                            self.input = format!("/send {} \"\"", nick);
+                                            self.messages.push(format!("💡 Selecionado '{}'. Digite o caminho do arquivo entre as aspas e dê ENTER.", nick));
                                         }
                                     }
                                 }
-                                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    let _ = tx_actions.send(UiAction::Quit);
-                                    self.cleanup_terminal(&mut terminal)?;
-                                    return Ok(());
-                                }
-                                KeyCode::Char(c) => {
-                                    self.input.push(c);
-                                }
-                                KeyCode::Backspace => {
-                                    self.input.pop();
-                                }
-                                _ => {}
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -186,16 +220,17 @@ impl TerminalUi {
         }
     }
 
-    fn draw_ui(&self, f: &mut ratatui::Frame) {
+    fn draw_ui(&mut self, f: &mut ratatui::Frame) {
         let size = f.area();
 
-        // Divide a tela em 3 áreas verticais: Título/Topo, Corpo Central e Barra de Entrada
+        // Divide a tela em 4 áreas verticais: Título/Topo, Corpo Central, Barra de Entrada e Rodapé
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3), // Header
                 Constraint::Min(5),    // Main Body
                 Constraint::Length(3), // Input Bar
+                Constraint::Length(1), // Footer Status Bar
             ])
             .split(size);
 
@@ -256,6 +291,7 @@ impl TerminalUi {
             .split(main_chunks[1]);
 
         // Lista de Membros
+        self.peers_area = side_chunks[0];
         let peer_items: Vec<ListItem> = self
             .peers
             .iter()
@@ -299,7 +335,7 @@ impl TerminalUi {
         );
         f.render_widget(voice_list, side_chunks[1]);
 
-        // 3. Barra de Entrada Inferior
+        // 3. Barra de Entrada
         let input_box = Paragraph::new(format!("❯ {}", self.input))
             .style(Style::default().fg(Color::White))
             .block(
@@ -308,6 +344,14 @@ impl TerminalUi {
                     .title(" Digite uma mensagem ou comando (/send <par> <arquivo>, /mute, /quit) "),
             );
         f.render_widget(input_box, chunks[2]);
+
+        // 4. Rodapé de Notificações / Status Bar (Redirecionamento de logs de sistema)
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled(" 📢 STATUS: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(&self.last_status_bar, Style::default().fg(Color::Cyan)),
+        ]))
+        .style(Style::default().bg(Color::DarkGray));
+        f.render_widget(footer, chunks[3]);
     }
 
     fn render_messages(&self, f: &mut ratatui::Frame, area: Rect) {
@@ -341,7 +385,7 @@ impl TerminalUi {
 
     fn cleanup_terminal(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
         terminal.show_cursor()?;
         Ok(())
     }
