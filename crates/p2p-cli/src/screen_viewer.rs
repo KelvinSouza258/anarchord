@@ -57,7 +57,6 @@ impl ScreenViewer {
             let mut rgba_staging: Vec<u8> = Vec::new();
 
             while window.is_open() && !window.is_key_down(Key::Escape) && is_active.load(Ordering::Relaxed) {
-                // Coleta todos os pacotes pendentes e decodifica para manter o estado inter-frames consistente
                 let mut incoming_packets = Vec::new();
                 if let Ok(rx) = rx_video_frames.lock() {
                     while let Ok(pkt) = rx.try_recv() {
@@ -69,31 +68,17 @@ impl ScreenViewer {
                     match codec {
                         VideoCodec::H264 => {
                             if let Some(ref mut decoder) = h264_decoder {
-                                for packet in nal_units(&data) {
-                                    if let Ok(Some(yuv)) = decoder.decode(packet) {
-                                        let dim = yuv.dimensions();
-                                        let (w, h) = (dim.0, dim.1);
-                                        let required_len = w * h * 4;
-
-                                        if rgba_staging.len() != required_len {
-                                            rgba_staging.resize(required_len, 0);
-                                        }
-
-                                        yuv.write_rgba8(&mut rgba_staging);
-
-                                        if w != curr_w || h != curr_h {
-                                            curr_w = w;
-                                            curr_h = h;
-                                            current_buffer.resize(curr_w * curr_h, 0);
-                                        }
-
-                                        // Converte RGBA8 para o formato 0RGB do minifb
-                                        for (i, pixel) in rgba_staging.chunks_exact(4).enumerate() {
-                                            if i < current_buffer.len() {
-                                                let r = pixel[0] as u32;
-                                                let g = pixel[1] as u32;
-                                                let b = pixel[2] as u32;
-                                                current_buffer[i] = (r << 16) | (g << 8) | b;
+                                // 1. Tenta decodificar o bitstream direto
+                                let decode_res = decoder.decode(&data);
+                                match decode_res {
+                                    Ok(Some(yuv)) => {
+                                        Self::render_yuv_to_buffer(&yuv, &mut rgba_staging, &mut current_buffer, &mut curr_w, &mut curr_h);
+                                    }
+                                    _ => {
+                                        // 2. Fallback: Se o bitstream veio com múltiplos NALs, itera por eles
+                                        for packet in nal_units(&data) {
+                                            if let Ok(Some(yuv)) = decoder.decode(packet) {
+                                                Self::render_yuv_to_buffer(&yuv, &mut rgba_staging, &mut current_buffer, &mut curr_w, &mut curr_h);
                                             }
                                         }
                                     }
@@ -133,5 +118,38 @@ impl ScreenViewer {
 
             is_active.store(false, Ordering::SeqCst);
         });
+    }
+
+    fn render_yuv_to_buffer(
+        yuv: &openh264::decoder::DecodedYUV<'_>,
+        rgba_staging: &mut Vec<u8>,
+        current_buffer: &mut Vec<u32>,
+        curr_w: &mut usize,
+        curr_h: &mut usize,
+    ) {
+        let dim = yuv.dimensions();
+        let (w, h) = (dim.0, dim.1);
+        let required_len = w * h * 4;
+
+        if rgba_staging.len() != required_len {
+            rgba_staging.resize(required_len, 0);
+        }
+
+        yuv.write_rgba8(rgba_staging);
+
+        if w != *curr_w || h != *curr_h {
+            *curr_w = w;
+            *curr_h = h;
+            current_buffer.resize(*curr_w * *curr_h, 0);
+        }
+
+        for (i, pixel) in rgba_staging.chunks_exact(4).enumerate() {
+            if i < current_buffer.len() {
+                let r = pixel[0] as u32;
+                let g = pixel[1] as u32;
+                let b = pixel[2] as u32;
+                current_buffer[i] = (r << 16) | (g << 8) | b;
+            }
+        }
     }
 }

@@ -1,5 +1,6 @@
-use openh264::encoder::Encoder;
+use openh264::encoder::{Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, SpsPpsStrategy, UsageType};
 use openh264::formats::{RgbaSliceU8, YUVBuffer};
+use openh264::OpenH264API;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,34 +20,22 @@ pub struct ScreenInfo {
 /// Tipo de codec de vídeo do pacote
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoCodec {
-    /// Fallback JPEG legado (quadro completo independente)
     Jpeg,
-    /// H.264 / AVC de alta performance com compressão inter-frames
     H264,
 }
 
 /// Pacote de transmissão de quadro de vídeo P2P (H.264 ou JPEG)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenPacket {
-    /// Identificador do fluxo (ex: "screen:<pubkey_curta>")
     pub stream_id: String,
-    /// Chave pública do apresentador
     pub sender_pubkey: String,
-    /// Apelido do apresentador
     pub sender_name: String,
-    /// Número sequencial do quadro
     pub frame_seq: u64,
-    /// Largura do quadro transmitido
     pub width: u32,
-    /// Altura do quadro transmitido
     pub height: u32,
-    /// Timestamp Unix em milissegundos
     pub timestamp_ms: u64,
-    /// Codec de vídeo utilizado neste pacote
     pub codec: VideoCodec,
-    /// Indica se o quadro é um Keyframe / I-Frame (imagem completa sem depender do anterior)
     pub is_keyframe: bool,
-    /// Dados binários codificados do vídeo (NAL units H.264 ou bytes JPEG)
     pub video_data: Vec<u8>,
 }
 
@@ -72,12 +61,10 @@ impl ScreenCaptureEngine {
         }
     }
 
-    /// Retorna handle atômico para verificar ou alternar status de transmissão
     pub fn is_streaming_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.is_streaming)
     }
 
-    /// Lista os monitores físicos detectados pelo sistema operacional
     pub fn list_screens() -> Vec<ScreenInfo> {
         match Monitor::all() {
             Ok(monitors) => monitors
@@ -94,7 +81,24 @@ impl ScreenCaptureEngine {
         }
     }
 
-    /// Inicia a captura em tempo real codificando em H.264 a 30 FPS com baixíssimo uso de banda
+    /// Cria um encoder H.264 com configurações otimizadas para Screen Sharing em tempo real:
+    /// - Keyframe a cada 30 frames (1 segundo) para que novos espectadores não fiquem em tela preta
+    /// - UsageType::ScreenContentRealTime para nitidez máxima de fontes e janelas
+    /// - SpsPpsStrategy::ConstantId com SPS/PPS embutido em todo Keyframe
+    fn create_h264_encoder(fps: u32) -> Option<Encoder> {
+        let api = OpenH264API::from_source();
+        let config = EncoderConfig::new()
+            .usage_type(UsageType::ScreenContentRealTime)
+            .rate_control_mode(RateControlMode::Quality)
+            .max_frame_rate(FrameRate::from_hz(fps as f32))
+            .sps_pps_strategy(SpsPpsStrategy::ConstantId)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(30))
+            .scene_change_detect(true);
+
+        Encoder::with_api_config(api, config).ok()
+    }
+
+    /// Inicia a captura em tempo real codificando em H.264 a 30 FPS
     pub fn start_capture<F>(
         &self,
         stream_id: String,
@@ -114,11 +118,11 @@ impl ScreenCaptureEngine {
         std::thread::spawn(move || {
             let mut frame_seq = 0u64;
 
-            // Busca os monitores disponíveis
             let all_monitors = Monitor::all().unwrap_or_default();
             let selected_monitor = all_monitors.into_iter().nth(monitor_index);
 
-            let mut h264_encoder: Option<Encoder> = None;
+            let mut h264_encoder = Self::create_h264_encoder(fps);
+            let mut last_dimensions = (0u32, 0u32);
 
             while is_running.load(Ordering::Relaxed) {
                 let start_time = Instant::now();
@@ -129,7 +133,7 @@ impl ScreenCaptureEngine {
                             let w = image.width();
                             let h = image.height();
 
-                            // Ajusta para resolução amigável a H.264 (downscale 720p se > 1280, e dimensões pares)
+                            // Ajusta para resolução amigável a H.264 (máx 1280px e dimensões pares)
                             let target_w = if w > 1280 { 1280 } else { w } & !1;
                             let target_h = (((h as f32 * (target_w as f32 / w as f32)) as u32) & !1).max(2);
 
@@ -152,19 +156,20 @@ impl ScreenCaptureEngine {
                     Self::generate_synthetic_rgba(frame_seq)
                 };
 
-                // Inicializa o encoder H.264
-                if h264_encoder.is_none() {
-                    h264_encoder = Encoder::new().ok();
+                // Se a tela mudou de resolução, recria o encoder
+                if last_dimensions != (width, height) {
+                    h264_encoder = Self::create_h264_encoder(fps);
+                    last_dimensions = (width, height);
                 }
 
-                // Codifica o frame RGBA para H.264 (com fallback para JPEG se o encoder falhar)
+                // Codifica para H.264
                 let (codec, is_keyframe, video_bytes) = if let Some(ref mut enc) = h264_encoder {
                     let rgba_src = RgbaSliceU8::new(&raw_rgba, (width as usize, height as usize));
                     let yuv = YUVBuffer::from_rgb_source(rgba_src);
                     match enc.encode(&yuv) {
                         Ok(stream) => {
                             let bytes = stream.to_vec();
-                            let is_key = (frame_seq % 60 == 0) || frame_seq == 0;
+                            let is_key = (frame_seq % 30 == 0) || frame_seq == 0;
                             (VideoCodec::H264, is_key, bytes)
                         }
                         Err(_) => {
@@ -206,12 +211,11 @@ impl ScreenCaptureEngine {
         });
     }
 
-    /// Para a captura ativa
     pub fn stop_capture(&self) {
         self.is_streaming.store(false, Ordering::SeqCst);
     }
 
-    /// Inicia uma transmissão de vídeo sintético animado em H.264 (para bots/servidores headless)
+    /// Inicia uma transmissão de vídeo sintético animado em H.264
     pub fn start_synthetic_video_stream<F>(
         &self,
         stream_id: String,
@@ -230,7 +234,7 @@ impl ScreenCaptureEngine {
         std::thread::spawn(move || {
             let mut frame_seq = 0u64;
             let (width, height) = (640u32, 360u32);
-            let mut h264_encoder = Encoder::new().ok();
+            let mut h264_encoder = Self::create_h264_encoder(fps);
 
             while is_running.load(Ordering::Relaxed) {
                 let start_time = Instant::now();
@@ -242,7 +246,7 @@ impl ScreenCaptureEngine {
                     match enc.encode(&yuv) {
                         Ok(stream) => {
                             let bytes = stream.to_vec();
-                            let is_key = (frame_seq % 60 == 0) || frame_seq == 0;
+                            let is_key = (frame_seq % 30 == 0) || frame_seq == 0;
                             (VideoCodec::H264, is_key, bytes)
                         }
                         Err(_) => {
@@ -284,7 +288,6 @@ impl ScreenCaptureEngine {
         });
     }
 
-    /// Codifica buffer RGBA em JPEG (usado como fallback)
     fn encode_jpeg(raw_rgba: &[u8], width: u32, height: u32, quality: u8) -> Vec<u8> {
         let mut comp_buf = Vec::with_capacity(32 * 1024);
         let encoder = jpeg_encoder::Encoder::new(&mut comp_buf, quality);
@@ -297,7 +300,6 @@ impl ScreenCaptureEngine {
         comp_buf
     }
 
-    /// Gera quadro sintético dinâmico RGBA de alta fidelidade estilo Anarchord TV
     fn generate_synthetic_rgba(seq: u64) -> (u32, u32, Vec<u8>) {
         let width = 640u32;
         let height = 360u32;
@@ -313,7 +315,6 @@ impl ScreenCaptureEngine {
                 let dx = x as f32 - center_x;
                 let dist = (dx * dx + dy * dy).sqrt();
 
-                // Padrão de anéis concêntricos pulsantes (Efeito Radar / Cyber Neon)
                 let ring = ((dist * 0.1 - time_sec * 3.0).sin() * 127.0 + 128.0) as u8;
                 let scanline = if y % 4 == 0 { 40 } else { 0 };
 
