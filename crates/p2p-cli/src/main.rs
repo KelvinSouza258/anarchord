@@ -16,7 +16,7 @@ use p2p_core::{
     node::{parse_agent_version, P2PNode, DHT_DISCOVERY_NAMESPACE},
     protocol::AppBehaviourEvent,
     relay::RelayManager,
-    screen::{ScreenCaptureEngine, ScreenPacket},
+    screen::{max_width_for_quality, KeyframeGate, ScreenCaptureEngine, ScreenPacket},
     tracker::{make_info_hash, TorrentTrackerClient},
     voice::{AudioCodec, AudioDeviceManager, JitterBuffer, VoiceEngine, VoicePacket},
 };
@@ -78,6 +78,10 @@ pub struct Args {
     #[arg(long)]
     pub log_file: Option<PathBuf>,
 }
+
+/// Quadros de vídeo aguardando a janela do viewer. Fila curta: se a janela atrasar, os quadros
+/// excedentes são descartados em vez de acumular segundos de atraso.
+const VIEWER_QUEUE_FRAMES: usize = 3;
 
 /// Ação interpretada a partir de uma linha digitada no chat
 #[derive(Debug, PartialEq, Clone)]
@@ -603,6 +607,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tx_viewer_frame_opt: Option<std::sync::mpsc::SyncSender<(p2p_core::screen::VideoCodec, Vec<u8>)>> = None;
     let screen_viewer_active = Arc::new(AtomicBool::new(false));
     let mut current_watching_stream: Option<String> = None;
+    let mut viewer_gate = KeyframeGate::new();
     let mut active_screen_streams: HashMap<String, (String, String, u32, u32, std::time::Instant)> = HashMap::new(); // stream_id -> (nick, pubkey, w, h, last_seen)
 
     // Se o argumento --synth-video foi informado (útil para bots como Oracle-Bot), inicia transmissão automática
@@ -736,14 +741,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if screen_capture_engine.is_streaming() {
                                     let _ = tx_ui_event.send(UiEvent::SystemLog("Você já está transmitindo sua tela. Use /screen stop para parar.".to_string()));
                                 } else {
-                                    let max_width = match quality {
-                                        1080 => 1920,
-                                        720 => 1280,
-                                        540 => 960,
-                                        480 => 854,
-                                        360 => 640,
-                                        other => other,
-                                    };
+                                    let max_width = max_width_for_quality(quality);
                                     let stream_id = format!("screen:{}", &identity.public_key_hex()[..8]);
                                     let tx_frame = tx_screen_out.clone();
                                     screen_capture_engine.start_capture(
@@ -779,11 +777,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 if let Some((sid, presenter_nick)) = target_stream {
                                     // Cria ou recria o canal com capacidade para que quadros antigos sejam descartados se a janela travar
-                                    let (tx_vf, rx_vf) = std::sync::mpsc::sync_channel::<(p2p_core::screen::VideoCodec, Vec<u8>)>(30);
+                                    let (tx_vf, rx_vf) = std::sync::mpsc::sync_channel::<(p2p_core::screen::VideoCodec, Vec<u8>)>(VIEWER_QUEUE_FRAMES);
                                     let rx_vf_arc = Arc::new(std::sync::Mutex::new(rx_vf));
                                     tx_viewer_frame_opt = Some(tx_vf);
 
                                     current_watching_stream = Some(sid.clone());
+                                    viewer_gate = KeyframeGate::new();
                                     screen_viewer_active.store(true, Ordering::SeqCst);
                                     ScreenViewer::spawn_window(
                                         presenter_nick.clone(),
@@ -1173,14 +1172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if screen_capture_engine.is_streaming() {
                                     println!("⚠️  Você já está transmitindo sua tela. Use /screen stop para parar.");
                                 } else {
-                                    let max_width = match quality {
-                                        1080 => 1920,
-                                        720 => 1280,
-                                        540 => 960,
-                                        480 => 854,
-                                        360 => 640,
-                                        other => other,
-                                    };
+                                    let max_width = max_width_for_quality(quality);
                                     let stream_id = format!("screen:{}", &identity.public_key_hex()[..8]);
                                     let tx_frame = tx_screen_out.clone();
                                     screen_capture_engine.start_capture(
@@ -1218,11 +1210,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 if let Some((sid, presenter_nick)) = target_stream {
                                     // Cria ou recria o canal com capacidade para que quadros antigos sejam descartados se a janela travar
-                                    let (tx_vf, rx_vf) = std::sync::mpsc::sync_channel::<(p2p_core::screen::VideoCodec, Vec<u8>)>(30);
+                                    let (tx_vf, rx_vf) = std::sync::mpsc::sync_channel::<(p2p_core::screen::VideoCodec, Vec<u8>)>(VIEWER_QUEUE_FRAMES);
                                     let rx_vf_arc = Arc::new(std::sync::Mutex::new(rx_vf));
                                     tx_viewer_frame_opt = Some(tx_vf);
 
                                     current_watching_stream = Some(sid.clone());
+                                    viewer_gate = KeyframeGate::new();
                                     screen_viewer_active.store(true, Ordering::SeqCst);
                                     ScreenViewer::spawn_window(
                                         presenter_nick.clone(),
@@ -1562,8 +1555,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(watching_id) = &current_watching_stream {
                                     if watching_id == &stream_id && screen_viewer_active.load(Ordering::Relaxed) {
                                         if let Some(tx_vf) = &tx_viewer_frame_opt {
-                                            // try_send descarta quadros caso o consumidor esteja momentaneamente ocupado, evitando travar a malha
-                                            let _ = tx_vf.try_send((screen_pkt.codec, screen_pkt.video_data));
+                                            // Fila cheia descarta o quadro sem travar a malha; o gate segura os P-frames
+                                            // seguintes até o próximo keyframe para não corromper a imagem
+                                            let (codec, data) = (screen_pkt.codec, screen_pkt.video_data);
+                                            viewer_gate.forward(screen_pkt.is_keyframe, || tx_vf.try_send((codec, data)).is_ok());
                                         }
                                     }
                                 }

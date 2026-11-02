@@ -1,14 +1,12 @@
 use minifb::{Key, Window, WindowOptions};
-use openh264::decoder::Decoder;
-use openh264::formats::YUVSource;
-use openh264::nal_units;
-use p2p_core::screen::VideoCodec;
+use p2p_core::screen::{DecodedFrame, ScreenDecoder, VideoCodec};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Exibidor gráfico de tela em janela nativa ultraleve via minifb com métricas de telemetria em tempo real
+/// Exibidor gráfico de tela em janela nativa ultraleve via minifb com métricas de telemetria em tempo real.
+/// A decodificação fica no core (`ScreenDecoder`); aqui só há a janela e a conversão para o formato do minifb.
 pub struct ScreenViewer;
 
 impl ScreenViewer {
@@ -52,9 +50,7 @@ impl ScreenViewer {
             let mut current_buffer: Vec<u32> = vec![0; initial_width * initial_height];
             let mut curr_w = initial_width;
             let mut curr_h = initial_height;
-
-            let mut h264_decoder = Decoder::new().ok();
-            let mut rgba_staging: Vec<u8> = Vec::new();
+            let mut decoder = ScreenDecoder::new();
 
             // Variáveis de telemetria (FPS e velocidade de rede)
             let mut last_metrics_update = Instant::now();
@@ -74,58 +70,17 @@ impl ScreenViewer {
                 let mut had_new_frame = false;
 
                 for (codec, data) in incoming_packets {
-                    let data_len = data.len();
-                    bytes_this_second += data_len;
-                    total_bytes_received += data_len as u64;
+                    bytes_this_second += data.len();
+                    total_bytes_received += data.len() as u64;
+                    current_codec_name = match codec {
+                        VideoCodec::H264 => "H.264",
+                        VideoCodec::Jpeg => "JPEG",
+                    };
 
-                    match codec {
-                        VideoCodec::H264 => {
-                            current_codec_name = "H.264";
-                            if let Some(ref mut decoder) = h264_decoder {
-                                let mut rendered = false;
-                                for packet in nal_units(&data) {
-                                    if let Ok(Some(yuv)) = decoder.decode(packet) {
-                                        Self::render_yuv_to_buffer(&yuv, &mut rgba_staging, &mut current_buffer, &mut curr_w, &mut curr_h);
-                                        rendered = true;
-                                    }
-                                }
-                                if !rendered {
-                                    if let Ok(Some(yuv)) = decoder.decode(&data) {
-                                        Self::render_yuv_to_buffer(&yuv, &mut rgba_staging, &mut current_buffer, &mut curr_w, &mut curr_h);
-                                        rendered = true;
-                                    }
-                                }
-
-                                if rendered {
-                                    frames_this_second += 1;
-                                    had_new_frame = true;
-                                }
-                            }
-                        }
-                        VideoCodec::Jpeg => {
-                            current_codec_name = "JPEG";
-                            if let Ok(img) = image::load_from_memory_with_format(&data, image::ImageFormat::Jpeg) {
-                                let rgba = img.to_rgba8();
-                                let (w, h) = (rgba.width() as usize, rgba.height() as usize);
-
-                                if w != curr_w || h != curr_h {
-                                    curr_w = w;
-                                    curr_h = h;
-                                    current_buffer.resize(curr_w * curr_h, 0);
-                                }
-
-                                for (i, pixel) in rgba.chunks_exact(4).enumerate() {
-                                    if i < current_buffer.len() {
-                                        let r = pixel[0] as u32;
-                                        let g = pixel[1] as u32;
-                                        let b = pixel[2] as u32;
-                                        current_buffer[i] = (r << 16) | (g << 8) | b;
-                                    }
-                                }
-                                frames_this_second += 1;
-                                had_new_frame = true;
-                            }
-                        }
+                    if let Some(frame) = decoder.decode(codec, &data) {
+                        Self::copy_to_window_buffer(frame, &mut current_buffer, &mut curr_w, &mut curr_h);
+                        frames_this_second += 1;
+                        had_new_frame = true;
                     }
                 }
 
@@ -134,7 +89,6 @@ impl ScreenViewer {
                     let elapsed_sec = last_metrics_update.elapsed().as_secs_f32();
                     let current_fps = (frames_this_second as f32 / elapsed_sec).round() as u32;
                     let current_kbps = (bytes_this_second as f32 / 1024.0) / elapsed_sec;
-
                     let total_mb = (total_bytes_received as f64) / (1024.0 * 1024.0);
 
                     window.set_title(&format!(
@@ -148,7 +102,7 @@ impl ScreenViewer {
                 }
 
                 if had_new_frame {
-                    if let Err(_) = window.update_with_buffer(&current_buffer, curr_w, curr_h) {
+                    if window.update_with_buffer(&current_buffer, curr_w, curr_h).is_err() {
                         break;
                     }
                 } else {
@@ -161,43 +115,15 @@ impl ScreenViewer {
         });
     }
 
-    fn render_yuv_to_buffer(
-        yuv: &openh264::decoder::DecodedYUV<'_>,
-        rgba_staging: &mut Vec<u8>,
-        current_buffer: &mut Vec<u32>,
-        curr_w: &mut usize,
-        curr_h: &mut usize,
-    ) {
-        let dim = yuv.dimensions();
-        let (w, h) = (dim.0, dim.1);
-        let required_len = w * h * 4;
-
-        if rgba_staging.len() != required_len {
-            rgba_staging.resize(required_len, 0);
+    /// Converte RGBA para o formato 0RGB (u32) que o minifb exibe
+    fn copy_to_window_buffer(frame: &DecodedFrame, buffer: &mut Vec<u32>, curr_w: &mut usize, curr_h: &mut usize) {
+        if frame.width != *curr_w || frame.height != *curr_h {
+            *curr_w = frame.width;
+            *curr_h = frame.height;
         }
-
-        yuv.write_rgba8(rgba_staging);
-
-        if w != *curr_w || h != *curr_h {
-            *curr_w = w;
-            *curr_h = h;
-            current_buffer.resize(*curr_w * *curr_h, 0);
-        }
-
-        let mut chunks = rgba_staging.chunks_exact(4);
-        let mut i = 0;
-        let limit = current_buffer.len().min(rgba_staging.len() / 4);
-
-        while i < limit {
-            if let Some(pixel) = chunks.next() {
-                let r = pixel[0] as u32;
-                let g = pixel[1] as u32;
-                let b = pixel[2] as u32;
-                current_buffer[i] = (r << 16) | (g << 8) | b;
-                i += 1;
-            } else {
-                break;
-            }
+        buffer.resize(frame.width * frame.height, 0);
+        for (dst, px) in buffer.iter_mut().zip(frame.rgba.chunks_exact(4)) {
+            *dst = (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32;
         }
     }
 }

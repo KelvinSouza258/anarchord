@@ -18,5 +18,3 @@ opus1 = "0.3.0"
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 minifb = "0.29.0"
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
-openh264 = "0.9.9"

@@ -42,10 +42,14 @@ tracing-subscriber = "0.3"
 # Áudio Nativo Multiplataforma (Windows WASAPI, Linux ALSA, macOS CoreAudio)
 cpal = "0.15"
 opus1 = "0.3.0"
-xcap = { version = "0.9.8", features = ["wgc"] }
 jpeg-encoder = "0.7.1"
 image = "0.25.10"
 openh264 = "0.9.9"
+
+# Captura de tela nativa só existe em desktop; Android/iOS entregam frames pelo app hospedeiro
+# (screen::capture::external)
+[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
+xcap = { version = "0.9.8", features = ["wgc"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
