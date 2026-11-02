@@ -65,6 +65,7 @@ impl TorrentTrackerClient {
         info_hash: &[u8; 20],
         peer_id: &[u8; 20],
         listen_port: u16,
+        event: u32, // 0 = none, 1 = completed, 2 = started, 3 = stopped
     ) -> Result<Vec<SocketAddr>, TrackerError> {
         let action: u32 = 1; // 1 = Announce
         let transaction_id: u32 = rand::random();
@@ -78,7 +79,7 @@ impl TorrentTrackerClient {
         packet.extend_from_slice(&0u64.to_be_bytes()); // downloaded
         packet.extend_from_slice(&0u64.to_be_bytes()); // left
         packet.extend_from_slice(&0u64.to_be_bytes()); // uploaded
-        packet.extend_from_slice(&0u32.to_be_bytes()); // event: 0 = none
+        packet.extend_from_slice(&event.to_be_bytes()); // event: 0=none, 3=stopped
         packet.extend_from_slice(&0u32.to_be_bytes()); // IP address: 0 default
         packet.extend_from_slice(&rand::random::<u32>().to_be_bytes()); // key
         packet.extend_from_slice(&50i32.to_be_bytes()); // num_want: 50
@@ -126,7 +127,26 @@ impl TorrentTrackerClient {
             .ok_or(TrackerError::ResolutionFailed)?;
 
         let conn_id = client.connect_handshake(addr)?;
-        client.announce(addr, conn_id, info_hash, peer_id, listen_port)
+        client.announce(addr, conn_id, info_hash, peer_id, listen_port, 2) // 2 = started
+    }
+
+    /// Desanuncia do tracker notificando que o nó foi encerrado (event = stopped)
+    pub fn announce_stopped(
+        tracker_host_port: &str,
+        info_hash: &[u8; 20],
+        peer_id: &[u8; 20],
+        listen_port: u16,
+    ) -> Result<(), TrackerError> {
+        let client = TorrentTrackerClient::new()?;
+        let addr = tracker_host_port
+            .to_socket_addrs()
+            .map_err(|_| TrackerError::ResolutionFailed)?
+            .next()
+            .ok_or(TrackerError::ResolutionFailed)?;
+
+        let conn_id = client.connect_handshake(addr)?;
+        let _ = client.announce(addr, conn_id, info_hash, peer_id, listen_port, 3)?; // 3 = stopped
+        Ok(())
     }
 }
 

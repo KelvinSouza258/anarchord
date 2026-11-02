@@ -106,6 +106,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx_peer_discovery, mut rx_peer_discovery) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (tx_assigned_port, mut rx_assigned_port) = tokio::sync::mpsc::channel::<u16>(1);
 
+    // Rastreamento da porta real para cleanup ao sair (Ctrl+C ou /quit)
+    let assigned_listen_port = Arc::new(std::sync::atomic::AtomicU16::new(args.port));
+    let assigned_port_clone = Arc::clone(&assigned_listen_port);
+
     if !args.no_auto_bootstrap {
         // 1. Conecta aos nós globais da rede IPFS DHT
         for bootstrap_addr in get_ipfs_bootstrap_multiaddrs() {
@@ -121,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             // Aguarda a porta real atribuída pelo OS (caso args.port == 0)
             let actual_port = rx_assigned_port.recv().await.unwrap_or(args.port);
+            assigned_port_clone.store(actual_port, Ordering::SeqCst);
             let info_hash = make_info_hash("global-discord-discovery");
             for tracker in OPENTRACKER_SERVERS {
                 match TorrentTrackerClient::discover_peers(tracker, &info_hash, &bt_peer_id, actual_port) {
@@ -225,6 +230,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+            }
+
+            // Captura de encerramento via CTRL+C (Graceful Shutdown)
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n🛑 Interrupção detectada (CTRL+C). Notificando saída aos Trackers...");
+                break;
             }
 
             // Entrada do teclado
@@ -431,5 +442,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Graceful Shutdown: Desanuncia o par do BitTorrent Tracker com event = stopped
+    let port = assigned_listen_port.load(Ordering::SeqCst);
+    if !args.no_auto_bootstrap && port > 0 {
+        println!("📡 Removendo nó da lista de pares dos Open Trackers (event = stopped)...");
+        let p2p_id_bytes = node.peer_id.to_bytes();
+        let mut bt_peer_id = [0u8; 20];
+        let copy_len = p2p_id_bytes.len().min(20);
+        bt_peer_id[0..copy_len].copy_from_slice(&p2p_id_bytes[0..copy_len]);
+        let info_hash = make_info_hash("global-discord-discovery");
+
+        for tracker in OPENTRACKER_SERVERS {
+            let _ = TorrentTrackerClient::announce_stopped(tracker, &info_hash, &bt_peer_id, port);
+        }
+    }
+
+    println!("👋 Anarchord encerrado com sucesso.");
     Ok(())
 }
