@@ -5,6 +5,9 @@ use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use p2p_core::{
     api::ChatMessage,
     bootstrap::{get_ipfs_bootstrap_multiaddrs, OPENTRACKER_SERVERS},
+    file_transfer::{
+        calculate_file_hash, chunk_file, FileDecision, FileOffer, FileReceiver, FileTransferMessage,
+    },
     identity::UserIdentity,
     node::P2PNode,
     protocol::AppBehaviourEvent,
@@ -70,6 +73,9 @@ pub enum ChatAction {
     JoinVoice(String),
     LeaveVoice,
     JoinTextChannel(String),
+    SendFile { recipient_query: String, file_path: String },
+    AcceptFile(String),
+    RejectFile(String),
     SendTextMessage(String),
     Empty,
 }
@@ -105,6 +111,27 @@ pub fn parse_user_input(input: &str) -> ChatAction {
         let new_channel = trimmed.trim_start_matches("/join ").trim();
         if !new_channel.is_empty() {
             return ChatAction::JoinTextChannel(new_channel.to_string());
+        }
+    }
+    if trimmed.starts_with("/send ") {
+        let parts: Vec<&str> = trimmed.trim_start_matches("/send ").split_whitespace().collect();
+        if parts.len() >= 2 {
+            return ChatAction::SendFile {
+                recipient_query: parts[0].to_string(),
+                file_path: parts[1..].join(" "),
+            };
+        }
+    }
+    if trimmed.starts_with("/accept ") {
+        let hash = trimmed.trim_start_matches("/accept ").trim();
+        if !hash.is_empty() {
+            return ChatAction::AcceptFile(hash.to_string());
+        }
+    }
+    if trimmed.starts_with("/reject ") {
+        let hash = trimmed.trim_start_matches("/reject ").trim();
+        if !hash.is_empty() {
+            return ChatAction::RejectFile(hash.to_string());
         }
     }
     ChatAction::SendTextMessage(trimmed.to_string())
@@ -436,6 +463,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut peer_metadata: HashMap<libp2p::PeerId, (String, String)> = HashMap::new(); // PeerId -> (Nick, PubKey)
     let mut port_reported = false;
 
+    // Gerenciamento de Transferência Direta de Arquivos P2P
+    // Tópico global do Gossipsub para ofertas e sinalização direta
+    let files_topic = IdentTopic::new("p2p-discord/direct-files");
+    let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&files_topic);
+
+    // Ofertas recebidas pendentes de aprovação pelo usuário: file_hash -> FileOffer
+    let mut pending_incoming_offers: HashMap<String, FileOffer> = HashMap::new();
+    // Receptores de arquivos em andamento (após aceitação): file_hash -> FileReceiver
+    let mut active_file_receivers: HashMap<String, FileReceiver> = HashMap::new();
+    // Arquivos locais que este nó ofereceu e estão aguardando o destinatário aceitar: file_hash -> (caminho, bytes)
+    let mut pending_outgoing_files: HashMap<String, (String, Vec<u8>)> = HashMap::new();
+
     // Rastreamento de pares ativos falando/transmitindo áudio (pubkey -> (nome, Instant da última recepção))
     let mut active_speakers: HashMap<String, (String, std::time::Instant)> = HashMap::new();
     let mut speaker_check_interval = tokio::time::interval(std::time::Duration::from_millis(200));
@@ -576,6 +615,116 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 continue;
                             }
+                            ChatAction::SendFile { recipient_query, file_path } => {
+                                // 1. Tenta encontrar a chave pública do destinatário buscando por Nickname ou PubKey
+                                let target_pubkey = peer_metadata.values().find_map(|(nick, pubkey)| {
+                                    if nick.eq_ignore_ascii_case(&recipient_query) || pubkey.starts_with(&recipient_query) {
+                                        Some(pubkey.clone())
+                                    } else {
+                                        None
+                                    }
+                                });
+
+                                let recipient_pubkey = match target_pubkey {
+                                    Some(pk) => pk,
+                                    None => {
+                                        println!("❌ Destinatário '{}' não encontrado entre os pares conectados.", recipient_query);
+                                        println!("💡 Dica: Use /peers para ver apelidos e IDs dos pares.");
+                                        continue;
+                                    }
+                                };
+
+                                // 2. Lê o arquivo local em bytes
+                                let p = std::path::Path::new(&file_path);
+                                match std::fs::read(p) {
+                                    Ok(data) => {
+                                        let file_size = data.len() as u64;
+                                        let file_hash = calculate_file_hash(&data);
+                                        let file_name = p.file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("arquivo.bin")
+                                            .to_string();
+
+                                        let chunks = chunk_file(&file_hash, &data);
+                                        let total_chunks = chunks.len() as u32;
+
+                                        let offer = FileOffer {
+                                            file_hash: file_hash.clone(),
+                                            file_name: file_name.clone(),
+                                            file_size,
+                                            total_chunks,
+                                            sender_pubkey: identity.public_key_hex(),
+                                            sender_name: args.nick.clone(),
+                                            recipient_pubkey: recipient_pubkey.clone(),
+                                        };
+
+                                        // Salva localmente em pendentes aguardando confirmação do par
+                                        pending_outgoing_files.insert(file_hash.clone(), (file_name.clone(), data));
+
+                                        let msg = FileTransferMessage::Offer(offer);
+                                        if let Ok(bytes) = msg.to_bytes() {
+                                            let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
+                                            println!("📦 Proposta de envio enviada para o par [{}]:", recipient_query);
+                                            println!("   📄 Arquivo : {}", file_name);
+                                            println!("   📏 Tamanho : {:.2} MB ({} bytes)", file_size as f64 / (1024.0 * 1024.0), file_size);
+                                            println!("   🔑 Hash    : {}", file_hash);
+                                            println!("   ⏳ Aguardando o destinatário aceitar a transferência...");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("❌ Erro ao ler arquivo '{}': {:?}", file_path, e);
+                                    }
+                                }
+                                continue;
+                            }
+                            ChatAction::AcceptFile(hash_query) => {
+                                // Encontra oferta pelo hash completo ou prefixo
+                                let target_key = pending_incoming_offers.keys().find(|k| k.starts_with(&hash_query)).cloned();
+                                if let Some(hash) = target_key {
+                                    if let Some(offer) = pending_incoming_offers.remove(&hash) {
+                                        // Cria o receptor de chunks ativo
+                                        active_file_receivers.insert(
+                                            hash.clone(),
+                                            FileReceiver::new(offer.file_name.clone(), offer.file_size, offer.total_chunks),
+                                        );
+
+                                        // Envia sinal de decisão positiva
+                                        let decision = FileDecision {
+                                            file_hash: hash.clone(),
+                                            accepted: true,
+                                            responder_pubkey: identity.public_key_hex(),
+                                        };
+                                        let msg = FileTransferMessage::Decision(decision);
+                                        if let Ok(bytes) = msg.to_bytes() {
+                                            let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
+                                            println!("✅ Você ACEITOU o arquivo '{}' de {}. Aguardando blocos P2P...", offer.file_name, offer.sender_name);
+                                        }
+                                    }
+                                } else {
+                                    println!("⚠️ Nenhuma oferta de arquivo pendente com hash correspondente a '{}'.", hash_query);
+                                }
+                                continue;
+                            }
+                            ChatAction::RejectFile(hash_query) => {
+                                let target_key = pending_incoming_offers.keys().find(|k| k.starts_with(&hash_query)).cloned();
+                                if let Some(hash) = target_key {
+                                    if let Some(offer) = pending_incoming_offers.remove(&hash) {
+                                        let decision = FileDecision {
+                                            file_hash: hash.clone(),
+                                            accepted: false,
+                                            responder_pubkey: identity.public_key_hex(),
+                                        };
+                                        let msg = FileTransferMessage::Decision(decision);
+                                        if let Ok(bytes) = msg.to_bytes() {
+                                            let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
+                                            println!("❌ Você REJEITOU o arquivo '{}' de {}.", offer.file_name, offer.sender_name);
+                                        }
+                                    }
+                                } else {
+                                    println!("⚠️ Nenhuma oferta de arquivo pendente com hash correspondente a '{}'.", hash_query);
+                                }
+                                continue;
+                            }
                             ChatAction::SendTextMessage(trimmed) => {
                                 // Cria mensagem assinada
                                 let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -705,6 +854,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
+                        // 3. Tenta decodificar como mensagem de transferência direta de arquivo P2P
+                        else if let Ok(file_msg) = FileTransferMessage::from_bytes(&message.data) {
+                            match file_msg {
+                                FileTransferMessage::Offer(offer) => {
+                                    // Verifica se o arquivo é direcionado a nós
+                                    if offer.recipient_pubkey == identity.public_key_hex() {
+                                        println!("\n📥 [TRANSFERÊNCIA DE ARQUIVO] Recebida proposta de '{}':", offer.sender_name);
+                                        println!("   📄 Arquivo : {}", offer.file_name);
+                                        println!("   📏 Tamanho : {:.2} MB ({} bytes em {} blocos de 64KB)", offer.file_size as f64 / (1024.0 * 1024.0), offer.file_size, offer.total_chunks);
+                                        println!("   🔑 Hash    : {}", offer.file_hash);
+                                        println!("   💡 Para aceitar: /accept {}", &offer.file_hash[..8]);
+                                        println!("   💡 Para rejeitar: /reject {}\n", &offer.file_hash[..8]);
+                                        pending_incoming_offers.insert(offer.file_hash.clone(), offer);
+                                    }
+                                }
+                                FileTransferMessage::Decision(decision) => {
+                                    if let Some((file_name, data)) = pending_outgoing_files.get(&decision.file_hash) {
+                                        if decision.accepted {
+                                            println!("\n🎉 O destinatário ACEITOU a transferência de '{}'! Transmitindo blocos P2P...", file_name);
+                                            let chunks = chunk_file(&decision.file_hash, data);
+                                            let total = chunks.len();
+                                            for (idx, chunk) in chunks.into_iter().enumerate() {
+                                                let msg = FileTransferMessage::Chunk(chunk);
+                                                if let Ok(bytes) = msg.to_bytes() {
+                                                    let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
+                                                }
+                                                if (idx + 1) % 10 == 0 || (idx + 1) == total {
+                                                    let pct = ((idx + 1) as f32 / total as f32) * 100.0;
+                                                    println!("   📤 Enviado: {:.1}% ({}/{} blocos)", pct, idx + 1, total);
+                                                }
+                                            }
+                                            println!("✅ Arquivo '{}' enviado com sucesso!\n", file_name);
+                                            pending_outgoing_files.remove(&decision.file_hash);
+                                        } else {
+                                            println!("\n❌ O destinatário REJEITOU a transferência de '{}'.", file_name);
+                                            pending_outgoing_files.remove(&decision.file_hash);
+                                        }
+                                    }
+                                }
+                                FileTransferMessage::Chunk(chunk) => {
+                                    if let Some(receiver) = active_file_receivers.get_mut(&chunk.file_hash) {
+                                        let file_hash_clone = chunk.file_hash.clone();
+                                        let pct = receiver.add_chunk(chunk.chunk_index, chunk.data);
+                                        if (chunk.chunk_index + 1) % 10 == 0 || receiver.is_complete() {
+                                            println!("   📥 Baixando '{}': {:.1}%", receiver.file_name, pct);
+                                        }
+
+                                        if receiver.is_complete() {
+                                            let file_name = receiver.file_name.clone();
+                                            match receiver.assemble_and_verify(&file_hash_clone) {
+                                                Ok(completed_bytes) => {
+                                                    // Salva na pasta downloads local
+                                                    let download_dir = std::path::Path::new("downloads");
+                                                    let _ = std::fs::create_dir_all(download_dir);
+                                                    let save_path = download_dir.join(&file_name);
+                                                    if let Ok(_) = std::fs::write(&save_path, &completed_bytes) {
+                                                        println!("\n💾 [ARQUIVO CONCLUÍDO] '{}' salvo com sucesso em: {:?}", file_name, save_path);
+                                                        println!("   🔒 Integridade SHA-256 verificada com sucesso!\n");
+                                                    } else {
+                                                        println!("❌ Erro ao salvar arquivo em {:?}", save_path);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    println!("❌ Falha na verificação de integridade do arquivo: {}", e);
+                                                }
+                                            }
+                                            active_file_receivers.remove(&file_hash_clone);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -745,6 +966,32 @@ mod tests {
         assert_eq!(parse_user_input("/devices"), ChatAction::ListDevices);
         assert_eq!(parse_user_input("/mute"), ChatAction::ToggleMute);
         assert_eq!(parse_user_input("/voice leave"), ChatAction::LeaveVoice);
+    }
+
+    #[test]
+    fn test_parse_user_input_file_commands() {
+        assert_eq!(
+            parse_user_input("/send Alice foto.png"),
+            ChatAction::SendFile {
+                recipient_query: "Alice".to_string(),
+                file_path: "foto.png".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_user_input("/send Bob C:\\fotos\\ferias 2026.png"),
+            ChatAction::SendFile {
+                recipient_query: "Bob".to_string(),
+                file_path: "C:\\fotos\\ferias 2026.png".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_user_input("/accept 8f4a123b"),
+            ChatAction::AcceptFile("8f4a123b".to_string())
+        );
+        assert_eq!(
+            parse_user_input("/reject 8f4a123b"),
+            ChatAction::RejectFile("8f4a123b".to_string())
+        );
     }
 
     #[test]
