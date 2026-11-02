@@ -64,6 +64,10 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub synth_audio: bool,
 
+    /// Transmitir vídeo sintético/fake em loop na malha P2P (útil para bots/servidores de teste de tela)
+    #[arg(long, default_value_t = false)]
+    pub synth_video: bool,
+
     /// Desativar descoberta automática via IPFS Amino DHT e Open Trackers BitTorrent
     #[arg(long, default_value_t = false)]
     pub no_auto_bootstrap: bool,
@@ -579,6 +583,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let screen_viewer_active = Arc::new(AtomicBool::new(false));
     let mut current_watching_stream: Option<String> = None;
     let mut active_screen_streams: HashMap<String, (String, String, u32, u32, std::time::Instant)> = HashMap::new(); // stream_id -> (nick, pubkey, w, h, last_seen)
+
+    // Se o argumento --synth-video foi informado (útil para bots como Oracle-Bot), inicia transmissão automática
+    if args.synth_video {
+        let stream_id = format!("screen:{}", &identity.public_key_hex()[..8]);
+        let tx_frame = tx_screen_out.clone();
+        screen_capture_engine.start_synthetic_video_stream(
+            stream_id.clone(),
+            identity.public_key_hex(),
+            args.nick.clone(),
+            15, // 15 FPS
+            65, // JPEG quality
+            move |pkt| {
+                let _ = tx_frame.send(pkt);
+            },
+        );
+        if args.daemon {
+            println!("📺 [VÍDEO SINTÉTICO] Transmissão animada P2P iniciada automaticamente (Stream ID: {})", stream_id);
+        }
+    }
 
     // Loop de eventos da malha P2P + Teclado + Auto-Discovery
     loop {
