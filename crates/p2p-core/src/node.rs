@@ -59,11 +59,14 @@ impl P2PNode {
                 )
                 .expect("GossipSub behaviour válido");
 
-                // 3. Identify
-                let identify = identify::Behaviour::new(identify::Config::new(
+                // 3. Identify com User Agent contendo o Nickname e PubKey
+                let user_agent = format!("anarchord:{}:{}", identity.profile.display_name, identity.public_key_hex());
+                let identify_config = identify::Config::new(
                     "/p2p-discord/1.0.0".to_string(),
                     key.public(),
-                ));
+                )
+                .with_agent_version(user_agent);
+                let identify = identify::Behaviour::new(identify_config);
 
                 // 4. Ping
                 let ping = ping::Behaviour::new(ping::Config::default());

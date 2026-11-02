@@ -226,8 +226,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Leitura interativa do teclado (stdin)
     let mut stdin_lines = BufReader::new(tokio::io::stdin()).lines();
 
-    // Rastreamento de nós conectados para desduplicação
+    // Rastreamento de nós conectados para desduplicação e metadados de identificação
     let mut connected_peers: HashSet<libp2p::PeerId> = HashSet::new();
+    let mut peer_metadata: HashMap<libp2p::PeerId, (String, String)> = HashMap::new(); // PeerId -> (Nick, PubKey)
     let mut port_reported = false;
 
     // Loop de eventos da malha P2P + Teclado + Auto-Discovery
@@ -246,7 +247,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(ch) = &current_voice_channel {
                         voice_pkt.channel_id = ch.clone();
                         if let Ok(pkt_bytes) = voice_pkt.to_bytes() {
-                            let _ = node.swarm.behaviour_mut().gossipsub.publish(v_topic.clone(), pkt_bytes);
+                            if let Err(e) = node.swarm.behaviour_mut().gossipsub.publish(v_topic.clone(), pkt_bytes) {
+                                // Exibe apenas em caso de erro incomum
+                                tracing::debug!("Erro ao publicar pacote de voz: {:?}", e);
+                            }
                         }
                     }
                 }
@@ -277,7 +281,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("  (Nenhum par direto no momento. Aguardando descoberta...)");
                             } else {
                                 for peer in &connected_peers {
-                                    println!("  🟢 Par: {}", peer);
+                                    if let Some((nick, pubkey)) = peer_metadata.get(peer) {
+                                        println!("  🟢 Par: {} | Apelido: {} | User ID: {}", peer, nick, pubkey);
+                                    } else {
+                                        println!("  🟢 Par: {} (Identificando...)", peer);
+                                    }
                                 }
                             }
                             println!("--------------------------------\n");
@@ -427,6 +435,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("👋 Conexão fechada com: {} (Motivo: {:?})", peer_id, cause);
                         }
                     }
+                    libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Identify(
+                        libp2p::identify::Event::Received { peer_id, info, .. }
+                    )) => {
+                        // Extrai Nickname e PubKey do agent_version ("anarchord:nick:pubkey")
+                        if info.agent_version.starts_with("anarchord:") {
+                            let parts: Vec<&str> = info.agent_version.split(':').collect();
+                            if parts.len() >= 3 {
+                                let nick = parts[1].to_string();
+                                let pubkey = parts[2].to_string();
+                                peer_metadata.insert(peer_id, (nick.clone(), pubkey.clone()));
+                                println!("✨ Identidade confirmada: {} é '{}' (User ID: {})", peer_id, nick, pubkey);
+                            }
+                        }
+                    }
                     libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(
                         libp2p::gossipsub::Event::Message { message, .. }
                     )) => {
@@ -439,6 +461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // 2. Tenta decodificar como pacote de voz P2P
                         else if let Ok(voice_pkt) = VoicePacket::from_bytes(&message.data) {
                             if voice_pkt.sender_pubkey != identity.public_key_hex() {
+                                println!("🔊 [ÁUDIO RECEBIDO] de {} ({} bytes, energia: {})", voice_pkt.sender_name, voice_pkt.audio_data.len(), voice_pkt.energy_level);
                                 // Insere no JitterBuffer do remetente
                                 let jb = remote_jitter_buffers
                                     .entry(voice_pkt.sender_pubkey.clone())
