@@ -1,6 +1,7 @@
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::gossipsub::IdentTopic;
+use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use p2p_core::{
     api::ChatMessage,
     bootstrap::{get_ipfs_bootstrap_multiaddrs, OPENTRACKER_SERVERS},
@@ -8,7 +9,7 @@ use p2p_core::{
     node::P2PNode,
     protocol::AppBehaviourEvent,
     tracker::{make_info_hash, TorrentTrackerClient},
-    voice::{AudioDeviceManager, JitterBuffer, VoiceEngine, VoicePacket},
+    voice::{AudioCodec, AudioDeviceManager, JitterBuffer, VoiceEngine, VoicePacket},
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -187,18 +188,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let voice_seq = Arc::new(AtomicU64::new(1));
     let (tx_voice_to_broadcast, mut rx_voice_to_broadcast) = tokio::sync::mpsc::unbounded_channel::<VoicePacket>();
 
-    // Jitter Buffers para pares remotos (um por PeerId/chave pública)
+    // Jitter Buffers e Decoders Opus para pares remotos (um por PeerId/chave pública)
     let mut remote_jitter_buffers: HashMap<String, JitterBuffer> = HashMap::new();
+    let mut remote_opus_decoders: HashMap<String, OpusDecoder> = HashMap::new();
 
-    // Se a flag --synth-audio estiver ativada, transmite melodia chiptune retrô de 8-bits
+    // Se a flag --synth-audio estiver ativada, transmite melodia chiptune retrô de 8-bits comprimida em Opus
     if args.synth_audio {
         let voice_seq_synth = Arc::clone(&voice_seq);
         let my_pubkey_synth = identity.public_key_hex();
         let my_nick_synth = identity.profile.display_name.clone();
         let tx_synth = tx_voice_to_broadcast.clone();
 
-        println!("📻 Modo Sintetizador 8-Bits ativado: tocando melodia chiptune retrô contínua...");
+        println!("📻 Modo Sintetizador 8-Bits ativado: tocando melodia chiptune comprimida em Opus...");
         std::thread::spawn(move || {
+            let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)
+                .expect("Falha ao inicializar encoder Opus");
             let sample_rate = p2p_core::SAMPLE_RATE as f32; // 48000 Hz
             let frame_size = p2p_core::FRAME_SIZE; // 960 amostras (20ms)
 
@@ -291,14 +295,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_default()
                     .as_millis() as u64;
 
-                let packet = VoicePacket::from_pcm_samples(
+                let packet = VoicePacket::from_pcm_samples_opus(
                     "active_voice".to_string(),
                     my_pubkey_synth.clone(),
                     my_nick_synth.clone(),
                     seq,
                     now_ms,
                     &samples,
-                );
+                    &mut encoder,
+                ).unwrap_or_else(|_| VoicePacket::from_pcm_samples(
+                    "active_voice".to_string(),
+                    my_pubkey_synth.clone(),
+                    my_nick_synth.clone(),
+                    seq,
+                    now_ms,
+                    &samples,
+                ));
 
                 let _ = tx_synth.send(packet);
 
@@ -317,6 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let my_nick = identity.profile.display_name.clone();
 
         std::thread::spawn(move || {
+            let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).ok();
             while let Ok(frame_samples) = mic_rx.recv() {
                 if is_muted_flag.load(Ordering::Relaxed) {
                     continue;
@@ -331,14 +344,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_default()
                         .as_millis() as u64;
 
-                    let packet = VoicePacket::from_pcm_samples(
-                        "active_voice".to_string(),
-                        my_pubkey.clone(),
-                        my_nick.clone(),
-                        seq,
-                        now_ms,
-                        &frame_samples,
-                    );
+                    let packet = if let Some(enc) = encoder.as_mut() {
+                        VoicePacket::from_pcm_samples_opus(
+                            "active_voice".to_string(),
+                            my_pubkey.clone(),
+                            my_nick.clone(),
+                            seq,
+                            now_ms,
+                            &frame_samples,
+                            enc,
+                        ).unwrap_or_else(|_| VoicePacket::from_pcm_samples(
+                            "active_voice".to_string(),
+                            my_pubkey.clone(),
+                            my_nick.clone(),
+                            seq,
+                            now_ms,
+                            &frame_samples,
+                        ))
+                    } else {
+                        VoicePacket::from_pcm_samples(
+                            "active_voice".to_string(),
+                            my_pubkey.clone(),
+                            my_nick.clone(),
+                            seq,
+                            now_ms,
+                            &frame_samples,
+                        )
+                    };
 
                     let _ = tx_voice_to_broadcast.send(packet);
                 }
@@ -618,7 +650,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Se tiver pacote ordenado pronto para reprodução, envia ao alto-falante
                                 if let Some(ready_pkt) = jb.pop_next() {
                                     if let Some(engine) = &voice_engine {
-                                        let samples = ready_pkt.to_pcm_samples();
+                                        let samples = match ready_pkt.codec {
+                                            AudioCodec::Opus => {
+                                                let dec = remote_opus_decoders
+                                                    .entry(ready_pkt.sender_pubkey.clone())
+                                                    .or_insert_with(|| {
+                                                        OpusDecoder::new(SampleRate::Hz48000, Channels::Mono)
+                                                            .expect("Falha ao criar OpusDecoder")
+                                                    });
+                                                ready_pkt.to_pcm_samples_opus(dec).unwrap_or_else(|_| ready_pkt.to_pcm_samples())
+                                            }
+                                            AudioCodec::Pcm16 => ready_pkt.to_pcm_samples(),
+                                        };
                                         engine.play_remote_samples(samples);
                                     }
                                 }

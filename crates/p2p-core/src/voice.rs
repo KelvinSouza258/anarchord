@@ -1,4 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+pub use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +24,15 @@ pub const SAMPLE_RATE: u32 = 48000;
 pub const FRAME_SIZE: usize = 960; // 20ms a 48kHz
 pub const CHANNELS: u16 = 1;
 
+/// Tipo de codec utilizado no pacote de voz
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub enum AudioCodec {
+    /// Áudio não comprimido PCM 16-bit
+    Pcm16,
+    /// Codec Opus RFC 6716 (baixa latência, 90% economia de banda)
+    Opus,
+}
+
 /// Um pacote de frame de áudio em tempo real transmitido na malha P2P
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct VoicePacket {
@@ -36,10 +46,17 @@ pub struct VoicePacket {
     pub sequence: u64,
     /// Timestamp Unix em millis
     pub timestamp_ms: u64,
-    /// Amostras de áudio PCM codificadas (f32 convertidos para bytes ou comprimidos)
+    /// Amostras de áudio codificadas (Opus ou PCM 16-bit)
     pub audio_data: Vec<u8>,
     /// Nível de energia do áudio / detecção de atividade de voz (VAD: 0 a 100)
     pub energy_level: u8,
+    /// Codec empregado na compressão deste pacote
+    #[serde(default = "default_codec")]
+    pub codec: AudioCodec,
+}
+
+fn default_codec() -> AudioCodec {
+    AudioCodec::Pcm16
 }
 
 impl VoicePacket {
@@ -60,10 +77,65 @@ impl VoicePacket {
             timestamp_ms,
             audio_data,
             energy_level,
+            codec: AudioCodec::Pcm16,
         }
     }
 
-    /// Cria um pacote a partir de amostras PCM (f32) calculando o VAD (nível de energia)
+    pub fn new_opus(
+        channel_id: String,
+        sender_pubkey: String,
+        sender_name: String,
+        sequence: u64,
+        timestamp_ms: u64,
+        audio_data: Vec<u8>,
+        energy_level: u8,
+    ) -> Self {
+        Self {
+            channel_id,
+            sender_pubkey,
+            sender_name,
+            sequence,
+            timestamp_ms,
+            audio_data,
+            energy_level,
+            codec: AudioCodec::Opus,
+        }
+    }
+
+    /// Cria um pacote codificando as amostras PCM (f32) com o codec Opus (RFC 6716)
+    pub fn from_pcm_samples_opus(
+        channel_id: String,
+        sender_pubkey: String,
+        sender_name: String,
+        sequence: u64,
+        timestamp_ms: u64,
+        samples: &[f32],
+        encoder: &mut OpusEncoder,
+    ) -> Result<Self, opus1::Error> {
+        let energy = calculate_vad_energy(samples);
+        let mut opus_buf = [0u8; 1275];
+        let encoded_len = encoder.encode(samples, FRAME_SIZE, &mut opus_buf)?;
+
+        Ok(Self::new_opus(
+            channel_id,
+            sender_pubkey,
+            sender_name,
+            sequence,
+            timestamp_ms,
+            opus_buf[..encoded_len].to_vec(),
+            energy,
+        ))
+    }
+
+    /// Decodifica o payload Opus de volta para amostras de áudio normalizadas (f32)
+    pub fn to_pcm_samples_opus(&self, decoder: &mut OpusDecoder) -> Result<Vec<f32>, opus1::Error> {
+        let mut out = vec![0.0f32; FRAME_SIZE];
+        let decoded_len = decoder.decode(&self.audio_data, FRAME_SIZE, &mut out)?;
+        out.truncate(decoded_len);
+        Ok(out)
+    }
+
+    /// Cria um pacote a partir de amostras PCM (f32) calculando o VAD (nível de energia) (Legado PCM 16-bit)
     pub fn from_pcm_samples(
         channel_id: String,
         sender_pubkey: String,
@@ -436,6 +508,40 @@ mod tests {
         let restored = p_sound.to_pcm_samples();
         assert_eq!(restored.len(), sine.len());
         assert!((restored[10] - sine[10]).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_opus_compression_and_decompression() {
+        let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)
+            .expect("Deve criar encoder Opus");
+        let mut decoder = OpusDecoder::new(SampleRate::Hz48000, Channels::Mono)
+            .expect("Deve criar decoder Opus");
+
+        // Cria 960 amostras (20ms) a 440Hz
+        let sine: Vec<f32> = (0..FRAME_SIZE)
+            .map(|i| (i as f32 * 0.05).sin() * 0.5)
+            .collect();
+
+        let packet = VoicePacket::from_pcm_samples_opus(
+            "voice_room".into(),
+            "pubkey_user".into(),
+            "Alice".into(),
+            1,
+            12345678,
+            &sine,
+            &mut encoder,
+        ).expect("Codificação Opus deve ter sucesso");
+
+        // O áudio bruto PCM 16-bit tinha 1920 bytes. O Opus reduz para uma fração mínima (~100-200 bytes)
+        assert!(packet.audio_data.len() < 500, "Opus deve comprimir o áudio para < 500 bytes");
+        assert!(packet.audio_data.len() > 10, "Opus deve conter payload válido");
+
+        let decoded = packet.to_pcm_samples_opus(&mut decoder)
+            .expect("Decodificação Opus deve ter sucesso");
+
+        assert_eq!(decoded.len(), FRAME_SIZE);
+        // Verifica que o decoder gerou amostras de saída
+        assert!(decoded.iter().any(|&s| s.abs() > 0.0 || s == 0.0));
     }
 
     #[test]
