@@ -145,16 +145,26 @@ pub fn parse_user_input(input: &str) -> ChatAction {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::WARN) // Logs limpos para chat no terminal
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
-
     let args = Args::parse();
 
-    println!("============================================================");
-    println!(" 🚀 P2P Discord Daemon / CLI (100% Descentralizado)");
-    println!("============================================================");
+    if args.daemon {
+        let subscriber = FmtSubscriber::builder()
+            .with_max_level(Level::WARN)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    } else {
+        // No modo TUI do Ratatui, desativa logs para stdout para não distorcer a tela
+        let subscriber = FmtSubscriber::builder()
+            .with_writer(|| std::io::sink())
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
+
+    if args.daemon {
+        println!("============================================================");
+        println!(" 🚀 P2P Discord Daemon / CLI (100% Descentralizado)");
+        println!("============================================================");
+    }
 
     // 1. Carrega ou gera a identidade permanente do usuário (JSON/PEM com perfil)
     let mut identity = UserIdentity::load_or_create(&args.identity_file)?;
@@ -162,28 +172,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         identity.set_nick(&args.nick);
         let _ = identity.save_to(&args.identity_file);
     }
-    println!("👤 Apelido     : {}", identity.profile.display_name);
-    println!("🔑 User ID     : {}", identity.public_key_hex());
+    if args.daemon {
+        println!("👤 Apelido     : {}", identity.profile.display_name);
+        println!("🔑 User ID     : {}", identity.public_key_hex());
+    }
 
     // 2. Inicializa o Nó P2P (Swarm com Kademlia, QUIC, GossipSub, DCUtR)
     let mut node = P2PNode::new(identity.clone(), args.port)?;
-    println!("🌐 Peer ID P2P : {}", node.peer_id);
-    if args.port > 0 {
-        println!("🚪 Porta Local : {}", args.port);
-    } else {
-        println!("🚪 Porta Local : Automática (Dinâmica)");
+    if args.daemon {
+        println!("🌐 Peer ID P2P : {}", node.peer_id);
+        if args.port > 0 {
+            println!("🚪 Porta Local : {}", args.port);
+        } else {
+            println!("🚪 Porta Local : Automática (Dinâmica)");
+        }
+        println!("💬 Sala Ativa  : #{}", args.channel);
+        println!("============================================================");
+        println!("💡 Dica: Digite sua mensagem e pressione ENTER para enviar!");
+        println!("         /peers           -> Lista os pares P2P conectados");
+        println!("         /join <sala>     -> Troca de canal de texto");
+        println!("         /voice join <id> -> Conecta na sala de voz P2P em tempo real");
+        println!("         /voice leave     -> Sai da sala de voz P2P");
+        println!("         /mute            -> Alterna mutar/desmutar seu microfone");
+        println!("         /devices         -> Lista microfones e alto-falantes detectados");
+        println!("         /quit            -> Encerra o nó");
+        println!("============================================================\n");
     }
-    println!("💬 Sala Ativa  : #{}", args.channel);
-    println!("============================================================");
-    println!("💡 Dica: Digite sua mensagem e pressione ENTER para enviar!");
-    println!("         /peers           -> Lista os pares P2P conectados");
-    println!("         /join <sala>     -> Troca de canal de texto");
-    println!("         /voice join <id> -> Conecta na sala de voz P2P em tempo real");
-    println!("         /voice leave     -> Sai da sala de voz P2P");
-    println!("         /mute            -> Alterna mutar/desmutar seu microfone");
-    println!("         /devices         -> Lista microfones e alto-falantes detectados");
-    println!("         /quit            -> Encerra o nó");
-    println!("============================================================\n");
 
     // Canal ativo inicial
     let mut current_channel = args.channel.clone();
@@ -194,7 +208,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Conexão direta explícita se fornecida
     if let Some(remote_addr) = args.connect {
         let multiaddr: libp2p::Multiaddr = remote_addr.parse()?;
-        println!("⏳ Conectando ao par remoto: {}", multiaddr);
+        if args.daemon {
+            println!("⏳ Conectando ao par remoto: {}", multiaddr);
+        }
         node.swarm.dial(multiaddr)?;
     }
 
@@ -205,6 +221,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rastreamento da porta real para cleanup ao sair (Ctrl+C ou /quit)
     let assigned_listen_port = Arc::new(std::sync::atomic::AtomicU16::new(args.port));
     let assigned_port_clone = Arc::clone(&assigned_listen_port);
+
+    let is_daemon = args.daemon;
 
     if !args.no_auto_bootstrap {
         // 1. Conecta aos nós globais da rede IPFS DHT
@@ -227,7 +245,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match TorrentTrackerClient::discover_peers(tracker, &info_hash, &bt_peer_id, actual_port) {
                     Ok(peers) => {
                         for peer in peers {
-                            println!("📡 Par descoberto via BitTorrent Tracker: {}", peer);
+                            if is_daemon {
+                                println!("📡 Par descoberto via BitTorrent Tracker: {}", peer);
+                            }
                             let tcp_addr = format!("/ip4/{}/tcp/{}", peer.ip(), peer.port());
                             let quic_addr = format!("/ip4/{}/udp/{}/quic-v1", peer.ip(), peer.port());
                             let _ = tx_peer_discovery.send(tcp_addr);
@@ -245,11 +265,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let voice_engine_res = VoiceEngine::start();
     let (voice_engine, mut voice_mic_rx) = match voice_engine_res {
         Ok((engine, rx)) => {
-            println!("🎤 Subsistema de Áudio ativado com sucesso.");
+            if args.daemon {
+                println!("🎤 Subsistema de Áudio ativado com sucesso.");
+            }
             (Some(engine), Some(rx))
         }
         Err(e) => {
-            println!("⚠️ Áudio nativo indisponível neste terminal: {}", e);
+            if args.daemon {
+                println!("⚠️ Áudio nativo indisponível neste terminal: {}", e);
+            }
             (None, None)
         }
     };
@@ -261,11 +285,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let v_topic_name = format!("p2p-discord/voice/{}", v_chan);
         let v_topic = IdentTopic::new(v_topic_name);
         if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&v_topic) {
-            println!("❌ Falha ao entrar no canal de voz automático: {:?}", e);
+            if args.daemon {
+                println!("❌ Falha ao entrar no canal de voz automático: {:?}", e);
+            }
         } else {
             current_voice_channel = Some(v_chan.clone());
             current_voice_topic = Some(v_topic);
-            println!("🔊 Conectado automaticamente à sala de voz [🔊 {}]!", v_chan);
+            if args.daemon {
+                println!("🔊 Conectado automaticamente à sala de voz [🔊 {}]!", v_chan);
+            }
         }
     }
     let voice_seq = Arc::new(AtomicU64::new(1));
@@ -514,7 +542,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 active_speakers.retain(|_pubkey, (name, last_seen)| {
                     if now.duration_since(*last_seen).as_millis() > 600 {
                         let _ = tx_ui_event.send(UiEvent::VoiceActivity { nick: name.clone(), speaking: false });
-                        println!("🔇 [VOZ] {} parou de falar.", name);
+                        if args.daemon {
+                            println!("🔇 [VOZ] {} parou de falar.", name);
+                        }
                         false
                     } else {
                         true
@@ -996,7 +1026,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     nick: nick.clone(),
                                     pubkey: pubkey.clone(),
                                 });
-                                println!("✨ Identidade confirmada: {} é '{}' (User ID: {})", peer_id, nick, pubkey);
+                                if args.daemon {
+                                    println!("✨ Identidade confirmada: {} é '{}' (User ID: {})", peer_id, nick, pubkey);
+                                }
                             }
                         }
                     }
@@ -1011,7 +1043,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     author: chat_msg.author_name.clone(),
                                     text: chat_msg.text.clone(),
                                 });
-                                println!("\n📩 [#{}] {}: {}", chat_msg.channel_id, chat_msg.author_name, chat_msg.text);
+                                if args.daemon {
+                                    println!("\n📩 [#{}] {}: {}", chat_msg.channel_id, chat_msg.author_name, chat_msg.text);
+                                }
                             }
                         }
                         // 2. Tenta decodificar como pacote de voz P2P
@@ -1023,7 +1057,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         nick: voice_pkt.sender_name.clone(),
                                         speaking: true,
                                     });
-                                    println!("🔊 [VOZ] {} começou a falar...", voice_pkt.sender_name);
+                                    if args.daemon {
+                                        println!("🔊 [VOZ] {} começou a falar...", voice_pkt.sender_name);
+                                    }
                                     e.insert((voice_pkt.sender_name.clone(), now));
                                 } else if let Some(speaker) = active_speakers.get_mut(&voice_pkt.sender_pubkey) {
                                     speaker.1 = now;
