@@ -22,3 +22,8 @@ tmp/
 *.tmp
 p2p-cli-linux
 downloads/
+
+# Dados locais do app: servidores (chaves de dono, estado MLS) e histórico da barra de entrada
+*.servers/
+*.history
+*.log

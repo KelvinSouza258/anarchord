@@ -11,6 +11,7 @@
 
 pub mod cert;
 pub mod chain;
+pub mod e2ee;
 
 pub use cert::{format_duration, parse_duration, ModAction, ModKind, ModeratorCert, Permission, UtcSecs};
 pub use chain::{AppendResult, BanState, Block, Channel, ChannelType, Entry, Rejection, ServerChain, ServerState};
@@ -51,6 +52,23 @@ pub fn voice_topic(space: &Space, channel: &str) -> String {
         Space::Lobby => format!("{}/voice/{}", TOPIC_PREFIX, channel),
         Space::Server(id) => format!("{}/server/{}/voice/{}", TOPIC_PREFIX, id, channel),
     }
+}
+
+/// Tópico de compartilhamento de tela do espaço
+pub fn screen_topic(space: &Space) -> String {
+    match space {
+        Space::Lobby => format!("{}/screens", TOPIC_PREFIX),
+        Space::Server(id) => format!("{}/server/{}/screens", TOPIC_PREFIX, id),
+    }
+}
+
+/// Se o tópico é de conteúdo de um servidor (canal, voz ou tela), devolve o id do servidor.
+/// Esse conteúdo trafega cifrado com MLS.
+pub fn parse_server_content_topic(topic: &str) -> Option<&str> {
+    let rest = topic.strip_prefix(TOPIC_PREFIX)?.strip_prefix("/server/")?;
+    let (id, tail) = rest.split_at(rest.find('/')?);
+    let content = tail.starts_with("/channel/") || tail.starts_with("/voice/") || tail == "/screens";
+    (content && is_valid_server_id(id)).then_some(id)
 }
 
 /// Tópico de controle de um servidor: blocos da cadeia, ações de moderação e pedidos de cadeia
@@ -100,6 +118,12 @@ pub enum ServerMessage {
     ChainRequest { server_id: String, from_height: u64 },
     /// Ação de moderador ainda não incluída na cadeia
     Action(ModAction),
+    /// Pedido de entrada no grupo cifrado (MLS): pacote de chave de quem publicou
+    KeyPackage { server_id: String, key_package: Vec<u8> },
+    /// Commit MLS do dono (adiciona ou remove membros e troca a chave do grupo)
+    Commit { server_id: String, commit: Vec<u8> },
+    /// Welcome MLS para quem foi admitido no grupo
+    Welcome { server_id: String, target: String, welcome: Vec<u8> },
 }
 
 impl ServerMessage {
@@ -439,6 +463,9 @@ impl ServerRegistry {
                 }
                 vec![ServerEvent::Reply { messages: server.sync_messages(from_height), server_id }]
             }
+            ServerMessage::KeyPackage { .. } | ServerMessage::Commit { .. } | ServerMessage::Welcome { .. } => {
+                vec![ServerEvent::Ignored("mensagem do grupo cifrado (tratada por e2ee)".into())]
+            }
             ServerMessage::Action(action) => {
                 let server_id = action.body.server_id.clone();
                 let Some(server) = self.servers.get_mut(&server_id) else {
@@ -729,6 +756,12 @@ mod tests {
         assert_eq!(channel_topic(&space, "geral"), format!("p2p-anarchord/server/{}/channel/geral", id));
         assert_eq!(parse_server_control_topic(&server_control_topic(&id)), Some(id.as_str()));
         assert_eq!(parse_server_control_topic(&channel_topic(&space, "geral")), None);
+        assert_eq!(parse_server_content_topic(&channel_topic(&space, "geral")), Some(id.as_str()));
+        assert_eq!(parse_server_content_topic(&voice_topic(&space, "voz")), Some(id.as_str()));
+        assert_eq!(parse_server_content_topic(&screen_topic(&space)), Some(id.as_str()));
+        assert_eq!(parse_server_content_topic(&server_control_topic(&id)), None);
+        assert_eq!(parse_server_content_topic(&channel_topic(&Space::Lobby, "geral")), None);
+        assert_eq!(screen_topic(&Space::Lobby), "p2p-anarchord/screens");
     }
 
     #[test]

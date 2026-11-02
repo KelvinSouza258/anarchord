@@ -228,6 +228,16 @@ impl UserIdentity {
         self.signing_key.sign(message).to_vec()
     }
 
+    /// Bytes da chave privada Ed25519 (usada também como chave de assinatura MLS)
+    pub(crate) fn signing_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
+    /// Bytes da chave pública Ed25519
+    pub(crate) fn verifying_key_bytes(&self) -> [u8; 32] {
+        self.verifying_key.to_bytes()
+    }
+
     /// Converte para o par de chaves oficial do libp2p
     pub fn to_libp2p_keypair(&self) -> libp2p::identity::Keypair {
         let mut bytes = self.signing_key.to_bytes();

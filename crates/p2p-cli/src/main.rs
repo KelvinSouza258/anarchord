@@ -12,8 +12,10 @@ use p2p_core::{
     api::{pubkey_hex_from_peer_id, ChatMessage},
     bootstrap::OPENTRACKER_SERVERS,
     community::{
-        self, format_duration, server_control_topic, server_dht_key, short_id, ChannelType, ModKind, ServerEvent,
-        ServerMessage, ServerRegistry, Space,
+        self,
+        e2ee::{self, CommitOutcome, E2eeError, ServerGroups},
+        format_duration, server_control_topic, server_dht_key, short_id, ChannelType, ModKind, ServerEvent, ServerMessage,
+        ServerRegistry, Space,
     },
     file_transfer::{
         calculate_file_hash, chunk_file, FileDecision, FileOffer, FileReceiver, FileTransferMessage,
@@ -264,6 +266,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Servidores acompanhados (cadeias de configuração e chaves de dono), ao lado do arquivo de identidade
     let mut servers = ServerRegistry::load(servers_dir_for(&args.identity_file), now_secs())?;
+    // Grupos MLS (criptografia de ponta a ponta) dos servidores, salvos junto dos servidores
+    let mut mls = ServerGroups::new(&identity, Some(servers_dir_for(&args.identity_file).join("mls-state.json")));
+    // Último pedido de entrada no grupo cifrado por servidor (evita repetir a cada tick)
+    let mut last_key_package: HashMap<String, std::time::Instant> = HashMap::new();
     for id in servers.list().map(|s| s.server_id.clone()).collect::<Vec<_>>() {
         follow_server(&mut node, &id);
     }
@@ -621,8 +627,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut current_voice_peers: HashSet<String> = HashSet::new();
 
     // Subsistema de Compartilhamento de Tela P2P (Screen Share H.264)
-    let screen_topic = IdentTopic::new("p2p-anarchord/screens");
+    let screen_topic = IdentTopic::new(community::screen_topic(&Space::Lobby));
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&screen_topic);
+    // Para onde vão os quadros da minha transmissão (Lobby ou servidor, definido ao iniciar)
+    let mut screen_publish_topic = screen_topic.clone();
     let screen_capture_engine = Arc::new(ScreenCaptureEngine::new());
     let (tx_screen_out, mut rx_screen_out) = tokio::sync::mpsc::unbounded_channel::<ScreenPacket>();
     let mut tx_viewer_frame_opt: Option<std::sync::mpsc::SyncSender<(p2p_core::screen::VideoCodec, Vec<u8>)>> = None;
@@ -667,6 +675,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         publish_server_message(&mut node, &id, &request);
                     }
                 }
+                // Grupo cifrado: pedir entrada / dono cria, admite e remove
+                server_sync_tick(&mut node, &servers, &mut mls, &mut last_key_package);
                 // Dono online: consolida ações de moderadores e renova certificados na janela
                 let now = now_secs();
                 for id in servers.list().filter(|s| s.is_owner()).map(|s| s.server_id.clone()).collect::<Vec<_>>() {
@@ -696,8 +706,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Publicação de quadros de vídeo da tela capturada para a malha P2P
             Some(screen_pkt) = rx_screen_out.recv() => {
                 if let Ok(pkt_bytes) = screen_pkt.to_bytes() {
-                    match node.swarm.behaviour_mut().gossipsub.publish(screen_topic.clone(), pkt_bytes) {
-                        Ok(_) => {
+                    match publish_content(&mut node, &mut mls, &screen_publish_topic, pkt_bytes) {
+                        Ok(()) => {
                             if screen_pkt.frame_seq % 60 == 0 {
                                 let _ = tx_ui_event.send(UiEvent::SystemLog(format!("📺 [VÍDEO ENVIADO] Quadro #{} transmitido na malha ({:.1} KB)", screen_pkt.frame_seq, screen_pkt.video_data.len() as f32 / 1024.0)));
                             }
@@ -722,7 +732,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(ch) = &current_voice_channel {
                         voice_pkt.channel_id = ch.clone();
                         if let Ok(pkt_bytes) = voice_pkt.to_bytes() {
-                            if let Err(e) = node.swarm.behaviour_mut().gossipsub.publish(v_topic.clone(), pkt_bytes) {
+                            if let Err(e) = publish_content(&mut node, &mut mls, v_topic, pkt_bytes) {
                                 // Exibe apenas em caso de erro incomum
                                 tracing::debug!("Erro ao publicar pacote de voz: {:?}", e);
                             }
@@ -772,6 +782,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     cmd,
                                     &mut node,
                                     &mut servers,
+                                    &mut mls,
                                     &mut active,
                                     &mut pending_switch,
                                     &last_invite,
@@ -799,6 +810,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = tx_ui_event.send(UiEvent::SystemLog("Você já está transmitindo sua tela. Use /screen stop para parar.".to_string()));
                                 } else {
                                     let max_width = max_width_for_quality(quality);
+                                    screen_publish_topic = IdentTopic::new(community::screen_topic(&active.space));
                                     let stream_id = format!("screen:{}", &identity.public_key_hex()[..8]);
                                     let tx_frame = tx_screen_out.clone();
                                     screen_capture_engine.start_capture(
@@ -998,7 +1010,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                                 let msg = ChatMessage::new_signed(&identity, &active.channel, &trimmed, now);
                                 if let Ok(json_bytes) = serde_json::to_vec(&msg) {
-                                    let _ = node.swarm.behaviour_mut().gossipsub.publish(active.topic.clone(), json_bytes);
+                                    if let Err(PublishError::NoGroupKey) = publish_content(&mut node, &mut mls, &active.topic, json_bytes) {
+                                        ui_log(&tx_ui_event, "🔐 Aguardando a chave do grupo deste servidor (o dono precisa estar online para admitir você). Mensagem não enviada.");
+                                    }
                                 }
                             }
                         }
@@ -1101,8 +1115,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(
                         libp2p::gossipsub::Event::Message { message, .. }
                     )) => {
+                        // Conteúdo de servidor (chat, voz, tela) chega cifrado com MLS: decifra antes.
+                        // O MLS autentica quem enviou; quem não está no grupo (banido, fora da
+                        // allow-list) não consegue produzir nada que decifre.
+                        let mut data = message.data.clone();
+                        let mut mls_sender: Option<String> = None;
+                        let mut undecryptable = false;
+                        if let Some(server_id) = community::parse_server_content_topic(message.topic.as_str()) {
+                            match mls.decrypt(server_id, &message.data) {
+                                Ok(decrypted) => {
+                                    data = decrypted.plaintext;
+                                    mls_sender = Some(decrypted.sender);
+                                }
+                                Err(e) => {
+                                    tracing::debug!("Conteúdo de servidor não decifrado: {}", e);
+                                    undecryptable = true;
+                                }
+                            }
+                        }
+                        // Autor declarado no pacote precisa ser quem o MLS diz que enviou
+                        let sender_matches = |author: &str| mls_sender.as_deref().map_or(true, |s| s == author);
+                        if undecryptable {}
                         // 0. Tópico de controle de servidor: blocos da cadeia, ações de moderadores e pedidos
-                        if let Some(server_id) = community::parse_server_control_topic(message.topic.as_str()).map(str::to_string) {
+                        else if let Some(server_id) = community::parse_server_control_topic(message.topic.as_str()).map(str::to_string) {
                             let from_pubkey = message.source.as_ref().and_then(pubkey_hex_from_peer_id);
                             handle_server_network_message(
                                 &server_id,
@@ -1110,6 +1145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 from_pubkey.as_deref(),
                                 &mut node,
                                 &mut servers,
+                                &mut mls,
                                 &mut active,
                                 &mut pending_switch,
                                 &identity,
@@ -1118,8 +1154,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                         // 1. Tenta decodificar como mensagem de chat de texto
-                        else if let Ok(chat_msg) = serde_json::from_slice::<ChatMessage>(&message.data) {
-                            if chat_msg.author_pubkey != identity.public_key_hex() {
+                        else if let Ok(chat_msg) = serde_json::from_slice::<ChatMessage>(&data) {
+                            if chat_msg.author_pubkey != identity.public_key_hex() && sender_matches(&chat_msg.author_pubkey) {
                                 let server = active.server_id().and_then(|id| servers.get(id));
                                 let banned = server.is_some_and(|s| s.is_banned(&chat_msg.author_pubkey, now_secs()));
                                 let outside = server.is_some_and(|s| !s.is_allowed(&chat_msg.author_pubkey, now_secs()));
@@ -1149,8 +1185,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         // 2. Tenta decodificar como pacote de voz P2P
-                        else if let Ok(voice_pkt) = VoicePacket::from_bytes(&message.data) {
-                            if voice_pkt.sender_pubkey != identity.public_key_hex() {
+                        else if let Ok(voice_pkt) = VoicePacket::from_bytes(&data) {
+                            if voice_pkt.sender_pubkey != identity.public_key_hex() && sender_matches(&voice_pkt.sender_pubkey) {
                                 let now = std::time::Instant::now();
                                 if current_voice_peers.insert(voice_pkt.sender_name.clone()) {
                                     let _ = tx_ui_event.send(UiEvent::VoiceRoomMembers(current_voice_peers.iter().cloned().collect()));
@@ -1196,7 +1232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         // 3. Tenta decodificar como mensagem de transferência direta de arquivo P2P
-                        else if let Ok(file_msg) = FileTransferMessage::from_bytes(&message.data) {
+                        else if let Ok(file_msg) = FileTransferMessage::from_bytes(&data) {
                             match file_msg {
                                 FileTransferMessage::Offer(offer) => {
                                     // Verifica se o arquivo é direcionado a nós
@@ -1323,8 +1359,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         // 4. Tenta decodificar como quadro de compartilhamento de tela P2P (ScreenPacket)
-                        else if let Ok(screen_pkt) = ScreenPacket::from_bytes(&message.data) {
-                            if screen_pkt.sender_pubkey != identity.public_key_hex() {
+                        else if let Ok(screen_pkt) = ScreenPacket::from_bytes(&data) {
+                            if screen_pkt.sender_pubkey != identity.public_key_hex() && sender_matches(&screen_pkt.sender_pubkey) {
                                 let stream_id = screen_pkt.stream_id.clone();
                                 let is_new = !active_screen_streams.contains_key(&stream_id);
                                 active_screen_streams.insert(
@@ -1540,9 +1576,58 @@ fn ui_log(tx_ui_event: &UnboundedSender<UiEvent>, message: impl Into<String>) {
     let _ = tx_ui_event.send(UiEvent::SystemLog(message.into()));
 }
 
-/// Passa a ouvir o tópico de controle do servidor (cadeia e moderação)
+/// Passa a ouvir o tópico de controle do servidor (cadeia e moderação) e o de tela dele
 fn follow_server(node: &mut P2PNode, server_id: &str) {
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&IdentTopic::new(server_control_topic(server_id)));
+    let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&IdentTopic::new(community::screen_topic(&Space::Server(server_id.to_string()))));
+}
+
+#[derive(Debug)]
+enum PublishError {
+    /// Conteúdo de servidor e este nó ainda não tem a chave do grupo
+    NoGroupKey,
+    Network,
+}
+
+/// Publica conteúdo (chat, voz, tela). Em tópicos de servidor, cifra antes com o grupo MLS.
+fn publish_content(node: &mut P2PNode, mls: &mut ServerGroups, topic: &IdentTopic, bytes: Vec<u8>) -> Result<(), PublishError> {
+    let topic_name = topic.hash().into_string();
+    let payload = match community::parse_server_content_topic(&topic_name) {
+        Some(server_id) => mls.encrypt(server_id, &bytes).map_err(|_| PublishError::NoGroupKey)?,
+        None => bytes,
+    };
+    node.swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload).map(|_| ()).map_err(|_| PublishError::Network)
+}
+
+/// Ciclo periódico do grupo cifrado de cada servidor:
+/// - dono: cria o grupo se faltar e remove quem foi banido ou saiu da allow-list;
+/// - membro sem a chave: publica o pacote de chave pedindo entrada (no máximo a cada 15 s).
+fn server_sync_tick(
+    node: &mut P2PNode,
+    servers: &ServerRegistry,
+    mls: &mut ServerGroups,
+    last_key_package: &mut HashMap<String, std::time::Instant>,
+) {
+    let now = now_secs();
+    let ids: Vec<(String, bool)> = servers.list().filter(|s| s.has_chain()).map(|s| (s.server_id.clone(), s.is_owner())).collect();
+    for (id, owner) in ids {
+        if owner {
+            if !mls.has_group(&id) {
+                let _ = mls.create_group(&id);
+            }
+            if let Ok(Some(commit)) = e2ee::enforce_membership(mls, servers, &id, now) {
+                publish_server_message(node, &id, &commit);
+            }
+        } else if !mls.has_group(&id)
+            && last_key_package.get(&id).map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(15))
+        {
+            if let Ok(key_package) = mls.key_package() {
+                if publish_server_message(node, &id, &ServerMessage::KeyPackage { server_id: id.clone(), key_package }) {
+                    last_key_package.insert(id, std::time::Instant::now());
+                }
+            }
+        }
+    }
 }
 
 /// Publica no tópico de controle do servidor. Falha (sem ninguém no tópico) é normal e ignorada.
@@ -1686,6 +1771,7 @@ fn run_server_command(
     cmd: ServerCommand,
     node: &mut P2PNode,
     servers: &mut ServerRegistry,
+    mls: &mut ServerGroups,
     active: &mut ActiveChannel,
     pending_switch: &mut Option<String>,
     last_invite: &Option<String>,
@@ -1718,9 +1804,17 @@ fn run_server_command(
         ServerCommand::Create(name) => match servers.create(&name, &identity.public_key_hex(), now) {
             Ok(id) => {
                 follow_server(node, &id);
+                if let Err(e) = mls.create_group(&id) {
+                    ui_log(tx_ui_event, format!("⚠️ Grupo cifrado não criado: {}", e));
+                }
                 ui_log(
                     tx_ui_event,
-                    format!("🏰 Servidor '{}' criado (id {}). Você é o dono (nível 0). Use /server invite para convidar.", name, short_id(&id)),
+                    format!(
+                        "🏰 Servidor '{}' criado (id {}). Você é o dono (nível 0). Chat, voz e tela do servidor são cifrados de ponta a ponta. \
+                         Use /server invite para convidar.",
+                        name,
+                        short_id(&id)
+                    ),
                 );
                 let channel = default_channel(servers, &id);
                 enter_channel(node, servers, active, Space::Server(id), channel, peer_metadata, tx_ui_event);
@@ -1737,7 +1831,9 @@ fn run_server_command(
             let name = servers.get(&id).map(|s| s.name()).unwrap_or_default();
             let was_owner = servers.get(&id).is_some_and(|s| s.is_owner());
             servers.leave(&id);
+            mls.drop_group(&id);
             let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&IdentTopic::new(server_control_topic(&id)));
+            let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&IdentTopic::new(community::screen_topic(&Space::Server(id.clone()))));
             enter_channel(node, servers, active, Space::Lobby, "geral".to_string(), peer_metadata, tx_ui_event);
             let note = if was_owner { " A chave de dono continua salva em disco." } else { "" };
             ui_log(tx_ui_event, format!("👋 Você saiu do servidor '{}'.{}", name, note));
@@ -2012,6 +2108,7 @@ fn handle_server_network_message(
     from_pubkey: Option<&str>,
     node: &mut P2PNode,
     servers: &mut ServerRegistry,
+    mls: &mut ServerGroups,
     active: &mut ActiveChannel,
     pending_switch: &mut Option<String>,
     identity: &UserIdentity,
@@ -2021,6 +2118,53 @@ fn handle_server_network_message(
     let Ok(message) = ServerMessage::from_bytes(data) else { return };
     let now = now_secs();
     let me = identity.public_key_hex();
+
+    // Grupo cifrado (MLS): entrada, troca de chave e boas-vindas
+    match &message {
+        ServerMessage::KeyPackage { server_id, key_package } => {
+            let Some(from) = from_pubkey else { return };
+            match e2ee::admit_from_key_package(mls, servers, server_id, from, key_package, now) {
+                Ok(messages) => {
+                    for m in &messages {
+                        publish_server_message(node, server_id, m);
+                    }
+                    ui_log(tx_ui_event, format!("🔐 {} recebeu a chave do grupo cifrado.", nick_for(from, peer_metadata, identity)));
+                }
+                Err(E2eeError::NotOwner) => {}
+                Err(e) => tracing::debug!("Pedido de entrada no grupo recusado: {}", e),
+            }
+            return;
+        }
+        ServerMessage::Commit { server_id, commit } => {
+            let owner = servers.get(server_id).map(|s| s.chain().state().owner.clone()).unwrap_or_default();
+            let name = servers.get(server_id).map(|s| s.name()).unwrap_or_default();
+            match mls.process_commit(server_id, commit, &owner) {
+                Ok(CommitOutcome::Removed) => ui_log(
+                    tx_ui_event,
+                    format!("🔐 Você foi removido do grupo cifrado de '{}': não recebe mais o conteúdo do servidor.", name),
+                ),
+                // Perdemos algum Commit: descarta e pede entrada de novo no próximo ciclo
+                Ok(CommitOutcome::OutOfSync) => mls.drop_group(server_id),
+                Ok(_) => {}
+                Err(e) => tracing::debug!("Commit MLS inválido: {}", e),
+            }
+            return;
+        }
+        ServerMessage::Welcome { server_id, target, welcome } => {
+            if *target == me && !mls.has_group(server_id) {
+                let name = servers.get(server_id).map(|s| s.name()).unwrap_or_default();
+                match mls.join(server_id, welcome) {
+                    Ok(()) => ui_log(
+                        tx_ui_event,
+                        format!("🔐 Chave do grupo de '{}' recebida: chat, voz e tela cifrados de ponta a ponta.", name),
+                    ),
+                    Err(e) => tracing::debug!("Welcome MLS recusado: {}", e),
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
     let before = servers.get(topic_server_id).map(|s| (s.has_chain() && s.is_banned(&me, now), s.level_of(&me, now)));
 
     for event in servers.handle_message(message, from_pubkey, now) {
@@ -2219,10 +2363,14 @@ mod tests {
         node: P2PNode,
         identity: UserIdentity,
         servers: ServerRegistry,
+        mls: ServerGroups,
+        last_key_package: HashMap<String, std::time::Instant>,
         active: ActiveChannel,
         pending: Option<String>,
         last_invite: Option<String>,
         meta: HashMap<PeerId, (String, String)>,
+        /// Textos de chat recebidos (já decifrados, quando de servidor)
+        received: Vec<String>,
         tx: UnboundedSender<UiEvent>,
         rx: tokio::sync::mpsc::UnboundedReceiver<UiEvent>,
     }
@@ -2235,6 +2383,8 @@ mod tests {
             node.swarm.behaviour_mut().gossipsub.subscribe(&active.topic).unwrap();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             Self {
+                mls: ServerGroups::new(&identity, None),
+                last_key_package: HashMap::new(),
                 node,
                 identity,
                 servers: ServerRegistry::in_memory(),
@@ -2242,6 +2392,7 @@ mod tests {
                 pending: None,
                 last_invite: None,
                 meta: HashMap::new(),
+                received: Vec::new(),
                 tx,
                 rx,
             }
@@ -2253,6 +2404,7 @@ mod tests {
                 cmd,
                 &mut self.node,
                 &mut self.servers,
+                &mut self.mls,
                 &mut self.active,
                 &mut self.pending,
                 &self.last_invite,
@@ -2297,16 +2449,28 @@ mod tests {
                             from_pubkey.as_deref(),
                             &mut self.node,
                             &mut self.servers,
+                            &mut self.mls,
                             &mut self.active,
                             &mut self.pending,
                             &self.identity,
                             &self.meta,
                             &self.tx,
                         );
-                    } else if let Ok(chat) = serde_json::from_slice::<ChatMessage>(&message.data) {
-                        if chat.verify(message.source.as_ref()) {
-                            if let Some(invite) = parse_invite(&chat.text) {
-                                self.last_invite = Some(invite);
+                    } else {
+                        // Conteúdo de servidor chega cifrado: decifra como o loop principal
+                        let data = match community::parse_server_content_topic(message.topic.as_str()) {
+                            Some(server_id) => match self.mls.decrypt(server_id, &message.data) {
+                                Ok(d) => d.plaintext,
+                                Err(_) => return,
+                            },
+                            None => message.data.clone(),
+                        };
+                        if let Ok(chat) = serde_json::from_slice::<ChatMessage>(&data) {
+                            if chat.verify(message.source.as_ref()) {
+                                if let Some(invite) = parse_invite(&chat.text) {
+                                    self.last_invite = Some(invite);
+                                }
+                                self.received.push(chat.text);
                             }
                         }
                     }
@@ -2329,6 +2493,11 @@ mod tests {
                         if let Some(request) = bob.pending.clone().and_then(|id| bob.servers.chain_request(&id)) {
                             let id = bob.pending.clone().unwrap();
                             publish_server_message(&mut bob.node, &id, &request);
+                        }
+                        // Ciclo do grupo cifrado (no app, o timer de 5 s); KeyPackage sem espera
+                        for peer in [&mut *alice, &mut *bob] {
+                            peer.last_key_package.clear();
+                            server_sync_tick(&mut peer.node, &peer.servers, &mut peer.mls, &mut peer.last_key_package);
                         }
                     }
                 }
@@ -2378,6 +2547,16 @@ mod tests {
         assert!(bob.pending.is_none());
         assert!(bob.logs().iter().any(|l| l.contains("sincronizado")));
 
+        // Bob pede entrada no grupo cifrado; a dona admite e manda a chave
+        let sid = server_id.clone();
+        pump(&mut alice, &mut bob, "Bob receber a chave do grupo", move |_, b| b.mls.has_group(&sid)).await;
+        assert!(bob.logs().iter().any(|l| l.contains("Chave do grupo")));
+
+        // Chat do servidor cifrado de ponta a ponta
+        let secret = ChatMessage::new_signed(&alice.identity, "geral", "segredo do servidor", now_secs());
+        publish_content(&mut alice.node, &mut alice.mls, &alice.active.topic.clone(), serde_json::to_vec(&secret).unwrap()).unwrap();
+        pump(&mut alice, &mut bob, "mensagem cifrada chegar a Bob", |_, b| b.received.iter().any(|t| t == "segredo do servidor")).await;
+
         // Sem certificado, Bob não modera
         bob.command("/server ban Alice");
         assert!(bob.logs().iter().any(|l| l.contains("não tem certificado")));
@@ -2414,6 +2593,24 @@ mod tests {
         let logs = bob.logs();
         assert!(logs.iter().any(|l| l.contains("Você não é mais moderador")), "{:?}", logs);
         assert!(logs.iter().any(|l| l.contains("Você foi banido")), "{:?}", logs);
+
+        // A manutenção da dona tira Bob do grupo cifrado: a chave é trocada
+        let sid = server_id.clone();
+        pump(&mut alice, &mut bob, "Bob ser removido do grupo cifrado", move |_, b| !b.mls.has_group(&sid)).await;
+        let removal_logs: Vec<String> = logs.iter().cloned().chain(bob.logs()).collect();
+        assert!(removal_logs.iter().any(|l| l.contains("removido do grupo cifrado")), "{:?}", removal_logs);
+        let after = ChatMessage::new_signed(&alice.identity, "geral", "depois do ban", now_secs());
+        publish_content(&mut alice.node, &mut alice.mls, &alice.active.topic.clone(), serde_json::to_vec(&after).unwrap()).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    ev = alice.node.swarm.select_next_some() => alice.process(ev),
+                    ev = bob.node.swarm.select_next_some() => bob.process(ev),
+                }
+            }
+        })
+        .await;
+        assert!(!bob.received.iter().any(|t| t == "depois do ban"), "banido não lê mais o servidor");
 
         // O histórico (a cadeia) registra tudo, igual para os dois
         bob.command("/server history");
