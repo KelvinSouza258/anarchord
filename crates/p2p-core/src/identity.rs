@@ -237,6 +237,27 @@ impl UserIdentity {
     }
 }
 
+/// Decodifica uma chave de 32 bytes em hexadecimal (pubkey Ed25519 / User ID)
+pub(crate) fn hex_decode_32(s: &str) -> Result<[u8; 32], ()> {
+    if s.len() != 64 || !s.is_ascii() {
+        return Err(());
+    }
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| ())?;
+    }
+    Ok(bytes)
+}
+
+/// Verifica uma assinatura Ed25519 feita pela pubkey em hexadecimal
+pub(crate) fn verify_signature_hex(pubkey_hex: &str, message: &[u8], signature: &[u8]) -> bool {
+    use ed25519_dalek::{Signature, Verifier};
+    let Ok(key_bytes) = hex_decode_32(pubkey_hex) else { return false };
+    let Ok(key) = VerifyingKey::from_bytes(&key_bytes) else { return false };
+    let Ok(signature) = Signature::from_slice(signature) else { return false };
+    key.verify(message, &signature).is_ok()
+}
+
 // Helper para converter hex sem adicionar crate externa
 mod hex {
     pub fn encode(data: [u8; 32]) -> String {

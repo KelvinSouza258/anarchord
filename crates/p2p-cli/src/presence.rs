@@ -2,11 +2,6 @@ use libp2p::gossipsub::{self, IdentTopic};
 use libp2p::PeerId;
 use std::collections::HashMap;
 
-/// Tópico Gossipsub de um canal de texto
-pub fn channel_topic(channel: &str) -> IdentTopic {
-    IdentTopic::new(format!("p2p-anarchord/channel/{}", channel))
-}
-
 /// Nicks dos pares Anarchord (identificados via Identify) inscritos no tópico do canal.
 /// É a presença exibida em "Membros da Sala" na TUI.
 pub fn channel_members(
@@ -31,7 +26,12 @@ mod tests {
     use futures::StreamExt;
     use libp2p::swarm::SwarmEvent;
     use libp2p::{identify, Multiaddr};
+    use p2p_core::community::{channel_topic as space_channel_topic, Space};
     use p2p_core::{parse_agent_version, protocol::AppBehaviourEvent, P2PNode, UserIdentity};
+
+    fn channel_topic(channel: &str) -> IdentTopic {
+        IdentTopic::new(space_channel_topic(&Space::Lobby, channel))
+    }
     use std::time::Duration;
 
     fn node(nick: &str) -> P2PNode {

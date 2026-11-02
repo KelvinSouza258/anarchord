@@ -103,7 +103,9 @@ impl P2PNode {
                 // 2. GossipSub (Chat de Texto em Malha, Áudio e Vídeo P2P)
                 let gossip_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_millis(500))
-                    .validation_mode(gossipsub::ValidationMode::Permissive)
+                    // Strict: toda mensagem precisa de autor (source) e assinatura válidos. É o que permite
+                    // ligar o autor de uma ChatMessage a quem de fato a publicou (ChatMessage::verify)
+                    .validation_mode(gossipsub::ValidationMode::Strict)
                     .max_transmit_size(1024 * 1024) // 1MB limite para permitir pacotes de chunks P2P e vídeo
                     .mesh_n(2)           // Alvo da malha D reduzido para funcionar até com 2 nós em testes locais
                     .mesh_n_low(1)       // Mínimo D_lo = 1 (enxerta par assim que houver 1 conectado)
@@ -198,7 +200,12 @@ impl P2PNode {
     /// Anuncia este nó como provedor da chave de descoberta Anarchord na DHT.
     /// Deve ser chamado quando houver endereço externo confirmado, pois o registro carrega esses endereços.
     pub fn dht_start_providing(&mut self) {
-        if let Err(e) = self.swarm.behaviour_mut().kademlia.start_providing(dht_discovery_key()) {
+        self.dht_provide(dht_discovery_key());
+    }
+
+    /// Anuncia este nó como provedor de uma chave qualquer (ex.: a de um servidor que ele acompanha)
+    pub fn dht_provide(&mut self, key: kad::RecordKey) {
+        if let Err(e) = self.swarm.behaviour_mut().kademlia.start_providing(key) {
             tracing::warn!("Falha ao anunciar provedor na DHT: {:?}", e);
         }
     }
@@ -206,7 +213,12 @@ impl P2PNode {
     /// Busca na DHT os outros nós Anarchord que anunciaram a chave de descoberta.
     /// Os resultados chegam como `kad::Event::OutboundQueryProgressed` com `GetProvidersOk::FoundProviders`.
     pub fn dht_find_peers(&mut self) {
-        self.swarm.behaviour_mut().kademlia.get_providers(dht_discovery_key());
+        self.dht_find(dht_discovery_key());
+    }
+
+    /// Busca os provedores de uma chave qualquer (ex.: membros online de um servidor)
+    pub fn dht_find(&mut self, key: kad::RecordKey) {
+        self.swarm.behaviour_mut().kademlia.get_providers(key);
     }
 }
 

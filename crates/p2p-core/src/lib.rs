@@ -1,5 +1,5 @@
 pub mod identity;
-pub mod server;
+pub mod community;
 pub mod api;
 pub mod protocol;
 pub mod node;
@@ -11,8 +11,8 @@ pub mod file_transfer;
 pub mod screen;
 
 pub use identity::UserIdentity;
-pub use server::{ServerMetadata, ServerPayload, Channel, ChannelType};
-pub use api::{CoreCommand, CoreEvent, ChatMessage};
+pub use api::{peer_id_from_pubkey_hex, ChatMessage, CoreCommand, CoreEvent};
+pub use community::{Channel, ChannelType, ServerMessage, ServerRegistry, Space};
 pub use node::{
     dht_discovery_key, make_agent_version, parse_agent_version, P2PNode, AGENT_VERSION_PREFIX,
     DHT_DISCOVERY_NAMESPACE,

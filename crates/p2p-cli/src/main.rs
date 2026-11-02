@@ -1,14 +1,20 @@
 mod presence;
+mod spaces;
 mod ui;
 mod screen_viewer;
 
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::gossipsub::IdentTopic;
+use libp2p::PeerId;
 use opus1::{Application, Channels, OpusDecoder, OpusEncoder, SampleRate};
 use p2p_core::{
-    api::ChatMessage,
+    api::{pubkey_hex_from_peer_id, ChatMessage},
     bootstrap::OPENTRACKER_SERVERS,
+    community::{
+        self, format_duration, server_control_topic, server_dht_key, short_id, ChannelType, ModKind, ServerEvent,
+        ServerMessage, ServerRegistry, Space,
+    },
     file_transfer::{
         calculate_file_hash, chunk_file, FileDecision, FileOffer, FileReceiver, FileTransferMessage,
     },
@@ -21,14 +27,16 @@ use p2p_core::{
     voice::{AudioCodec, AudioDeviceManager, JitterBuffer, VoiceEngine, VoicePacket},
 };
 use screen_viewer::ScreenViewer;
+use spaces::{invite_text, parse_invite, parse_server_command, ActiveChannel, ServerCommand, SERVER_HELP};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
+use tokio::sync::mpsc::UnboundedSender;
+use ui::menu::ServerEntry;
 use ui::{TerminalUi, UiAction, UiEvent};
 
 #[derive(Parser, Debug, PartialEq)]
@@ -101,6 +109,7 @@ pub enum ChatAction {
     ScreenWatch(String),
     ScreenList,
     SendTextMessage(String),
+    Server(ServerCommand),
     Empty,
 }
 
@@ -152,6 +161,12 @@ pub fn parse_user_input(input: &str) -> ChatAction {
     }
     if trimmed == "/voice leave" {
         return ChatAction::LeaveVoice;
+    }
+    if trimmed == "/lobby" {
+        return ChatAction::Server(ServerCommand::Switch("lobby".to_string()));
+    }
+    if trimmed == "/server" || trimmed.starts_with("/server ") {
+        return ChatAction::Server(parse_server_command(trimmed.trim_start_matches("/server")));
     }
     if trimmed.starts_with("/join ") {
         let new_channel = trimmed.trim_start_matches("/join ").trim();
@@ -243,21 +258,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("💬 Sala Ativa  : #{}", args.channel);
         println!("============================================================");
-        println!("💡 Dica: Digite sua mensagem e pressione ENTER para enviar!");
-        println!("         /peers           -> Lista os pares P2P conectados");
-        println!("         /join <sala>     -> Troca de canal de texto");
-        println!("         /voice join <id> -> Conecta na sala de voz P2P em tempo real");
-        println!("         /voice leave     -> Sai da sala de voz P2P");
-        println!("         /mute            -> Alterna mutar/desmutar seu microfone");
-        println!("         /devices         -> Lista microfones e alto-falantes detectados");
-        println!("         /quit            -> Encerra o nó");
+        println!("🤖 Modo daemon: só exibe eventos (sem entrada de comandos). Ctrl+C encerra.");
         println!("============================================================\n");
     }
 
-    // Canal ativo inicial
-    let mut current_channel = args.channel.clone();
-    let mut current_topic = presence::channel_topic(&current_channel);
-    node.swarm.behaviour_mut().gossipsub.subscribe(&current_topic)?;
+    // Servidores acompanhados (cadeias de configuração e chaves de dono), ao lado do arquivo de identidade
+    let mut servers = ServerRegistry::load(servers_dir_for(&args.identity_file), now_secs())?;
+    for id in servers.list().map(|s| s.server_id.clone()).collect::<Vec<_>>() {
+        follow_server(&mut node, &id);
+    }
+    // Servidor em que o usuário entra assim que a configuração chegar (/server join sem cadeia ainda)
+    let mut pending_switch: Option<String> = None;
+    // Último convite de servidor recebido no chat (/server accept)
+    let mut last_invite: Option<String> = None;
+    // Quando cada servidor teve a cadeia reenviada pela última vez (evita rajadas de respostas)
+    let mut last_snapshot_reply: HashMap<String, std::time::Instant> = HashMap::new();
+
+    // Canal ativo inicial: sempre no Lobby
+    let mut active = ActiveChannel::new(Space::Lobby, args.channel.clone());
+    node.swarm.behaviour_mut().gossipsub.subscribe(&active.topic)?;
 
     // Conexão direta explícita se fornecida
     if let Some(remote_addr) = args.connect {
@@ -340,8 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut current_voice_topic: Option<IdentTopic> = None;
 
     if let Some(v_chan) = &args.auto_voice {
-        let v_topic_name = format!("p2p-anarchord/voice/{}", v_chan);
-        let v_topic = IdentTopic::new(v_topic_name);
+        let v_topic = IdentTopic::new(community::voice_topic(&Space::Lobby, v_chan));
         if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&v_topic) {
             if args.daemon {
                 println!("❌ Falha ao entrar no canal de voz automático: {:?}", e);
@@ -547,8 +565,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Leitura interativa do teclado (stdin no modo daemon ou canal do Ratatui)
-    let mut stdin_lines = BufReader::new(tokio::io::stdin()).lines();
 
     // Canais de comunicação com a TUI do Ratatui
     let (tx_ui_event, rx_ui_event) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
@@ -564,10 +580,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             identity.profile.display_name.clone(),
             identity.public_key_hex(),
             Arc::clone(&is_muted_flag),
+            Some(args.identity_file.with_extension("history")),
         );
         tokio::spawn(async move {
             let _ = ui.run(rx_ui_event, tx_ui_action).await;
         });
+        publish_servers(&servers, &active, &tx_ui_event);
     }
 
     // Rastreamento de nós conectados para desduplicação e metadados de identificação
@@ -576,6 +594,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Busca periódica de outros nós Anarchord na DHT (registros de provedor)
     let mut dht_search_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
+    // Sincronização periódica: pede a cadeia de quem ainda não tem e faz a manutenção dos servidores próprios
+    let mut server_sync_interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
     // Reservas em relays públicos quando o AutoNAT detecta NAT (habilita DCUtR / hole punching)
     let mut relay_manager = RelayManager::new();
@@ -634,6 +655,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Procura na DHT os nós Anarchord que anunciaram a chave de descoberta
             _ = dht_search_interval.tick(), if !args.no_auto_bootstrap => {
                 node.dht_find_peers();
+                // Membros online dos servidores acompanhados
+                for id in servers.list().map(|s| s.server_id.clone()).collect::<Vec<_>>() {
+                    node.dht_find(server_dht_key(&id));
+                }
+            }
+            _ = server_sync_interval.tick() => {
+                // Cadeia ainda não chegou: pede de novo a quem estiver no tópico
+                for id in servers.list().filter(|s| !s.has_chain()).map(|s| s.server_id.clone()).collect::<Vec<_>>() {
+                    if let Some(request) = servers.chain_request(&id) {
+                        publish_server_message(&mut node, &id, &request);
+                    }
+                }
+                // Dono online: consolida ações de moderadores e renova certificados na janela
+                let now = now_secs();
+                for id in servers.list().filter(|s| s.is_owner()).map(|s| s.server_id.clone()).collect::<Vec<_>>() {
+                    if let Some(block) = servers.owner_maintenance(&id, now) {
+                        publish_server_message(&mut node, &id, &block);
+                        if active.server_id() == Some(id.as_str()) {
+                            refresh_space(&node, &servers, &active, &peer_metadata, &tx_ui_event);
+                        }
+                    }
+                }
             }
             // Monitora quando pares pararam de falar/transmitir (inatividade > 600ms)
             _ = speaker_check_interval.tick() => {
@@ -721,7 +764,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = tx_ui_event.send(UiEvent::SystemLog(format!("Pares Anarchord conectados: {} (conexões totais, incluindo DHT: {})", anarchord_peers, connected_peers.len())));
                             }
                             ChatAction::ListDevices => {
-                                let _ = tx_ui_event.send(UiEvent::SystemLog("Dispositivos de áudio listados.".to_string()));
+                                ui_log(&tx_ui_event, format!("🎤 Entradas: {}", AudioDeviceManager::list_input_devices().join(" | ")));
+                                ui_log(&tx_ui_event, format!("🔊 Saídas: {}", AudioDeviceManager::list_output_devices().join(" | ")));
+                            }
+                            ChatAction::Server(cmd) => {
+                                run_server_command(
+                                    cmd,
+                                    &mut node,
+                                    &mut servers,
+                                    &mut active,
+                                    &mut pending_switch,
+                                    &last_invite,
+                                    &identity,
+                                    &peer_metadata,
+                                    &tx_ui_event,
+                                );
                             }
                             ChatAction::ToggleMute => {
                                 if let Some(engine) = &voice_engine {
@@ -797,13 +854,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             ChatAction::JoinVoice(channel_id) => {
+                                if let Some(server) = active.server_id().and_then(|id| servers.get(id)) {
+                                    if !server.has_channel(&channel_id, ChannelType::Voice) {
+                                        ui_log(&tx_ui_event, format!("❌ Não há sala de voz '{}' neste servidor. Veja o painel de canais.", channel_id));
+                                        continue;
+                                    }
+                                }
                                 if let Some(prev) = &current_voice_topic {
                                     let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(prev);
                                 }
                                 current_voice_peers.clear();
                                 current_voice_peers.insert(my_nick.clone());
-                                let v_topic_name = format!("p2p-anarchord/voice/{}", channel_id);
-                                let v_topic = IdentTopic::new(v_topic_name);
+                                let v_topic = IdentTopic::new(community::voice_topic(&active.space, &channel_id));
                                 if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&v_topic) {
                                     let _ = tx_ui_event.send(UiEvent::SystemLog(format!("❌ Falha ao entrar no canal de voz: {:?}", e)));
                                 } else {
@@ -827,18 +889,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             ChatAction::JoinTextChannel(new_channel) => {
-                                if new_channel != current_channel {
-                                    let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&current_topic);
-                                    current_channel = new_channel.clone();
-                                    current_topic = presence::channel_topic(&current_channel);
-                                    if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&current_topic) {
-                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("❌ Erro ao entrar no canal #{}: {:?}", current_channel, e)));
-                                    } else {
-                                        let _ = tx_ui_event.send(UiEvent::ChannelChanged(current_channel.clone()));
-                                        publish_channel_members(&node, &peer_metadata, &current_channel, &current_topic, &tx_ui_event);
-                                        let _ = tx_ui_event.send(UiEvent::SystemLog(format!("🚀 Entrou no canal #{}", current_channel)));
+                                // No Lobby qualquer nome vira canal; num servidor, só os canais do manifesto
+                                if let Some(server) = active.server_id().and_then(|id| servers.get(id)) {
+                                    if !server.has_channel(&new_channel, ChannelType::Text) {
+                                        ui_log(&tx_ui_event, format!("❌ #{} não existe neste servidor. Veja o painel de canais.", new_channel));
+                                        continue;
                                     }
                                 }
+                                let space = active.space.clone();
+                                enter_channel(&mut node, &servers, &mut active, space, new_channel, &peer_metadata, &tx_ui_event);
                             }
                             ChatAction::SendFile { recipient_query, file_path } => {
                                 let target_pubkey = peer_metadata.iter().find_map(|(pid, (nick, pubkey))| {
@@ -925,344 +984,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             ChatAction::SendTextMessage(trimmed) => {
-                                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-                                let payload = format!("{}:{}:{}", current_channel, trimmed, now);
-                                let signature = identity.sign(payload.as_bytes()).to_vec();
-
-                                let msg = ChatMessage {
-                                    channel_id: current_channel.clone(),
-                                    author_pubkey: identity.public_key_hex(),
-                                    author_name: my_nick.clone(),
-                                    text: trimmed.clone(),
-                                    timestamp: now,
-                                    signature,
-                                };
-
-                                if let Ok(json_bytes) = serde_json::to_vec(&msg) {
-                                    let _ = node.swarm.behaviour_mut().gossipsub.publish(current_topic.clone(), json_bytes);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Entrada do teclado (apenas no modo daemon interativo com stdin conectado)
-            line = stdin_lines.next_line(), if args.daemon && false => {
-                match line {
-                    Ok(Some(text)) => {
-                        let action = parse_user_input(&text);
-                        match action {
-                            ChatAction::Empty => continue,
-                            ChatAction::Quit => {
-                                println!("Encerrando nó P2P...");
-                                break;
-                            }
-                            ChatAction::ListPeers => {
-                                println!("\n👥 --- PARES CONECTADOS ({}) ---", connected_peers.len());
-                                if connected_peers.is_empty() {
-                                    println!("  (Nenhum par direto no momento. Aguardando descoberta...)");
-                                } else {
-                                    for peer in &connected_peers {
-                                        if let Some((nick, pubkey)) = peer_metadata.get(peer) {
-                                            println!("  🟢 Par: {} | Apelido: {} | User ID: {}", peer, nick, pubkey);
-                                        } else {
-                                            println!("  🟢 Par: {} (Identificando...)", peer);
-                                        }
-                                    }
-                                }
-                                println!("--------------------------------\n");
-                                continue;
-                            }
-                            ChatAction::ListDevices => {
-                                let inputs = AudioDeviceManager::list_input_devices();
-                                let outputs = AudioDeviceManager::list_output_devices();
-                                println!("\n🎤 --- DISPOSITIVOS DE ENTRADA (MICROFONES) ---");
-                                for dev in inputs {
-                                    println!("  🎙️  {}", dev);
-                                }
-                                println!("🔊 --- DISPOSITIVOS DE SAÍDA (ALTO-FALANTES) ---");
-                                for dev in outputs {
-                                    println!("  🔈 {}", dev);
-                                }
-                                println!("-----------------------------------------------\n");
-                                continue;
-                            }
-                            ChatAction::ToggleMute => {
-                                if let Some(engine) = &voice_engine {
-                                    let muted = engine.toggle_mute();
-                                    if muted {
-                                        println!("🔇 Microfone MUTADO.");
-                                    } else {
-                                        println!("🎙️  Microfone ATIVADO.");
-                                    }
-                                } else {
-                                    println!("⚠️  Engine de áudio não inicializada.");
-                                }
-                                continue;
-                            }
-                            ChatAction::JoinVoice(v_channel) => {
-                                if let Some(prev) = &current_voice_topic {
-                                    let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(prev);
-                                }
-                                current_voice_peers.clear();
-                                current_voice_peers.insert(my_nick.clone());
-                                let v_topic_name = format!("p2p-anarchord/voice/{}", v_channel);
-                                let v_topic = IdentTopic::new(v_topic_name);
-                                if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&v_topic) {
-                                    println!("❌ Falha ao entrar no canal de voz: {:?}", e);
-                                } else {
-                                    current_voice_channel = Some(v_channel.clone());
-                                    current_voice_topic = Some(v_topic);
-                                    let _ = tx_ui_event.send(UiEvent::VoiceChannelChanged(Some(v_channel.clone())));
-                                    let _ = tx_ui_event.send(UiEvent::VoiceRoomMembers(current_voice_peers.iter().cloned().collect()));
-                                    println!("🔊 Você conectou à sala de voz [🔊 {}]!", v_channel);
-                                    println!("💡 Dica: Fale no microfone ou use /mute para silenciar.");
-                                }
-                                continue;
-                            }
-                            ChatAction::LeaveVoice => {
-                                if let Some(prev) = current_voice_topic.take() {
-                                    let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&prev);
-                                    let prev_name = current_voice_channel.take().unwrap_or_default();
-                                    current_voice_peers.clear();
-                                    let _ = tx_ui_event.send(UiEvent::VoiceChannelChanged(None));
-                                    let _ = tx_ui_event.send(UiEvent::VoiceRoomMembers(Vec::new()));
-                                    println!("🔇 Você saiu da sala de voz [{}].", prev_name);
-                                } else {
-                                    println!("⚠️  Você não está conectado a nenhuma sala de voz.");
-                                }
-                                continue;
-                            }
-                            ChatAction::JoinTextChannel(new_channel) => {
-                                if new_channel != current_channel {
-                                    let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&current_topic);
-                                    current_channel = new_channel.clone();
-                                    current_topic = presence::channel_topic(&current_channel);
-                                    if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&current_topic) {
-                                        println!("❌ Erro ao entrar no canal #{}: {:?}", current_channel, e);
-                                    } else {
-                                        let _ = tx_ui_event.send(UiEvent::ChannelChanged(current_channel.clone()));
-                                        publish_channel_members(&node, &peer_metadata, &current_channel, &current_topic, &tx_ui_event);
-                                        println!("🚀 Você entrou no canal [#{}]!", current_channel);
-                                    }
-                                }
-                                continue;
-                            }
-                            ChatAction::SendFile { recipient_query, file_path } => {
-                                // 1. Tenta encontrar a chave pública do destinatário buscando por Nickname ou PubKey
-                                let target_pubkey = peer_metadata.values().find_map(|(nick, pubkey)| {
-                                    if nick.eq_ignore_ascii_case(&recipient_query) || pubkey.starts_with(&recipient_query) {
-                                        Some(pubkey.clone())
-                                    } else {
-                                        None
-                                    }
-                                });
-
-                                let recipient_pubkey = match target_pubkey {
-                                    Some(pk) => pk,
-                                    None => {
-                                        println!("❌ Destinatário '{}' não encontrado entre os pares conectados.", recipient_query);
-                                        println!("💡 Dica: Use /peers para ver apelidos e IDs dos pares.");
+                                if let Some(server) = active.server_id().and_then(|id| servers.get(id)) {
+                                    let me = identity.public_key_hex();
+                                    if server.is_banned(&me, now_secs()) {
+                                        ui_log(&tx_ui_event, "⛔ Você está banido deste servidor: os outros membros ignoram suas mensagens.");
                                         continue;
                                     }
-                                };
-
-                                // 2. Lê o arquivo local em bytes
-                                let p = std::path::Path::new(&file_path);
-                                match std::fs::read(p) {
-                                    Ok(data) => {
-                                        let file_size = data.len() as u64;
-                                        let file_hash = calculate_file_hash(&data);
-                                        let file_name = p.file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or("arquivo.bin")
-                                            .to_string();
-
-                                        let chunks = chunk_file(&file_hash, &data);
-                                        let total_chunks = chunks.len() as u32;
-
-                                        let offer = FileOffer {
-                                            file_hash: file_hash.clone(),
-                                            file_name: file_name.clone(),
-                                            file_size,
-                                            total_chunks,
-                                            sender_pubkey: identity.public_key_hex(),
-                                            sender_name: my_nick.clone(),
-                                            recipient_pubkey: recipient_pubkey.clone(),
-                                        };
-
-                                        // Salva localmente em pendentes aguardando confirmação do par
-                                        pending_outgoing_files.insert(file_hash.clone(), (file_name.clone(), data));
-
-                                        let msg = FileTransferMessage::Offer(offer);
-                                        if let Ok(bytes) = msg.to_bytes() {
-                                            let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
-                                            println!("📦 Proposta de envio enviada para o par [{}]:", recipient_query);
-                                            println!("   📄 Arquivo : {}", file_name);
-                                            println!("   📏 Tamanho : {:.2} MB ({} bytes)", file_size as f64 / (1024.0 * 1024.0), file_size);
-                                            println!("   🔑 Hash    : {}", file_hash);
-                                            println!("   ⏳ Aguardando o destinatário aceitar a transferência...");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!("❌ Erro ao ler arquivo '{}': {:?}", file_path, e);
+                                    if !server.is_allowed(&me, now_secs()) {
+                                        ui_log(&tx_ui_event, "🔒 Servidor fechado e você não está na allow-list: suas mensagens são ignoradas.");
+                                        continue;
                                     }
                                 }
-                                continue;
-                            }
-                            ChatAction::AcceptFile(hash_query) => {
-                                // Encontra oferta pelo hash completo ou prefixo
-                                let target_key = pending_incoming_offers.keys().find(|k| k.starts_with(&hash_query)).cloned();
-                                if let Some(hash) = target_key {
-                                    if let Some(offer) = pending_incoming_offers.remove(&hash) {
-                                        // Cria o receptor de chunks ativo
-                                        active_file_receivers.insert(
-                                            hash.clone(),
-                                            FileReceiver::new(offer.file_name.clone(), offer.file_size, offer.total_chunks),
-                                        );
-
-                                        // Envia sinal de decisão positiva
-                                        let decision = FileDecision {
-                                            file_hash: hash.clone(),
-                                            accepted: true,
-                                            responder_pubkey: identity.public_key_hex(),
-                                        };
-                                        let msg = FileTransferMessage::Decision(decision);
-                                        if let Ok(bytes) = msg.to_bytes() {
-                                            let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
-                                            println!("✅ Você ACEITOU o arquivo '{}' de {}. Aguardando blocos P2P...", offer.file_name, offer.sender_name);
-                                        }
-                                    }
-                                } else {
-                                    println!("⚠️ Nenhuma oferta de arquivo pendente com hash correspondente a '{}'.", hash_query);
-                                }
-                                continue;
-                            }
-                            ChatAction::RejectFile(hash_query) => {
-                                let target_key = pending_incoming_offers.keys().find(|k| k.starts_with(&hash_query)).cloned();
-                                if let Some(hash) = target_key {
-                                    if let Some(offer) = pending_incoming_offers.remove(&hash) {
-                                        let decision = FileDecision {
-                                            file_hash: hash.clone(),
-                                            accepted: false,
-                                            responder_pubkey: identity.public_key_hex(),
-                                        };
-                                        let msg = FileTransferMessage::Decision(decision);
-                                        if let Ok(bytes) = msg.to_bytes() {
-                                            let _ = node.swarm.behaviour_mut().gossipsub.publish(files_topic.clone(), bytes);
-                                            println!("❌ Você REJEITOU o arquivo '{}' de {}.", offer.file_name, offer.sender_name);
-                                        }
-                                    }
-                                } else {
-                                    println!("⚠️ Nenhuma oferta de arquivo pendente com hash correspondente a '{}'.", hash_query);
-                                }
-                                continue;
-                            }
-                            ChatAction::ScreenList => {
-                                let screens = ScreenCaptureEngine::list_screens();
-                                println!("\n📺 --- TELAS / MONITORES DETECTADOS ({}) ---", screens.len());
-                                for (i, s) in screens.iter().enumerate() {
-                                    println!("  [{}] {} ({}x{}){}", i, s.name, s.width, s.height, if s.is_primary { " (Primária)" } else { "" });
-                                }
-                                println!("-----------------------------------------------\n");
-                                continue;
-                            }
-                            ChatAction::ScreenStart { monitor_idx, quality } => {
-                                if screen_capture_engine.is_streaming() {
-                                    println!("⚠️  Você já está transmitindo sua tela. Use /screen stop para parar.");
-                                } else {
-                                    let max_width = max_width_for_quality(quality);
-                                    let stream_id = format!("screen:{}", &identity.public_key_hex()[..8]);
-                                    let tx_frame = tx_screen_out.clone();
-                                    screen_capture_engine.start_capture(
-                                        stream_id.clone(),
-                                        identity.public_key_hex(),
-                                        my_nick.clone(),
-                                        monitor_idx,
-                                        30, // 30 FPS com H.264
-                                        max_width,
-                                        move |pkt| {
-                                            let _ = tx_frame.send(pkt);
-                                        },
-                                    );
-                                    println!("📺 Transmissão H.264 (30 FPS, {}p) INICIADA (Stream ID: {}). Use /screen stop para encerrar.", quality, stream_id);
-                                }
-                                continue;
-                            }
-                            ChatAction::ScreenStop => {
-                                if screen_capture_engine.is_streaming() {
-                                    screen_capture_engine.stop_capture();
-                                    println!("📺 Transmissão de tela ENCERRADA.");
-                                } else {
-                                    println!("⚠️  Nenhuma transmissão de tela em andamento.");
-                                }
-                                continue;
-                            }
-                            ChatAction::ScreenWatch(target_query) => {
-                                let target_stream = active_screen_streams.iter().find_map(|(sid, (nick, pubkey, _, _, _))| {
-                                    if nick.eq_ignore_ascii_case(&target_query) || sid.starts_with(&target_query) || pubkey.starts_with(&target_query) {
-                                        Some((sid.clone(), nick.clone()))
-                                    } else {
-                                        None
-                                    }
-                                });
-
-                                if let Some((sid, presenter_nick)) = target_stream {
-                                    // Cria ou recria o canal com capacidade para que quadros antigos sejam descartados se a janela travar
-                                    let (tx_vf, rx_vf) = std::sync::mpsc::sync_channel::<(p2p_core::screen::VideoCodec, Vec<u8>)>(VIEWER_QUEUE_FRAMES);
-                                    let rx_vf_arc = Arc::new(std::sync::Mutex::new(rx_vf));
-                                    tx_viewer_frame_opt = Some(tx_vf);
-
-                                    current_watching_stream = Some(sid.clone());
-                                    viewer_gate = KeyframeGate::new();
-                                    screen_viewer_active.store(true, Ordering::SeqCst);
-                                    ScreenViewer::spawn_window(
-                                        presenter_nick.clone(),
-                                        1280,
-                                        720,
-                                        rx_vf_arc,
-                                        Arc::clone(&screen_viewer_active),
-                                    );
-                                    println!("📺 Assistindo transmissão de '{}'. Pressione ESC na janela para fechar.", presenter_nick);
-                                } else {
-                                    println!("⚠️ Nenhuma tela ativa encontrada para '{}'. Verifique os pares ou aguarde.", target_query);
-                                }
-                                continue;
-                            }
-                            ChatAction::SendTextMessage(trimmed) => {
-                                // Cria mensagem assinada
                                 let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-                                let payload = format!("{}:{}:{}", current_channel, trimmed, now);
-                                let signature = identity.sign(payload.as_bytes()).to_vec();
-
-                                let msg = ChatMessage {
-                                    channel_id: current_channel.clone(),
-                                    author_pubkey: identity.public_key_hex(),
-                                    author_name: my_nick.clone(),
-                                    text: trimmed.clone(),
-                                    timestamp: now,
-                                    signature,
-                                };
-
+                                let msg = ChatMessage::new_signed(&identity, &active.channel, &trimmed, now);
                                 if let Ok(json_bytes) = serde_json::to_vec(&msg) {
-                                    if let Err(e) = node.swarm.behaviour_mut().gossipsub.publish(current_topic.clone(), json_bytes) {
-                                        println!("⚠️  Aguardando outros pares na sala para enviar mensagem... ({:?})", e);
-                                    } else {
-                                        println!("💬 [Você]: {}", trimmed);
-                                    }
+                                    let _ = node.swarm.behaviour_mut().gossipsub.publish(active.topic.clone(), json_bytes);
                                 }
                             }
                         }
-                    }
-                    Ok(None) if !args.daemon => break,
-                    Ok(None) => {
-                        // No modo daemon stdin está vazio (/dev/null), NÃO deve encerrar o processo!
-                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                    }
-                    Err(e) => {
-                        eprintln!("Erro ao ler entrada: {:?}", e);
-                        break;
                     }
                 }
             }
@@ -1288,7 +1027,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             relay_manager.remove_peer(&peer_id);
                             if peer_metadata.contains_key(&peer_id) {
                                 let _ = tx_ui_event.send(UiEvent::PeerDisconnected(peer_id.to_string()));
-                                publish_channel_members(&node, &peer_metadata, &current_channel, &current_topic, &tx_ui_event);
+                                publish_channel_members(&node, &peer_metadata, &active.channel, &active.topic, &tx_ui_event);
                             }
                             if args.daemon && peer_metadata.contains_key(&peer_id) {
                                 println!("👋 Conexão fechada com: {} (Motivo: {:?})", peer_id, cause);
@@ -1323,31 +1062,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if args.daemon {
                                 println!("✨ Identidade confirmada: {} é '{}' (User ID: {})", peer_id, nick, pubkey);
                             }
-                            publish_channel_members(&node, &peer_metadata, &current_channel, &current_topic, &tx_ui_event);
+                            publish_channel_members(&node, &peer_metadata, &active.channel, &active.topic, &tx_ui_event);
                         }
                     }
                     // Presença na sala: um par entrou ou saiu de algum tópico Gossipsub
                     libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(
-                        libp2p::gossipsub::Event::Subscribed { topic, .. }
-                        | libp2p::gossipsub::Event::Unsubscribed { topic, .. }
+                        libp2p::gossipsub::Event::Subscribed { peer_id, topic }
                     )) => {
-                        if topic == current_topic.hash() {
-                            publish_channel_members(&node, &peer_metadata, &current_channel, &current_topic, &tx_ui_event);
+                        if topic == active.topic.hash() {
+                            publish_channel_members(&node, &peer_metadata, &active.channel, &active.topic, &tx_ui_event);
+                        }
+                        // Alguém entrou no tópico de controle de um servidor que conhecemos: entrega a cadeia
+                        // (servidor fechado: só para quem está na allow-list)
+                        if let Some(server_id) = community::parse_server_control_topic(topic.as_str()).map(str::to_string) {
+                            let recently = last_snapshot_reply.get(&server_id).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2));
+                            let peer_pubkey = pubkey_hex_from_peer_id(&peer_id);
+                            let allowed = servers
+                                .get(&server_id)
+                                .is_some_and(|s| peer_pubkey.as_deref().is_some_and(|pk| s.is_allowed(pk, now_secs())));
+                            if !recently && allowed {
+                                let snapshot = servers.snapshot(&server_id);
+                                if !snapshot.is_empty() {
+                                    for m in &snapshot {
+                                        publish_server_message(&mut node, &server_id, m);
+                                    }
+                                    last_snapshot_reply.insert(server_id, std::time::Instant::now());
+                                }
+                            }
+                        }
+                    }
+                    libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(
+                        libp2p::gossipsub::Event::Unsubscribed { topic, .. }
+                    )) => {
+                        if topic == active.topic.hash() {
+                            publish_channel_members(&node, &peer_metadata, &active.channel, &active.topic, &tx_ui_event);
                         }
                     }
                     libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(
                         libp2p::gossipsub::Event::Message { message, .. }
                     )) => {
+                        // 0. Tópico de controle de servidor: blocos da cadeia, ações de moderadores e pedidos
+                        if let Some(server_id) = community::parse_server_control_topic(message.topic.as_str()).map(str::to_string) {
+                            let from_pubkey = message.source.as_ref().and_then(pubkey_hex_from_peer_id);
+                            handle_server_network_message(
+                                &server_id,
+                                &message.data,
+                                from_pubkey.as_deref(),
+                                &mut node,
+                                &mut servers,
+                                &mut active,
+                                &mut pending_switch,
+                                &identity,
+                                &peer_metadata,
+                                &tx_ui_event,
+                            );
+                        }
                         // 1. Tenta decodificar como mensagem de chat de texto
-                        if let Ok(chat_msg) = serde_json::from_slice::<ChatMessage>(&message.data) {
+                        else if let Ok(chat_msg) = serde_json::from_slice::<ChatMessage>(&message.data) {
                             if chat_msg.author_pubkey != identity.public_key_hex() {
-                                let _ = tx_ui_event.send(UiEvent::ChatMessage {
-                                    channel: chat_msg.channel_id.clone(),
-                                    author: chat_msg.author_name.clone(),
-                                    text: chat_msg.text.clone(),
-                                });
-                                if args.daemon {
-                                    println!("\n📩 [#{}] {}: {}", chat_msg.channel_id, chat_msg.author_name, chat_msg.text);
+                                let server = active.server_id().and_then(|id| servers.get(id));
+                                let banned = server.is_some_and(|s| s.is_banned(&chat_msg.author_pubkey, now_secs()));
+                                let outside = server.is_some_and(|s| !s.is_allowed(&chat_msg.author_pubkey, now_secs()));
+                                if !chat_msg.verify(message.source.as_ref()) {
+                                    // Assinatura inválida ou publicada por outro par que não o autor
+                                    tracing::debug!("Mensagem de chat não autêntica descartada (autor alegado: {})", chat_msg.author_name);
+                                } else if banned {
+                                    tracing::debug!("Mensagem de usuário banido descartada: {}", chat_msg.author_name);
+                                } else if outside {
+                                    tracing::debug!("Mensagem de quem está fora da allow-list descartada: {}", chat_msg.author_name);
+                                } else {
+                                    let _ = tx_ui_event.send(UiEvent::ChatMessage {
+                                        channel: chat_msg.channel_id.clone(),
+                                        author: chat_msg.author_name.clone(),
+                                        text: chat_msg.text.clone(),
+                                    });
+                                    if args.daemon {
+                                        println!("\n📩 [#{}] {}: {}", chat_msg.channel_id, chat_msg.author_name, chat_msg.text);
+                                    }
+                                    if let Some(invite) = parse_invite(&chat_msg.text) {
+                                        if servers.get(&invite).is_none() {
+                                            ui_log(&tx_ui_event, format!("💡 Convite de {}: digite /server accept para entrar", chat_msg.author_name));
+                                        }
+                                        last_invite = Some(invite);
+                                    }
                                 }
                             }
                         }
@@ -1614,6 +1411,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if !args.no_auto_bootstrap {
                             node.dht_start_providing();
+                            // Anuncia também os servidores acompanhados, para novos membros nos acharem pela DHT
+                            for id in servers.list().filter(|s| s.has_chain()).map(|s| s.server_id.clone()).collect::<Vec<_>>() {
+                                node.dht_provide(server_dht_key(&id));
+                            }
                         }
                     }
                     libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Autonat(
@@ -1703,6 +1504,602 @@ fn publish_channel_members(
         channel: channel.to_string(),
         members,
     });
+}
+
+/// Pasta dos servidores acompanhados: `<identidade>.servers/`, ao lado do arquivo de identidade.
+/// Cada identidade tem a sua (ex.: alice.json -> alice.servers/), para nós na mesma pasta não
+/// compartilharem chaves de dono.
+fn servers_dir_for(identity_file: &Path) -> PathBuf {
+    let stem = identity_file.file_stem().and_then(|s| s.to_str()).unwrap_or("identity");
+    identity_file.with_file_name(format!("{}.servers", stem))
+}
+
+/// Agora, em segundos Unix (UTC)
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default()
+}
+
+/// Data UTC legível ("2026-11-02 18:20 UTC"), sem depender de biblioteca de datas
+fn fmt_utc(secs: u64) -> String {
+    // Algoritmo de datas civis de Howard Hinnant (dias desde 1970-01-01 -> ano/mês/dia)
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02} {:02}:{:02} UTC", year, month, day, rem / 3600, rem % 3600 / 60)
+}
+
+fn ui_log(tx_ui_event: &UnboundedSender<UiEvent>, message: impl Into<String>) {
+    let _ = tx_ui_event.send(UiEvent::SystemLog(message.into()));
+}
+
+/// Passa a ouvir o tópico de controle do servidor (cadeia e moderação)
+fn follow_server(node: &mut P2PNode, server_id: &str) {
+    let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&IdentTopic::new(server_control_topic(server_id)));
+}
+
+/// Publica no tópico de controle do servidor. Falha (sem ninguém no tópico) é normal e ignorada.
+fn publish_server_message(node: &mut P2PNode, server_id: &str, message: &ServerMessage) -> bool {
+    let Ok(bytes) = message.to_bytes() else { return false };
+    node.swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(server_control_topic(server_id)), bytes).is_ok()
+}
+
+/// Nome e canais do espaço, no formato da TUI
+fn space_view(servers: &ServerRegistry, space: &Space) -> (String, Vec<(String, bool)>) {
+    match space {
+        Space::Lobby => ("🌐 Lobby".to_string(), Vec::new()),
+        Space::Server(id) => match servers.get(id) {
+            Some(server) => (
+                format!("🏰 {}", server.name()),
+                server.channels().into_iter().map(|c| (c.name, c.channel_type == ChannelType::Voice)).collect(),
+            ),
+            None => (format!("🏰 {}", short_id(id)), Vec::new()),
+        },
+    }
+}
+
+/// Atualiza na TUI o nome, os canais e os membros do espaço atual
+fn refresh_space(
+    node: &P2PNode,
+    servers: &ServerRegistry,
+    active: &ActiveChannel,
+    peer_metadata: &HashMap<PeerId, (String, String)>,
+    tx_ui_event: &UnboundedSender<UiEvent>,
+) {
+    let (space_name, channels) = space_view(servers, &active.space);
+    let is_server = active.server_id().is_some();
+    let _ = tx_ui_event.send(UiEvent::SpaceChanged { space_name, channels, is_server });
+    publish_servers(servers, active, tx_ui_event);
+    publish_channel_members(node, peer_metadata, &active.channel, &active.topic, tx_ui_event);
+}
+
+/// Envia à TUI a lista de servidores (menu "Trocar de espaço")
+fn publish_servers(servers: &ServerRegistry, active: &ActiveChannel, tx_ui_event: &UnboundedSender<UiEvent>) {
+    let entries = servers
+        .list()
+        .map(|s| ServerEntry {
+            name: s.name(),
+            id: s.server_id.clone(),
+            current: active.server_id() == Some(s.server_id.as_str()),
+            owner: s.is_owner(),
+            pending: !s.has_chain(),
+        })
+        .collect();
+    let _ = tx_ui_event.send(UiEvent::ServersChanged(entries));
+}
+
+/// Entra num canal de texto de um espaço (Lobby ou servidor) e atualiza a TUI
+fn enter_channel(
+    node: &mut P2PNode,
+    servers: &ServerRegistry,
+    active: &mut ActiveChannel,
+    space: Space,
+    channel: String,
+    peer_metadata: &HashMap<PeerId, (String, String)>,
+    tx_ui_event: &UnboundedSender<UiEvent>,
+) {
+    if let Err(e) = active.switch(&mut node.swarm.behaviour_mut().gossipsub, space, channel.clone()) {
+        ui_log(tx_ui_event, format!("❌ Erro ao entrar no canal #{}: {:?}", channel, e));
+        return;
+    }
+    let _ = tx_ui_event.send(UiEvent::ChannelChanged(active.channel.clone()));
+    refresh_space(node, servers, active, peer_metadata, tx_ui_event);
+    let (space_name, _) = space_view(servers, &active.space);
+    ui_log(tx_ui_event, format!("🚀 {} #{}", space_name, active.channel));
+}
+
+/// Primeiro canal de texto do servidor (ou "geral")
+fn default_channel(servers: &ServerRegistry, server_id: &str) -> String {
+    servers.get(server_id).and_then(|s| s.default_text_channel()).unwrap_or_else(|| "geral".to_string())
+}
+
+/// Encontra a pubkey de um par por nick, prefixo da pubkey (6+ caracteres) ou a pubkey completa
+fn resolve_pubkey(query: &str, peer_metadata: &HashMap<PeerId, (String, String)>) -> Option<String> {
+    if community::is_valid_server_id(query) {
+        return Some(query.to_string());
+    }
+    peer_metadata
+        .values()
+        .find(|(nick, pubkey)| nick.eq_ignore_ascii_case(query) || (query.len() >= 6 && pubkey.starts_with(query)))
+        .map(|(_, pubkey)| pubkey.clone())
+}
+
+/// Nick conhecido de uma pubkey, ou o início dela
+fn nick_for(pubkey: &str, peer_metadata: &HashMap<PeerId, (String, String)>, identity: &UserIdentity) -> String {
+    if pubkey == identity.public_key_hex() {
+        return identity.profile.display_name.clone();
+    }
+    peer_metadata
+        .values()
+        .find(|(_, pk)| pk == pubkey)
+        .map(|(nick, _)| nick.clone())
+        .unwrap_or_else(|| short_id(pubkey).to_string())
+}
+
+/// Entra (ou volta) num servidor pelo id. Se a cadeia ainda não chegou, pede aos membros
+/// e entra automaticamente quando ela chegar.
+#[allow(clippy::too_many_arguments)]
+fn join_server(
+    server_id: &str,
+    node: &mut P2PNode,
+    servers: &mut ServerRegistry,
+    active: &mut ActiveChannel,
+    pending_switch: &mut Option<String>,
+    peer_metadata: &HashMap<PeerId, (String, String)>,
+    tx_ui_event: &UnboundedSender<UiEvent>,
+) {
+    if let Err(e) = servers.join(server_id) {
+        ui_log(tx_ui_event, format!("❌ {}", e));
+        return;
+    }
+    follow_server(node, server_id);
+    if servers.get(server_id).is_some_and(|s| s.has_chain()) {
+        let channel = default_channel(servers, server_id);
+        enter_channel(node, servers, active, Space::Server(server_id.to_string()), channel, peer_metadata, tx_ui_event);
+    } else {
+        *pending_switch = Some(server_id.to_string());
+        node.dht_find(server_dht_key(server_id));
+        if let Some(request) = servers.chain_request(server_id) {
+            publish_server_message(node, server_id, &request);
+        }
+        ui_log(
+            tx_ui_event,
+            format!(
+                "⏳ Procurando membros online do servidor {}... você entra assim que a configuração chegar \
+                 (servidor fechado: é preciso estar na allow-list).",
+                short_id(server_id)
+            ),
+        );
+    }
+}
+
+/// Executa um comando `/server ...` da TUI
+#[allow(clippy::too_many_arguments)]
+fn run_server_command(
+    cmd: ServerCommand,
+    node: &mut P2PNode,
+    servers: &mut ServerRegistry,
+    active: &mut ActiveChannel,
+    pending_switch: &mut Option<String>,
+    last_invite: &Option<String>,
+    identity: &UserIdentity,
+    peer_metadata: &HashMap<PeerId, (String, String)>,
+    tx_ui_event: &UnboundedSender<UiEvent>,
+) {
+    let now = now_secs();
+    let current = active.server_id().map(str::to_string);
+    let need_server = || {
+        if current.is_none() {
+            ui_log(tx_ui_event, "Você está no 🌐 Lobby. Entre num servidor primeiro (/server list, /server switch <nome>).");
+        }
+        current.clone()
+    };
+    // Publica uma alteração bem-sucedida, atualiza a tela e registra o resultado
+    let publish_change = |node: &mut P2PNode, servers: &ServerRegistry, active: &ActiveChannel, id: &str, result: Result<ServerMessage, community::CommunityError>, ok: String| {
+        match result {
+            Ok(message) => {
+                publish_server_message(node, id, &message);
+                refresh_space(node, servers, active, peer_metadata, tx_ui_event);
+                ui_log(tx_ui_event, ok);
+            }
+            Err(e) => ui_log(tx_ui_event, format!("❌ {}", e)),
+        }
+    };
+
+    match cmd {
+        ServerCommand::Help => ui_log(tx_ui_event, SERVER_HELP),
+        ServerCommand::Create(name) => match servers.create(&name, &identity.public_key_hex(), now) {
+            Ok(id) => {
+                follow_server(node, &id);
+                ui_log(
+                    tx_ui_event,
+                    format!("🏰 Servidor '{}' criado (id {}). Você é o dono (nível 0). Use /server invite para convidar.", name, short_id(&id)),
+                );
+                let channel = default_channel(servers, &id);
+                enter_channel(node, servers, active, Space::Server(id), channel, peer_metadata, tx_ui_event);
+            }
+            Err(e) => ui_log(tx_ui_event, format!("❌ {}", e)),
+        },
+        ServerCommand::Join(id) => join_server(id.trim(), node, servers, active, pending_switch, peer_metadata, tx_ui_event),
+        ServerCommand::Accept => match last_invite {
+            Some(id) => join_server(id, node, servers, active, pending_switch, peer_metadata, tx_ui_event),
+            None => ui_log(tx_ui_event, "Nenhum convite recebido ainda. Peça para alguém usar /server invite no Lobby."),
+        },
+        ServerCommand::Leave => {
+            let Some(id) = need_server() else { return };
+            let name = servers.get(&id).map(|s| s.name()).unwrap_or_default();
+            let was_owner = servers.get(&id).is_some_and(|s| s.is_owner());
+            servers.leave(&id);
+            let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&IdentTopic::new(server_control_topic(&id)));
+            enter_channel(node, servers, active, Space::Lobby, "geral".to_string(), peer_metadata, tx_ui_event);
+            let note = if was_owner { " A chave de dono continua salva em disco." } else { "" };
+            ui_log(tx_ui_event, format!("👋 Você saiu do servidor '{}'.{}", name, note));
+        }
+        ServerCommand::List => {
+            let marker = |on: bool| if on { "▶" } else { " " };
+            ui_log(tx_ui_event, format!("{} 🌐 Lobby  (/server switch lobby)", marker(active.space == Space::Lobby)));
+            if servers.list().next().is_none() {
+                ui_log(tx_ui_event, "  Nenhum servidor. Crie com /server create <nome> ou aceite um convite.");
+            }
+            let me = identity.public_key_hex();
+            for server in servers.list() {
+                let mut tags = Vec::new();
+                if server.is_owner() {
+                    tags.push("dono".to_string());
+                } else if let Some(level) = server.level_of(&me, now) {
+                    tags.push(format!("moderador n{}", level));
+                }
+                if !server.has_chain() {
+                    tags.push("aguardando configuração".into());
+                } else {
+                    if server.chain().state().closed {
+                        tags.push("fechado".into());
+                    }
+                    if server.is_banned(&me, now) {
+                        tags.push("banido".into());
+                    }
+                }
+                let on = current.as_deref() == Some(server.server_id.as_str());
+                let tags = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) };
+                ui_log(tx_ui_event, format!("{} 🏰 {} ({}){}", marker(on), server.name(), short_id(&server.server_id), tags));
+            }
+        }
+        ServerCommand::Info => {
+            let Some(id) = need_server() else { return };
+            let Some(server) = servers.get(&id) else { return };
+            let state = server.effective_state(now);
+            let head = server.chain().head();
+            ui_log(
+                tx_ui_event,
+                format!(
+                    "🏰 {} | bloco {} ({}) | id {}",
+                    server.name(),
+                    head.map_or(0, |b| b.body.height),
+                    head.map_or_else(String::new, |b| fmt_utc(b.body.timestamp)),
+                    id
+                ),
+            );
+            let channels: Vec<String> = server
+                .channels()
+                .iter()
+                .map(|c| format!("{}{}", if c.channel_type == ChannelType::Voice { "🔊 " } else { "#" }, c.name))
+                .collect();
+            ui_log(tx_ui_event, format!("   Canais: {}", channels.join(", ")));
+            let me = identity.public_key_hex();
+            let my_role = match state.level_of(&me, now) {
+                Some(0) => "dono (nível 0)".to_string(),
+                Some(level) => format!("moderador nível {}", level),
+                None if server.is_owner() => "dono (nível 0)".to_string(),
+                None => "membro".to_string(),
+            };
+            let access = if state.closed { format!("fechado, {} na allow-list", state.allow_list.len()) } else { "aberto".to_string() };
+            ui_log(tx_ui_event, format!("   Você: {} | Acesso: {}", my_role, access));
+            let mods: Vec<String> = state
+                .moderators(now)
+                .iter()
+                .map(|(pk, level, until)| format!("{} (n{}, até {})", nick_for(pk, peer_metadata, identity), level, fmt_utc(*until)))
+                .collect();
+            ui_log(tx_ui_event, format!("   Moderadores: {}", if mods.is_empty() { "nenhum".to_string() } else { mods.join(", ") }));
+            let bans: Vec<String> = state
+                .active_bans(now)
+                .iter()
+                .map(|(pk, ban)| {
+                    let until = ban.until.map_or("permanente".to_string(), |u| format!("até {}", fmt_utc(u)));
+                    format!("{} ({}, por n{})", nick_for(pk, peer_metadata, identity), until, ban.by_level)
+                })
+                .collect();
+            ui_log(tx_ui_event, format!("   Banidos: {}", if bans.is_empty() { "nenhum".to_string() } else { bans.join(", ") }));
+            ui_log(
+                tx_ui_event,
+                format!(
+                    "   Certificados: validade {}, renovação nos últimos {} | Ações aguardando o dono: {}",
+                    format_duration(Some(state.cert_validity_secs)),
+                    format_duration(Some(state.renewal_window_secs)),
+                    server.pending_actions().count()
+                ),
+            );
+        }
+        ServerCommand::History => {
+            let Some(id) = need_server() else { return };
+            let history = servers.history(&id);
+            ui_log(tx_ui_event, format!("📜 Histórico de alterações ({} blocos, mais recentes por último):", history.len()));
+            for entry in history.iter().skip(history.len().saturating_sub(15)) {
+                ui_log(tx_ui_event, format!("   #{} {} — {}", entry.height, fmt_utc(entry.timestamp), entry.description));
+            }
+        }
+        ServerCommand::Switch(query) => {
+            if query.eq_ignore_ascii_case("lobby") {
+                enter_channel(node, servers, active, Space::Lobby, "geral".to_string(), peer_metadata, tx_ui_event);
+                return;
+            }
+            match servers.find(&query).map(|s| (s.server_id.clone(), s.has_chain())) {
+                Some((id, true)) => {
+                    let channel = default_channel(servers, &id);
+                    enter_channel(node, servers, active, Space::Server(id), channel, peer_metadata, tx_ui_event);
+                }
+                Some((id, false)) => {
+                    *pending_switch = Some(id.clone());
+                    ui_log(tx_ui_event, format!("⏳ A configuração de {} ainda não chegou; você entra assim que chegar.", short_id(&id)));
+                }
+                None => ui_log(tx_ui_event, format!("❌ Servidor '{}' não encontrado. Veja /server list.", query)),
+            }
+        }
+        ServerCommand::Invite => {
+            let Some(id) = need_server() else { return };
+            let name = servers.get(&id).map(|s| s.name()).unwrap_or_default();
+            let invite = ChatMessage::new_signed(identity, "geral", &invite_text(&name, &id), now);
+            let lobby = IdentTopic::new(community::channel_topic(&Space::Lobby, "geral"));
+            let sent = serde_json::to_vec(&invite)
+                .ok()
+                .is_some_and(|bytes| node.swarm.behaviour_mut().gossipsub.publish(lobby, bytes).is_ok());
+            if sent {
+                ui_log(tx_ui_event, format!("📨 Convite para '{}' publicado no 🌐 Lobby #geral. Quem estiver lá digita /server accept.", name));
+            } else {
+                ui_log(tx_ui_event, format!("⚠️ Ninguém no 🌐 Lobby #geral agora. Id do servidor para convite manual: {}", id));
+            }
+            if servers.get(&id).is_some_and(|s| s.chain().state().closed) {
+                ui_log(tx_ui_event, "🔒 Servidor fechado: admita a pessoa com /server allow <par> para ela conseguir entrar.");
+            }
+        }
+        ServerCommand::AddChannel { name, voice } => {
+            let Some(id) = need_server() else { return };
+            let kind = if voice { ChannelType::Voice } else { ChannelType::Text };
+            let result = servers.add_channel(&id, &name, kind, now);
+            publish_change(node, servers, active, &id, result, format!("✅ Canal {}{} criado.", if voice { "🔊 " } else { "#" }, name));
+        }
+        ServerCommand::RemoveChannel(name) => {
+            let Some(id) = need_server() else { return };
+            let result = servers.remove_channel(&id, &name, now);
+            publish_change(node, servers, active, &id, result, format!("🗑️ Canal {} removido.", name));
+        }
+        ServerCommand::AddModerator { target, level } => {
+            let Some(id) = need_server() else { return };
+            let Some(pubkey) = resolve_pubkey(&target, peer_metadata) else {
+                ui_log(tx_ui_event, format!("❌ Par '{}' não encontrado. Use o nick de alguém conectado ou a pubkey completa.", target));
+                return;
+            };
+            let validity = servers.get(&id).map_or(0, |s| s.chain().state().cert_validity_secs);
+            let result = servers.add_moderator(&id, &pubkey, level, now);
+            let who = nick_for(&pubkey, peer_metadata, identity);
+            publish_change(
+                node,
+                servers,
+                active,
+                &id,
+                result,
+                format!("🛡️ {} agora é moderador nível {} (certificado de {}, renovado automaticamente).", who, level, format_duration(Some(validity))),
+            );
+        }
+        ServerCommand::RemoveModerator(target) => {
+            let Some(id) = need_server() else { return };
+            let Some(pubkey) = resolve_pubkey(&target, peer_metadata) else {
+                ui_log(tx_ui_event, format!("❌ Par '{}' não encontrado.", target));
+                return;
+            };
+            let result = servers.remove_moderator(&id, &pubkey, now);
+            let who = nick_for(&pubkey, peer_metadata, identity);
+            publish_change(
+                node,
+                servers,
+                active,
+                &id,
+                result,
+                format!("🛡️ Certificado de {} revogado. Ações dele ainda não consolidadas serão desfeitas.", who),
+            );
+        }
+        ServerCommand::Close | ServerCommand::Open => {
+            let Some(id) = need_server() else { return };
+            let closing = matches!(cmd, ServerCommand::Close);
+            let result = servers.set_closed(&id, closing, now);
+            let message = if closing {
+                "🔒 Servidor fechado: só dono, moderadores e quem está na allow-list participam. Admita com /server allow <par>."
+            } else {
+                "🔓 Servidor aberto: qualquer um com o id pode entrar."
+            };
+            publish_change(node, servers, active, &id, result, message.to_string());
+        }
+        ServerCommand::Policy { validity, renewal_window } => {
+            let Some(id) = need_server() else { return };
+            let result = servers.set_cert_policy(&id, validity, renewal_window, now);
+            publish_change(
+                node,
+                servers,
+                active,
+                &id,
+                result,
+                format!(
+                    "⏳ Certificados: validade {}, renovação nos últimos {}.",
+                    format_duration(Some(validity)),
+                    format_duration(Some(renewal_window))
+                ),
+            );
+        }
+        ServerCommand::Ban { target, duration, reason } => {
+            let until = duration.map(|d| now + d);
+            moderation_command(ModKind::Ban { until }, &target, &reason, node, servers, active, identity, peer_metadata, tx_ui_event);
+        }
+        ServerCommand::Unban(target) => {
+            moderation_command(ModKind::Unban, &target, "", node, servers, active, identity, peer_metadata, tx_ui_event)
+        }
+        ServerCommand::Allow(target) => {
+            moderation_command(ModKind::Admit, &target, "", node, servers, active, identity, peer_metadata, tx_ui_event)
+        }
+        ServerCommand::Disallow(target) => {
+            moderation_command(ModKind::Unadmit, &target, "", node, servers, active, identity, peer_metadata, tx_ui_event)
+        }
+    }
+}
+
+/// Ban, desban e allow-list. O dono grava direto na cadeia; um moderador publica uma ação
+/// assinada com o próprio certificado, que vale na hora e é consolidada pelo dono depois.
+#[allow(clippy::too_many_arguments)]
+fn moderation_command(
+    kind: ModKind,
+    target: &str,
+    reason: &str,
+    node: &mut P2PNode,
+    servers: &mut ServerRegistry,
+    active: &ActiveChannel,
+    identity: &UserIdentity,
+    peer_metadata: &HashMap<PeerId, (String, String)>,
+    tx_ui_event: &UnboundedSender<UiEvent>,
+) {
+    let Some(id) = active.server_id().map(str::to_string) else {
+        ui_log(tx_ui_event, "Você está no 🌐 Lobby, que não tem moderação. Entre num servidor primeiro.");
+        return;
+    };
+    let Some(pubkey) = resolve_pubkey(target, peer_metadata) else {
+        ui_log(tx_ui_event, format!("❌ Par '{}' não encontrado. Use o nick de alguém conectado ou a pubkey completa.", target));
+        return;
+    };
+    if pubkey == identity.public_key_hex() {
+        ui_log(tx_ui_event, "❌ Você não pode moderar a si mesmo.");
+        return;
+    }
+    let now = now_secs();
+    let owner = servers.get(&id).is_some_and(|s| s.is_owner());
+    let who = nick_for(&pubkey, peer_metadata, identity);
+    let text = match &kind {
+        ModKind::Ban { until } => {
+            format!("🔨 {} foi banido ({}).", who, format_duration(until.map(|u| u.saturating_sub(now))))
+        }
+        ModKind::Unban => format!("🕊️ {} foi desbanido.", who),
+        ModKind::Admit => format!("✅ {} entrou na allow-list.", who),
+        ModKind::Unadmit => format!("🚫 {} saiu da allow-list.", who),
+    };
+    match servers.moderate(&id, identity, kind, &pubkey, reason, now) {
+        Ok(message) => {
+            publish_server_message(node, &id, &message);
+            let note = if owner { " Gravado na cadeia." } else { " Vale agora; fica definitivo quando o dono consolidar." };
+            ui_log(tx_ui_event, format!("{}{}", text, note));
+        }
+        Err(e) => ui_log(tx_ui_event, format!("❌ {}", e)),
+    }
+}
+
+/// Processa uma mensagem do tópico de controle de um servidor
+#[allow(clippy::too_many_arguments)]
+fn handle_server_network_message(
+    topic_server_id: &str,
+    data: &[u8],
+    from_pubkey: Option<&str>,
+    node: &mut P2PNode,
+    servers: &mut ServerRegistry,
+    active: &mut ActiveChannel,
+    pending_switch: &mut Option<String>,
+    identity: &UserIdentity,
+    peer_metadata: &HashMap<PeerId, (String, String)>,
+    tx_ui_event: &UnboundedSender<UiEvent>,
+) {
+    let Ok(message) = ServerMessage::from_bytes(data) else { return };
+    let now = now_secs();
+    let me = identity.public_key_hex();
+    let before = servers.get(topic_server_id).map(|s| (s.has_chain() && s.is_banned(&me, now), s.level_of(&me, now)));
+
+    for event in servers.handle_message(message, from_pubkey, now) {
+        match event {
+            ServerEvent::ChainUpdated { server_id, name, height } => {
+                ui_log(tx_ui_event, format!("📜 '{}' sincronizado (bloco {}).", name, height));
+                if pending_switch.as_deref() == Some(server_id.as_str()) {
+                    *pending_switch = None;
+                    let channel = default_channel(servers, &server_id);
+                    enter_channel(node, servers, active, Space::Server(server_id), channel, peer_metadata, tx_ui_event);
+                } else if active.server_id() == Some(server_id.as_str()) {
+                    refresh_space(node, servers, active, peer_metadata, tx_ui_event);
+                }
+            }
+            ServerEvent::Fork { server_id, height, replaced } => ui_log(
+                tx_ui_event,
+                format!(
+                    "⚠️ Fork na cadeia de {} no bloco {} (a chave do dono foi usada em dois lugares?): {}.",
+                    short_id(&server_id),
+                    height,
+                    if replaced { "adotado o ramo vencedor" } else { "mantido o ramo atual" }
+                ),
+            ),
+            ServerEvent::NeedBlocks { server_id, from_height } => {
+                publish_server_message(node, &server_id, &ServerMessage::ChainRequest { server_id: server_id.clone(), from_height });
+            }
+            ServerEvent::ActionAccepted { server_id, action } => {
+                let name = servers.get(&server_id).map(|s| s.name()).unwrap_or_default();
+                let by = nick_for(action.actor(), peer_metadata, identity);
+                let who = nick_for(&action.body.target, peer_metadata, identity);
+                let what = match action.body.kind {
+                    ModKind::Ban { until } => format!("baniu {} ({})", who, format_duration(until.map(|u| u.saturating_sub(now)))),
+                    ModKind::Unban => format!("desbaniu {}", who),
+                    ModKind::Admit => format!("admitiu {}", who),
+                    ModKind::Unadmit => format!("removeu {} da allow-list", who),
+                };
+                let reason = if action.body.reason.is_empty() { String::new() } else { format!(" — motivo: {}", action.body.reason) };
+                ui_log(tx_ui_event, format!("🔨 [{}] {} {}{}", name, by, what, reason));
+            }
+            ServerEvent::ActionsUndone { server_id, count } => {
+                let name = servers.get(&server_id).map(|s| s.name()).unwrap_or_default();
+                ui_log(
+                    tx_ui_event,
+                    format!("↩️ [{}] {} ação(ões) de moderação desfeita(s): o certificado do moderador foi revogado ou expirou.", name, count),
+                );
+            }
+            ServerEvent::Reply { server_id, messages } => {
+                for m in &messages {
+                    publish_server_message(node, &server_id, m);
+                }
+            }
+            ServerEvent::Ignored(reason) => tracing::debug!("Mensagem de servidor ignorada: {}", reason),
+        }
+    }
+
+    // Mudanças que afetam este usuário
+    let (Some((was_banned, was_level)), Some(server)) = (before, servers.get(topic_server_id)) else { return };
+    let name = server.name();
+    let banned = server.has_chain() && server.is_banned(&me, now);
+    if banned != was_banned {
+        ui_log(
+            tx_ui_event,
+            if banned {
+                format!("⛔ Você foi banido de '{}': suas mensagens serão ignoradas pelos membros.", name)
+            } else {
+                format!("🕊️ Seu ban em '{}' acabou.", name)
+            },
+        );
+    }
+    let level = server.level_of(&me, now);
+    if level != was_level && !server.is_owner() {
+        ui_log(
+            tx_ui_event,
+            match level {
+                Some(level) => format!("🛡️ Você agora é moderador nível {} em '{}'.", level, name),
+                None => format!("🛡️ Você não é mais moderador em '{}'.", name),
+            },
+        );
+    }
 }
 
 /// Pede reserva nos relays candidatos que faltam (só age quando o AutoNAT indicou NAT)
@@ -1815,5 +2212,242 @@ mod tests {
         assert!(custom_args.daemon);
         assert!(custom_args.synth_audio);
         assert!(custom_args.no_auto_bootstrap);
+    }
+
+    /// Um nó com o mesmo estado que o loop principal mantém para servidores
+    struct TestPeer {
+        node: P2PNode,
+        identity: UserIdentity,
+        servers: ServerRegistry,
+        active: ActiveChannel,
+        pending: Option<String>,
+        last_invite: Option<String>,
+        meta: HashMap<PeerId, (String, String)>,
+        tx: UnboundedSender<UiEvent>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<UiEvent>,
+    }
+
+    impl TestPeer {
+        fn new(nick: &str) -> Self {
+            let identity = UserIdentity::generate_with_nick(nick);
+            let mut node = P2PNode::new(identity.clone(), 0).unwrap();
+            let active = ActiveChannel::new(Space::Lobby, "geral".to_string());
+            node.swarm.behaviour_mut().gossipsub.subscribe(&active.topic).unwrap();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            Self {
+                node,
+                identity,
+                servers: ServerRegistry::in_memory(),
+                active,
+                pending: None,
+                last_invite: None,
+                meta: HashMap::new(),
+                tx,
+                rx,
+            }
+        }
+
+        fn command(&mut self, input: &str) {
+            let ChatAction::Server(cmd) = parse_user_input(input) else { panic!("não é comando de servidor: {}", input) };
+            run_server_command(
+                cmd,
+                &mut self.node,
+                &mut self.servers,
+                &mut self.active,
+                &mut self.pending,
+                &self.last_invite,
+                &self.identity,
+                &self.meta,
+                &self.tx,
+            );
+        }
+
+        /// Logs mostrados na TUI desde a última chamada
+        fn logs(&mut self) -> Vec<String> {
+            let mut out = Vec::new();
+            while let Ok(ev) = self.rx.try_recv() {
+                if let UiEvent::SystemLog(text) = ev {
+                    out.push(text);
+                }
+            }
+            out
+        }
+
+        /// O mesmo tratamento que o loop principal dá a Identify, controle de servidor e convites
+        fn process(&mut self, event: libp2p::swarm::SwarmEvent<AppBehaviourEvent>) {
+            match event {
+                libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Identify(libp2p::identify::Event::Received {
+                    peer_id,
+                    info,
+                    ..
+                })) => {
+                    if let Some(identity) = parse_agent_version(&info.agent_version) {
+                        self.meta.insert(peer_id, identity);
+                    }
+                }
+                libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message {
+                    message,
+                    ..
+                })) => {
+                    if let Some(server_id) = community::parse_server_control_topic(message.topic.as_str()).map(str::to_string) {
+                        let from_pubkey = message.source.as_ref().and_then(pubkey_hex_from_peer_id);
+                        handle_server_network_message(
+                            &server_id,
+                            &message.data,
+                            from_pubkey.as_deref(),
+                            &mut self.node,
+                            &mut self.servers,
+                            &mut self.active,
+                            &mut self.pending,
+                            &self.identity,
+                            &self.meta,
+                            &self.tx,
+                        );
+                    } else if let Ok(chat) = serde_json::from_slice::<ChatMessage>(&message.data) {
+                        if chat.verify(message.source.as_ref()) {
+                            if let Some(invite) = parse_invite(&chat.text) {
+                                self.last_invite = Some(invite);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Processa eventos dos dois nós até `done` ser verdadeiro. Enquanto Bob espera a cadeia,
+    /// repete o pedido (no app isso é o timer de 5 s).
+    async fn pump(alice: &mut TestPeer, bob: &mut TestPeer, what: &str, done: impl Fn(&TestPeer, &TestPeer) -> bool) {
+        let mut retry = tokio::time::interval(std::time::Duration::from_millis(300));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !done(alice, bob) {
+                tokio::select! {
+                    ev = alice.node.swarm.select_next_some() => alice.process(ev),
+                    ev = bob.node.swarm.select_next_some() => bob.process(ev),
+                    _ = retry.tick() => {
+                        if let Some(request) = bob.pending.clone().and_then(|id| bob.servers.chain_request(&id)) {
+                            let id = bob.pending.clone().unwrap();
+                            publish_server_message(&mut bob.node, &id, &request);
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "tempo esgotado esperando: {}", what);
+    }
+
+    /// Fluxo completo pela rede, com as mesmas funções do loop principal:
+    /// Alice cria o servidor e convida; Bob aceita, recebe a cadeia e entra; Alice certifica Bob
+    /// como moderador, Bob tenta banir a dona (recusado pelo nível), Alice revoga e bane Bob por 1h.
+    #[tokio::test]
+    async fn test_server_invite_join_and_ban_flow() {
+        let mut alice = TestPeer::new("Alice");
+        let mut bob = TestPeer::new("Bob");
+        let bob_addr: libp2p::Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", bob.node.listen_port).parse().unwrap();
+        alice.node.swarm.dial(bob_addr).unwrap();
+
+        let lobby = bob.active.topic.hash();
+        let bob_id = bob.node.peer_id;
+        pump(&mut alice, &mut bob, "Alice identificar Bob no Lobby", |a, _| {
+            a.meta.contains_key(&bob_id)
+                && a.node.swarm.behaviour().gossipsub.all_peers().any(|(p, t)| p == &bob_id && t.contains(&&lobby))
+        })
+        .await;
+
+        // Alice cria o servidor e já entra nele
+        alice.command("/server create Rust Guild");
+        let server_id = alice.servers.list().next().expect("servidor criado").server_id.clone();
+        assert_eq!(alice.active.space, Space::Server(server_id.clone()));
+        assert_eq!(alice.active.channel, "geral");
+        assert!(alice.logs().iter().any(|l| l.contains("criado")));
+
+        // Convite no Lobby -> Bob aceita
+        alice.command("/server invite");
+        assert!(alice.logs().iter().any(|l| l.contains("publicado")), "convite deveria ser publicado no Lobby");
+        let sid = server_id.clone();
+        pump(&mut alice, &mut bob, "convite chegar a Bob", move |_, b| b.last_invite.as_deref() == Some(sid.as_str())).await;
+
+        bob.command("/server accept");
+        assert_eq!(bob.pending.as_deref(), Some(server_id.as_str()), "Bob espera o manifesto");
+        let sid = server_id.clone();
+        pump(&mut alice, &mut bob, "Bob receber a cadeia e entrar", move |_, b| b.active.space == Space::Server(sid.clone()))
+            .await;
+        assert_eq!(bob.servers.get(&server_id).unwrap().name(), "Rust Guild");
+        assert!(bob.pending.is_none());
+        assert!(bob.logs().iter().any(|l| l.contains("sincronizado")));
+
+        // Sem certificado, Bob não modera
+        bob.command("/server ban Alice");
+        assert!(bob.logs().iter().any(|l| l.contains("não tem certificado")));
+
+        // Alice cria um canal e certifica Bob como moderador nível 1
+        alice.command("/server channel add jogos");
+        alice.command("/server mod add Bob");
+        assert!(alice.logs().iter().any(|l| l.contains("agora é moderador nível 1")));
+        let sid = server_id.clone();
+        let bob_pk = bob.identity.public_key_hex();
+        let pk = bob_pk.clone();
+        pump(&mut alice, &mut bob, "canal novo e certificado chegarem a Bob", move |_, b| {
+            let server = b.servers.get(&sid).unwrap();
+            server.has_channel("jogos", ChannelType::Text) && server.level_of(&pk, now_secs()) == Some(1)
+        })
+        .await;
+        assert!(bob.logs().iter().any(|l| l.contains("Você agora é moderador nível 1")));
+
+        // Moderador nível 1 não age sobre a dona (nível 0)
+        bob.command("/server ban Alice");
+        assert!(bob.logs().iter().any(|l| l.contains("nível igual ou superior")), "recusado pela regra de níveis");
+
+        // Alice revoga o certificado e bane Bob por 1 hora
+        alice.command("/server mod remove Bob");
+        alice.command("/server ban Bob 1h spam");
+        assert!(alice.logs().iter().any(|l| l.contains("foi banido (1h)")));
+        let sid = server_id.clone();
+        let pk = bob_pk.clone();
+        pump(&mut alice, &mut bob, "revogação e ban chegarem a Bob", move |_, b| {
+            let server = b.servers.get(&sid).unwrap();
+            server.level_of(&pk, now_secs()).is_none() && server.is_banned(&pk, now_secs())
+        })
+        .await;
+        let logs = bob.logs();
+        assert!(logs.iter().any(|l| l.contains("Você não é mais moderador")), "{:?}", logs);
+        assert!(logs.iter().any(|l| l.contains("Você foi banido")), "{:?}", logs);
+
+        // O histórico (a cadeia) registra tudo, igual para os dois
+        bob.command("/server history");
+        let history = bob.logs().join("\n");
+        assert!(history.contains("criado 'Rust Guild'"), "{}", history);
+        assert!(history.contains("certificado de moderador nível 1"), "{}", history);
+        assert!(history.contains("revogado"), "{}", history);
+        assert!(history.contains("dono baniu"), "{}", history);
+        assert_eq!(
+            alice.servers.get(&server_id).unwrap().chain().head().map(|b| b.hash()),
+            bob.servers.get(&server_id).unwrap().chain().head().map(|b| b.hash()),
+            "mesma cadeia nos dois nós"
+        );
+    }
+
+    #[test]
+    fn test_fmt_utc() {
+        assert_eq!(fmt_utc(0), "1970-01-01 00:00 UTC");
+        assert_eq!(fmt_utc(951_782_400), "2000-02-29 00:00 UTC", "ano bissexto");
+        assert_eq!(fmt_utc(1_800_000_000), "2027-01-15 08:00 UTC");
+    }
+
+    #[test]
+    fn test_server_commands_are_parsed_from_chat_input() {
+        assert_eq!(parse_user_input("/lobby"), ChatAction::Server(ServerCommand::Switch("lobby".into())));
+        assert_eq!(parse_user_input("/server"), ChatAction::Server(ServerCommand::Help));
+        assert_eq!(parse_user_input("/server create Rust Guild"), ChatAction::Server(ServerCommand::Create("Rust Guild".into())));
+        assert_eq!(parse_user_input("/serverx"), ChatAction::SendTextMessage("/serverx".into()));
+    }
+
+    #[test]
+    fn test_servers_dir_is_per_identity() {
+        assert_eq!(servers_dir_for(Path::new("alice.json")), PathBuf::from("alice.servers"));
+        assert_eq!(servers_dir_for(Path::new("dados/bob.json")), PathBuf::from("dados/bob.servers"));
+        assert_ne!(servers_dir_for(Path::new("alice.json")), servers_dir_for(Path::new("bob.json")));
     }
 }
