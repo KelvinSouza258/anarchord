@@ -1,5 +1,3 @@
-version: '3.8'
-
 networks:
   # Rede privada 1: Simula a LAN da casa de Alice (atrás de NAT)
   nat_alice_lan:

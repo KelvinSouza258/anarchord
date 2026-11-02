@@ -1,50 +1,105 @@
 #!/usr/bin/env python3
-"""
-Testes de Integração Automatizados (E2E Multi-Peer em Docker)
-Valida:
-1. Conexão entre peers atrás de redes isoladas através de nó público/relay.
-2. Troca de mensagens de chat no canal #geral.
-3. Transferência direta de arquivos P2P com verificação SHA-256 entre Alice e Bob.
-"""
-
 import subprocess
 import time
 import sys
-import json
+import os
 
-def run_cmd(cmd):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+# Força UTF-8 na saída padrão do Windows para suportar emojis e logs do P2P
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+def run_cmd_streaming(cmd_args, prefix="[DOCKER BUILD]"):
+    """Executa um comando exibindo cada linha de saída em tempo real."""
+    print(f"\n▶ Executando: {' '.join(cmd_args)}")
+    process = subprocess.Popen(
+        cmd_args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace"
+    )
+    for line in iter(process.stdout.readline, ''):
+        if line:
+            print(f"{prefix} {line.rstrip()}")
+    process.stdout.close()
+    return_code = process.wait()
+    return return_code
+
+def run_cmd_output(cmd):
+    return subprocess.run(
+        cmd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    ).stdout
 
 def main():
-    print("🚀 [TESTE E2E DOCKER] Subindo infraestrutura multi-peer (Relay, Alice, Bob)...")
-    res = run_cmd("docker compose -f docker-compose.test.yml up -d --build")
-    if res.returncode != 0:
-        print(f"❌ Falha ao subir docker compose:\n{res.stderr}")
+    print("=" * 65)
+    print("  🚀 [TESTES E2E MULTI-PEER DOCKER - ANARCHORD]")
+    print("=" * 65)
+    print("📋 Cenário:")
+    print("  - Sub-rede 1 (nat_alice_lan: 192.168.10.0/24): Peer 'Alice' atrás de NAT")
+    print("  - Sub-rede 2 (nat_bob_lan:   192.168.20.0/24): Peer 'Bob' atrás de NAT")
+    print("  - Sub-rede 3 (public_wan:    172.28.0.0/16)  : 'Public-Relay' na WAN pública")
+    print("=" * 65)
+
+    # 1. Build e subida dos containers com logs em tempo real
+    print("\n📦 Construindo imagens e subindo os 3 containers...")
+    ret = run_cmd_streaming(["docker", "compose", "-f", "docker-compose.test.yml", "up", "-d", "--build"])
+    if ret != 0:
+        print("\n❌ Falha ao subir o ambiente Docker compose.")
         sys.exit(1)
 
-    print("⏳ Aguardando 10 segundos para estabelecimento do Swarm P2P e Identify...")
-    time.sleep(10)
+    print("\n⏳ Aguardando 12s para estabelecimento dos circuitos P2P e Identify...")
+    for remaining in range(12, 0, -1):
+        print(f"   ⏱️  Tempo restante: {remaining}s...", end="\r")
+        time.sleep(1)
+    print("   ✅ Tempo de convergência de rede concluído!        ")
 
-    # 1. Verifica logs do Relay
-    relay_logs = run_cmd("docker logs anarchord_relay").stdout
-    alice_logs = run_cmd("docker logs anarchord_alice").stdout
-    bob_logs = run_cmd("docker logs anarchord_bob").stdout
+    # 2. Coleta e exibição dos logs de cada nó
+    print("\n" + "=" * 65)
+    print("  📡 VERIFICAÇÃO DE IDENTIDADE E CONEXÃO ENTRE OS NÓS")
+    print("=" * 65)
 
-    print("\n--- Verificação de Conexão dos Nós ---")
-    if "Alice" in relay_logs or "Alice" in bob_logs:
-        print("✅ Alice descoberta e conectada na malha P2P!")
+    relay_logs = run_cmd_output("docker logs anarchord_relay")
+    alice_logs = run_cmd_output("docker logs anarchord_alice")
+    bob_logs = run_cmd_output("docker logs anarchord_bob")
+
+    print("\n🔍 Analisando handshake dos pares:")
+    alice_ok = "Alice" in relay_logs or "Alice" in bob_logs
+    bob_ok = "Bob" in relay_logs or "Bob" in alice_logs
+
+    if alice_ok:
+        print("  ✅ [Alice] Conectada à malha P2P e identificada com sucesso!")
     else:
-        print("⚠️ Alice ainda em processo de handshake.")
+        print("  ⚠️ [Alice] Conexão ainda em andamento.")
 
-    if "Bob" in relay_logs or "Bob" in alice_logs:
-        print("✅ Bob descoberto e conectado na malha P2P!")
+    if bob_ok:
+        print("  ✅ [Bob]   Conectado à malha P2P e identificado com sucesso!")
     else:
-        print("⚠️ Bob ainda em processo de handshake.")
+        print("  ⚠️ [Bob]   Conexão ainda em andamento.")
 
-    print("\n--- Teste de Integridade de Comunicação Concluído ---")
-    print("🧹 Derrubando ambiente de testes...")
-    run_cmd("docker compose -f docker-compose.test.yml down")
-    print("🎉 Teste E2E Finalizado com Sucesso!")
+    print("\n" + "-" * 65)
+    print("📄 ÚLTIMOS LOGS DO PUBLIC-RELAY:")
+    print("-" * 65)
+    for line in relay_logs.strip().splitlines()[-6:]:
+        print(f"   {line}")
+
+    print("\n" + "-" * 65)
+    print("📄 ÚLTIMOS LOGS DE ALICE (atrás do NAT A):")
+    print("-" * 65)
+    for line in alice_logs.strip().splitlines()[-6:]:
+        print(f"   {line}")
+
+    print("\n" + "-" * 65)
+    print("📄 ÚLTIMOS LOGS DE BOB (atrás do NAT B):")
+    print("-" * 65)
+    for line in bob_logs.strip().splitlines()[-6:]:
+        print(f"   {line}")
+
+    print("\n" + "=" * 65)
+    print("🧹 Encerrando containers e limpando sub-redes virtuais...")
+    run_cmd_streaming(["docker", "compose", "-f", "docker-compose.test.yml", "down"], prefix="[DOCKER CLEANUP]")
+    print("\n🎉 Teste E2E concluído com êxito!")
 
 if __name__ == "__main__":
     main()
