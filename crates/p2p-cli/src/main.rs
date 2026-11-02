@@ -8,9 +8,12 @@ use p2p_core::{
     node::P2PNode,
     protocol::AppBehaviourEvent,
     tracker::{make_info_hash, TorrentTrackerClient},
+    voice::{AudioDeviceManager, JitterBuffer, VoiceEngine, VoicePacket},
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::Level;
@@ -77,9 +80,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("💬 Sala Ativa  : #{}", args.channel);
     println!("============================================================");
     println!("💡 Dica: Digite sua mensagem e pressione ENTER para enviar!");
-    println!("         /peers        -> Lista os pares P2P conectados");
-    println!("         /join <sala>  -> Troca de canal em tempo real");
-    println!("         /quit         -> Encerra o nó");
+    println!("         /peers           -> Lista os pares P2P conectados");
+    println!("         /join <sala>     -> Troca de canal de texto");
+    println!("         /voice join <id> -> Conecta na sala de voz P2P em tempo real");
+    println!("         /voice leave     -> Sai da sala de voz P2P");
+    println!("         /mute            -> Alterna mutar/desmutar seu microfone");
+    println!("         /devices         -> Lista microfones e alto-falantes detectados");
+    println!("         /quit            -> Encerra o nó");
     println!("============================================================\n");
 
     // Canal ativo inicial
@@ -133,6 +140,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Inicialização do Subsistema de Áudio P2P
+    let voice_engine_res = VoiceEngine::start();
+    let (voice_engine, mut voice_mic_rx) = match voice_engine_res {
+        Ok((engine, rx)) => {
+            println!("🎤 Subsistema de Áudio ativado com sucesso.");
+            (Some(engine), Some(rx))
+        }
+        Err(e) => {
+            println!("⚠️ Áudio nativo indisponível neste terminal: {}", e);
+            (None, None)
+        }
+    };
+
+    let mut current_voice_channel: Option<String> = None;
+    let mut current_voice_topic: Option<IdentTopic> = None;
+    let voice_seq = Arc::new(AtomicU64::new(1));
+    let (tx_voice_to_broadcast, mut rx_voice_to_broadcast) = tokio::sync::mpsc::unbounded_channel::<VoicePacket>();
+
+    // Jitter Buffers para pares remotos (um por PeerId/chave pública)
+    let mut remote_jitter_buffers: HashMap<String, JitterBuffer> = HashMap::new();
+
+    // Se a engine de áudio inicializou, escuta o microfone e empacota via VAD
+    if let (Some(engine), Some(mic_rx)) = (&voice_engine, voice_mic_rx.take()) {
+        let is_muted_flag = engine.is_muted_handle();
+        let voice_seq_clone = Arc::clone(&voice_seq);
+        let my_pubkey = identity.public_key_hex();
+        let my_nick = identity.profile.display_name.clone();
+
+        std::thread::spawn(move || {
+            while let Ok(frame_samples) = mic_rx.recv() {
+                if is_muted_flag.load(Ordering::Relaxed) {
+                    continue;
+                }
+
+                let energy = p2p_core::calculate_vad_energy(&frame_samples);
+                // VAD: Envia somente se houver energia perceptível (fala ativa)
+                if energy >= 8 {
+                    let seq = voice_seq_clone.fetch_add(1, Ordering::SeqCst);
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
+                    let packet = VoicePacket::from_pcm_samples(
+                        "active_voice".to_string(),
+                        my_pubkey.clone(),
+                        my_nick.clone(),
+                        seq,
+                        now_ms,
+                        &frame_samples,
+                    );
+
+                    let _ = tx_voice_to_broadcast.send(packet);
+                }
+            }
+        });
+    }
+
     // Leitura interativa do teclado (stdin)
     let mut stdin_lines = BufReader::new(tokio::io::stdin()).lines();
 
@@ -147,6 +212,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(discovered_addr) = rx_peer_discovery.recv() => {
                 if let Ok(multiaddr) = discovered_addr.parse::<libp2p::Multiaddr>() {
                     let _ = node.swarm.dial(multiaddr);
+                }
+            }
+
+            // Transmissão de áudio do microfone para a sala de voz ativa
+            Some(mut voice_pkt) = rx_voice_to_broadcast.recv() => {
+                if let Some(v_topic) = &current_voice_topic {
+                    if let Some(ch) = &current_voice_channel {
+                        voice_pkt.channel_id = ch.clone();
+                        if let Ok(pkt_bytes) = voice_pkt.to_bytes() {
+                            let _ = node.swarm.behaviour_mut().gossipsub.publish(v_topic.clone(), pkt_bytes);
+                        }
+                    }
                 }
             }
 
@@ -173,6 +250,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             println!("--------------------------------\n");
+                            continue;
+                        }
+
+                        if trimmed == "/devices" {
+                            let inputs = AudioDeviceManager::list_input_devices();
+                            let outputs = AudioDeviceManager::list_output_devices();
+                            println!("\n🎤 --- DISPOSITIVOS DE ENTRADA (MICROFONES) ---");
+                            for dev in inputs {
+                                println!("  🎙️  {}", dev);
+                            }
+                            println!("🔊 --- DISPOSITIVOS DE SAÍDA (ALTO-FALANTES) ---");
+                            for dev in outputs {
+                                println!("  🔈 {}", dev);
+                            }
+                            println!("-----------------------------------------------\n");
+                            continue;
+                        }
+
+                        if trimmed == "/mute" {
+                            if let Some(engine) = &voice_engine {
+                                let muted = engine.toggle_mute();
+                                if muted {
+                                    println!("🔇 Microfone MUTADO.");
+                                } else {
+                                    println!("🎙️  Microfone ATIVADO.");
+                                }
+                            } else {
+                                println!("⚠️  Engine de áudio não inicializada.");
+                            }
+                            continue;
+                        }
+
+                        if trimmed.starts_with("/voice join ") {
+                            let v_channel = trimmed.trim_start_matches("/voice join ").trim();
+                            if !v_channel.is_empty() {
+                                if let Some(prev) = &current_voice_topic {
+                                    let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(prev);
+                                }
+                                let v_topic_name = format!("p2p-discord/voice/{}", v_channel);
+                                let v_topic = IdentTopic::new(v_topic_name);
+                                if let Err(e) = node.swarm.behaviour_mut().gossipsub.subscribe(&v_topic) {
+                                    println!("❌ Falha ao entrar no canal de voz: {:?}", e);
+                                } else {
+                                    current_voice_channel = Some(v_channel.to_string());
+                                    current_voice_topic = Some(v_topic);
+                                    println!("🔊 Você conectou à sala de voz [🔊 {}]!", v_channel);
+                                    println!("💡 Dica: Fale no microfone ou use /mute para silenciar.");
+                                }
+                            }
+                            continue;
+                        }
+
+                        if trimmed == "/voice leave" {
+                            if let Some(prev) = current_voice_topic.take() {
+                                let _ = node.swarm.behaviour_mut().gossipsub.unsubscribe(&prev);
+                                println!("🔇 Você saiu da sala de voz [{}].", current_voice_channel.take().unwrap_or_default());
+                            } else {
+                                println!("⚠️  Você não está conectado a nenhuma sala de voz.");
+                            }
                             continue;
                         }
 
@@ -263,9 +399,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(
                         libp2p::gossipsub::Event::Message { message, .. }
                     )) => {
+                        // 1. Tenta decodificar como mensagem de chat de texto
                         if let Ok(chat_msg) = serde_json::from_slice::<ChatMessage>(&message.data) {
                             if chat_msg.author_pubkey != identity.public_key_hex() {
                                 println!("\n📩 [#{}] {}: {}", chat_msg.channel_id, chat_msg.author_name, chat_msg.text);
+                            }
+                        }
+                        // 2. Tenta decodificar como pacote de voz P2P
+                        else if let Ok(voice_pkt) = VoicePacket::from_bytes(&message.data) {
+                            if voice_pkt.sender_pubkey != identity.public_key_hex() {
+                                // Insere no JitterBuffer do remetente
+                                let jb = remote_jitter_buffers
+                                    .entry(voice_pkt.sender_pubkey.clone())
+                                    .or_insert_with(|| JitterBuffer::new(10));
+                                
+                                jb.push(voice_pkt);
+
+                                // Se tiver pacote ordenado pronto para reprodução, envia ao alto-falante
+                                if let Some(ready_pkt) = jb.pop_next() {
+                                    if let Some(engine) = &voice_engine {
+                                        let samples = ready_pkt.to_pcm_samples();
+                                        engine.play_remote_samples(samples);
+                                    }
+                                }
                             }
                         }
                     }

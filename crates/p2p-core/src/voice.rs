@@ -1,6 +1,22 @@
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum AudioEngineError {
+    #[error("Dispositivo não encontrado: {0}")]
+    DeviceNotFound(String),
+    #[error("Erro no driver de áudio: {0}")]
+    Cpal(#[from] cpal::DefaultStreamConfigError),
+    #[error("Erro ao construir stream: {0}")]
+    BuildStream(#[from] cpal::BuildStreamError),
+    #[error("Erro ao iniciar reprodução: {0}")]
+    PlayStream(#[from] cpal::PlayStreamError),
+}
 
 /// Configuração padrão de áudio para voz de baixa latência (48kHz, mono, frames de 20ms = 960 amostras)
 pub const SAMPLE_RATE: u32 = 48000;
@@ -205,6 +221,164 @@ impl AudioDeviceManager {
     }
 }
 
+/// Pipeline completo de captura e reprodução de voz nativa P2P
+pub struct VoiceEngine {
+    is_muted: Arc<AtomicBool>,
+    is_running: Arc<AtomicBool>,
+    _input_stream: Option<cpal::Stream>,
+    _output_stream: Option<cpal::Stream>,
+    incoming_audio_tx: Sender<Vec<f32>>,
+}
+
+impl VoiceEngine {
+    /// Inicializa a engine de áudio conectando o microfone e alto-falante padrão
+    /// Retorna a engine e o receiver por onde saem os pacotes capturados do microfone local
+    pub fn start() -> Result<(Self, Receiver<Vec<f32>>), AudioEngineError> {
+        let host = cpal::default_host();
+        let is_muted = Arc::new(AtomicBool::new(false));
+        let is_running = Arc::new(AtomicBool::new(true));
+
+        // 1. Canal de saída para os frames capturados do microfone local (20ms cada)
+        let (mic_tx, mic_rx) = channel::<Vec<f32>>();
+
+        // Configuração do microfone
+        let input_stream = match host.default_input_device() {
+            Some(input_dev) => {
+                let config: cpal::StreamConfig = match input_dev.default_input_config() {
+                    Ok(c) => c.into(),
+                    Err(_) => cpal::StreamConfig {
+                        channels: CHANNELS,
+                        sample_rate: cpal::SampleRate(SAMPLE_RATE),
+                        buffer_size: cpal::BufferSize::Default,
+                    },
+                };
+
+                let is_muted_clone = Arc::clone(&is_muted);
+                let is_running_clone = Arc::clone(&is_running);
+                let mut pcm_accumulator = Vec::with_capacity(FRAME_SIZE * 2);
+
+                let stream = input_dev.build_input_stream(
+                    &config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        if !is_running_clone.load(Ordering::Relaxed) {
+                            return;
+                        }
+
+                        if is_muted_clone.load(Ordering::Relaxed) {
+                            // Se estiver mutado, não acumula áudio
+                            pcm_accumulator.clear();
+                            return;
+                        }
+
+                        pcm_accumulator.extend_from_slice(data);
+
+                        // Quando acumular pelo menos um frame de 20ms (960 amostras), despacha
+                        while pcm_accumulator.len() >= FRAME_SIZE {
+                            let frame: Vec<f32> = pcm_accumulator.drain(..FRAME_SIZE).collect();
+                            let _ = mic_tx.send(frame);
+                        }
+                    },
+                    |err| eprintln!("⚠️ Erro no stream de microfone: {}", err),
+                    None,
+                )?;
+                stream.play()?;
+                Some(stream)
+            }
+            None => None,
+        };
+
+        // 2. Canal e buffer de reprodução de áudio dos pares remotos
+        let (playback_tx, playback_rx) = channel::<Vec<f32>>();
+        let playback_rx = Arc::new(Mutex::new(playback_rx));
+
+        // Configuração do alto-falante
+        let output_stream = match host.default_output_device() {
+            Some(output_dev) => {
+                let config: cpal::StreamConfig = match output_dev.default_output_config() {
+                    Ok(c) => c.into(),
+                    Err(_) => cpal::StreamConfig {
+                        channels: CHANNELS,
+                        sample_rate: cpal::SampleRate(SAMPLE_RATE),
+                        buffer_size: cpal::BufferSize::Default,
+                    },
+                };
+
+                let playback_rx_clone = Arc::clone(&playback_rx);
+                let mut current_playback_buffer: Vec<f32> = Vec::new();
+
+                let stream = output_dev.build_output_stream(
+                    &config,
+                    move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        // Tenta drenar do canal para o buffer interno de reprodução
+                        if let Ok(rx) = playback_rx_clone.try_lock() {
+                            while let Ok(samples) = rx.try_recv() {
+                                current_playback_buffer.extend(samples);
+                            }
+                        }
+
+                        for sample in output.iter_mut() {
+                            if !current_playback_buffer.is_empty() {
+                                *sample = current_playback_buffer.remove(0);
+                            } else {
+                                *sample = 0.0; // Silêncio se não houver pacotes prontos
+                            }
+                        }
+                    },
+                    |err| eprintln!("⚠️ Erro no stream de saída de áudio: {}", err),
+                    None,
+                )?;
+                stream.play()?;
+                Some(stream)
+            }
+            None => None,
+        };
+
+        Ok((
+            Self {
+                is_muted,
+                is_running,
+                _input_stream: input_stream,
+                _output_stream: output_stream,
+                incoming_audio_tx: playback_tx,
+            },
+            mic_rx,
+        ))
+    }
+
+    /// Alimenta o motor de áudio com as amostras recebidas de um par remoto
+    pub fn play_remote_samples(&self, samples: Vec<f32>) {
+        let _ = self.incoming_audio_tx.send(samples);
+    }
+
+    /// Ativa ou desativa o microfone local (Mute)
+    pub fn set_mute(&self, mute: bool) {
+        self.is_muted.store(mute, Ordering::SeqCst);
+    }
+
+    /// Alterna o estado de mute do microfone
+    pub fn toggle_mute(&self) -> bool {
+        let current = self.is_muted.load(Ordering::SeqCst);
+        let new_state = !current;
+        self.is_muted.store(new_state, Ordering::SeqCst);
+        new_state
+    }
+
+    /// Retorna se o microfone está atualmente mutado
+    pub fn is_muted(&self) -> bool {
+        self.is_muted.load(Ordering::SeqCst)
+    }
+
+    /// Retorna uma referência compartilhável para verificar se o microfone está mutado
+    pub fn is_muted_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.is_muted)
+    }
+
+    /// Encerra as threads de áudio
+    pub fn stop(&self) {
+        self.is_running.store(false, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +471,19 @@ mod tests {
         // Testa se a chamada a list_input_devices e list_output_devices não causa panic
         let _ = AudioDeviceManager::list_input_devices();
         let _ = AudioDeviceManager::list_output_devices();
+    }
+
+    #[test]
+    fn test_voice_engine_state_toggle() {
+        if let Ok((engine, _rx)) = VoiceEngine::start() {
+            assert!(!engine.is_muted());
+            let muted = engine.toggle_mute();
+            assert!(muted);
+            assert!(engine.is_muted());
+            let unmuted = engine.toggle_mute();
+            assert!(!unmuted);
+            assert!(!engine.is_muted());
+            engine.stop();
+        }
     }
 }
