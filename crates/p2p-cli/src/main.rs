@@ -957,7 +957,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    Ok(None) => break,
+                    Ok(None) if !args.daemon => break,
+                    Ok(None) => {
+                        // No modo daemon stdin está vazio (/dev/null), NÃO deve encerrar o processo!
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    }
                     Err(e) => {
                         eprintln!("Erro ao ler entrada: {:?}", e);
                         break;
