@@ -729,8 +729,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Entrada do teclado (quando rodando em modo daemon)
-            line = stdin_lines.next_line(), if args.daemon => {
+            // Entrada do teclado (apenas no modo daemon interativo com stdin conectado)
+            line = stdin_lines.next_line(), if args.daemon && false => {
                 match line {
                     Ok(Some(text)) => {
                         let action = parse_user_input(&text);
