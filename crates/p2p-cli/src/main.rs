@@ -50,6 +50,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     daemon: bool,
 
+    /// Transmitir tom sintético de teste de áudio (440Hz / 880Hz) continuamente na sala de voz
+    #[arg(long, default_value_t = false)]
+    synth_audio: bool,
+
     /// Desativar descoberta automática via IPFS Amino DHT e Open Trackers BitTorrent
     #[arg(long, default_value_t = false)]
     no_auto_bootstrap: bool,
@@ -186,7 +190,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Jitter Buffers para pares remotos (um por PeerId/chave pública)
     let mut remote_jitter_buffers: HashMap<String, JitterBuffer> = HashMap::new();
 
-    // Se a engine de áudio inicializou, escuta o microfone e empacota via VAD
+    // Se a flag --synth-audio estiver ativada, transmite ondas sonoras senoidais periódicas
+    if args.synth_audio {
+        let voice_seq_synth = Arc::clone(&voice_seq);
+        let my_pubkey_synth = identity.public_key_hex();
+        let my_nick_synth = identity.profile.display_name.clone();
+        let tx_synth = tx_voice_to_broadcast.clone();
+
+        println!("📻 Modo Sintetizador de Áudio ativado: gerando áudio a 440Hz contínuo...");
+        std::thread::spawn(move || {
+            let mut phase: f32 = 0.0;
+            let sample_rate = p2p_core::SAMPLE_RATE as f32;
+            let frame_size = p2p_core::FRAME_SIZE; // 960 amostras (20ms)
+            let freq = 440.0; // Nota Lá (440Hz)
+            let phase_step = (2.0 * std::f32::consts::PI * freq) / sample_rate;
+
+            loop {
+                let start_time = std::time::Instant::now();
+                let mut samples = Vec::with_capacity(frame_size);
+
+                for _ in 0..frame_size {
+                    let sample = (phase.sin()) * 0.5; // 50% de volume para ser agradável
+                    samples.push(sample);
+                    phase = (phase + phase_step) % (2.0 * std::f32::consts::PI);
+                }
+
+                let seq = voice_seq_synth.fetch_add(1, Ordering::SeqCst);
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
+                let packet = VoicePacket::from_pcm_samples(
+                    "active_voice".to_string(),
+                    my_pubkey_synth.clone(),
+                    my_nick_synth.clone(),
+                    seq,
+                    now_ms,
+                    &samples,
+                );
+
+                let _ = tx_synth.send(packet);
+
+                // Espera exatamente 20ms para sincronizar o fluxo de áudio em tempo real
+                let elapsed = start_time.elapsed();
+                if elapsed < std::time::Duration::from_millis(20) {
+                    std::thread::sleep(std::time::Duration::from_millis(20) - elapsed);
+                }
+            }
+        });
+    }
     if let (Some(engine), Some(mic_rx)) = (&voice_engine, voice_mic_rx.take()) {
         let is_muted_flag = engine.is_muted_handle();
         let voice_seq_clone = Arc::clone(&voice_seq);
