@@ -234,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    {
+    let ui_handle = {
         let (tx_ui_event, rx_ui_event) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
         let (tx_ui_action, rx_ui_action) = tokio::sync::mpsc::unbounded_channel::<UiAction>();
         let muted = Arc::new(AtomicBool::new(false));
@@ -244,14 +244,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&muted),
             Some(args.identity_file.with_extension("history")),
         );
-        tokio::spawn(async move {
+        let ui_handle = tokio::spawn(async move {
             let _ = ui.run(rx_ui_event, tx_ui_action).await;
         });
         tokio::spawn(bridge(events, rx_ui_action, commands, tx_ui_event, muted));
-    }
+        ui_handle
+    };
 
-    // O loop do core roda com timeout de saída para nunca travar o terminal
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task.run()).await;
+    // O loop do core roda nesta tarefa enquanto a UI estiver aberta
+    tokio::select! {
+        _ = task.run() => {},
+        _ = ui_handle => {},
+    }
     TerminalUi::restore_terminal();
     Ok(())
 }
