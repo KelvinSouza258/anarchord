@@ -1,5 +1,7 @@
 pub mod b64;
 pub mod files;
+pub mod runtime;
+pub mod wire;
 pub mod identity;
 pub mod community;
 pub mod api;
@@ -13,7 +15,8 @@ pub mod file_transfer;
 pub mod screen;
 
 pub use identity::UserIdentity;
-pub use api::{peer_id_from_pubkey_hex, ChatMessage, CoreCommand, CoreEvent};
+pub use api::{peer_id_from_pubkey_hex, ChatMessage};
+pub use runtime::{Core, CoreCommand, CoreConfig, CoreEvent, CoreHandle, CoreTask};
 pub use community::{Channel, ChannelType, ServerMessage, ServerRegistry, Space};
 pub use node::{
     dht_discovery_key, make_agent_version, parse_agent_version, P2PNode, AGENT_VERSION_PREFIX,

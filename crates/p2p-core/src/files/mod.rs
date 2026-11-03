@@ -62,11 +62,11 @@ pub enum SwarmMessage {
 
 impl SwarmMessage {
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("mensagem do enxame serializável")
+        crate::wire::encode(self)
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::wire::WireError> {
+        crate::wire::decode_as(bytes)
     }
 }
 
@@ -87,6 +87,7 @@ mod tests {
         assert_eq!(SwarmMessage::from_bytes(&offer.to_bytes()).unwrap(), offer);
         let have = SwarmMessage::Have { manifest: Cid::of(b"m"), have: Bitfield::new(3) };
         assert_eq!(SwarmMessage::from_bytes(&have.to_bytes()).unwrap(), have);
-        assert!(SwarmMessage::from_bytes(br#"{"stream_id":"s","sender_pubkey":"p"}"#).is_err());
+        let announce = crate::screen::ScreenAnnounce { stream_id: "s".into(), sender_pubkey: "p".into(), sender_name: "n".into(), width: 1, height: 1 };
+        assert!(SwarmMessage::from_bytes(&crate::wire::encode(&announce)).is_err());
     }
 }

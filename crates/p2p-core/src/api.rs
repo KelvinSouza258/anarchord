@@ -3,7 +3,7 @@ use crate::identity::{hex_decode_32, verify_signature_hex};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     pub channel_id: String,
     pub author_pubkey: String,
@@ -14,14 +14,14 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
-    /// Conteúdo assinado pelo autor: "canal:texto:timestamp"
-    fn signing_payload(channel_id: &str, text: &str, timestamp: u64) -> String {
-        format!("{}:{}:{}", channel_id, text, timestamp)
+    /// Conteúdo assinado pelo autor: canal, texto e data, em binário canônico
+    fn signing_payload(channel_id: &str, text: &str, timestamp: u64) -> Vec<u8> {
+        crate::wire::signing_bytes("chat", &(channel_id, text, timestamp))
     }
 
     /// Cria uma mensagem assinada pela identidade do autor
     pub fn new_signed(identity: &UserIdentity, channel_id: &str, text: &str, timestamp: u64) -> Self {
-        let signature = identity.sign(Self::signing_payload(channel_id, text, timestamp).as_bytes());
+        let signature = identity.sign(&Self::signing_payload(channel_id, text, timestamp));
         Self {
             channel_id: channel_id.to_string(),
             author_pubkey: identity.public_key_hex(),
@@ -44,7 +44,7 @@ impl ChatMessage {
             return false;
         }
         let payload = Self::signing_payload(&self.channel_id, &self.text, self.timestamp);
-        verify_signature_hex(&self.author_pubkey, payload.as_bytes(), &self.signature)
+        verify_signature_hex(&self.author_pubkey, &payload, &self.signature)
     }
 }
 
@@ -64,31 +64,6 @@ pub fn peer_id_from_pubkey_hex(pubkey_hex: &str) -> Option<PeerId> {
     let bytes = hex_decode_32(pubkey_hex).ok()?;
     let key = libp2p::identity::ed25519::PublicKey::try_from_bytes(&bytes).ok()?;
     Some(libp2p::identity::PublicKey::from(key).to_peer_id())
-}
-
-#[derive(Debug, Clone)]
-pub enum CoreCommand {
-    CreateServer { name: String },
-    JoinServer { server_id: String },
-    SendTextMessage { channel_id: String, text: String },
-    JoinVoiceChannel { channel_id: String },
-    LeaveVoiceChannel,
-    SetMute(bool),
-    KickPeer { peer_id: String },
-    ListPeers,
-    Shutdown,
-}
-
-#[derive(Debug, Clone)]
-pub enum CoreEvent {
-    ServerCreated { server_id: String, name: String },
-    ServerDiscovered { server_id: String, name: String },
-    PeerJoined { peer_id: String },
-    PeerLeft { peer_id: String },
-    TextMessageReceived(ChatMessage),
-    PeerSpeaking { peer_id: String, is_speaking: bool },
-    VoiceDataReady { peer_id: String, samples: Vec<f32> },
-    Error(String),
 }
 
 #[cfg(test)]

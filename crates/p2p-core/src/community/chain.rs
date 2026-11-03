@@ -99,20 +99,20 @@ impl Block {
             timestamp,
             entries,
         };
-        let signature = server_key.sign(&serde_json::to_vec(&body).expect("bloco serializável"));
+        let signature = server_key.sign(&crate::wire::signing_bytes("block", &body));
         Self { body, signature }
     }
 
     pub fn hash(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(serde_json::to_vec(&self.body).unwrap_or_default());
+        hasher.update(crate::wire::to_bytes(&self.body));
         hasher.update(&self.signature);
         hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
     }
 
     pub fn verify_signature(&self, server_id: &str) -> bool {
         self.body.server_id == server_id
-            && serde_json::to_vec(&self.body).is_ok_and(|bytes| verify_signature_hex(server_id, &bytes, &self.signature))
+            && verify_signature_hex(server_id, &crate::wire::signing_bytes("block", &self.body), &self.signature)
     }
 }
 

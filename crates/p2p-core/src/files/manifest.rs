@@ -78,12 +78,12 @@ impl Manifest {
             created_at: now,
             encrypted: key.is_some(),
         };
-        let signature = publisher.sign(&serde_json::to_vec(&body).expect("manifesto serializável"));
+        let signature = publisher.sign(&crate::wire::signing_bytes("manifest", &body));
         Ok(Self { body, signature })
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("manifesto serializável")
+        crate::wire::to_bytes(self)
     }
 
     /// Lê e valida um manifesto recebido, conferindo que ele é o conteúdo de `expected`
@@ -91,7 +91,7 @@ impl Manifest {
         if !expected.matches(bytes) {
             return Err(ManifestError::WrongCid);
         }
-        let manifest: Self = serde_json::from_slice(bytes).map_err(|_| ManifestError::Malformed)?;
+        let manifest: Self = crate::wire::from_bytes(bytes).ok_or(ManifestError::Malformed)?;
         manifest.verify()?;
         Ok(manifest)
     }
@@ -108,8 +108,7 @@ impl Manifest {
         if body.piece_size == 0 || body.pieces.len() as u64 != piece_count(body.size, body.piece_size) as u64 {
             return Err(ManifestError::BadLayout);
         }
-        let bytes = serde_json::to_vec(body).map_err(|_| ManifestError::Malformed)?;
-        if !verify_signature_hex(&body.publisher, &bytes, &self.signature) {
+        if !verify_signature_hex(&body.publisher, &crate::wire::signing_bytes("manifest", body), &self.signature) {
             return Err(ManifestError::BadSignature);
         }
         Ok(())

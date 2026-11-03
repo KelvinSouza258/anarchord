@@ -110,7 +110,7 @@ async fn test_chat_message_delivered_between_nodes() {
         .swarm
         .behaviour_mut()
         .gossipsub
-        .publish(topic.clone(), serde_json::to_vec(&msg).unwrap())
+        .publish(topic.clone(), p2p_core::wire::encode(&msg))
         .expect("publicação deveria encontrar Bob no tópico");
 
     let received = tokio::time::timeout(TIMEOUT, async {
@@ -118,7 +118,7 @@ async fn test_chat_message_delivered_between_nodes() {
             if let (Side::Bob, SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. }))) =
                 next_event(&mut alice, &mut bob).await
             {
-                return serde_json::from_slice::<ChatMessage>(&message.data).unwrap();
+                return p2p_core::wire::decode_as::<ChatMessage>(&message.data).unwrap();
             }
         }
     })
@@ -223,9 +223,9 @@ async fn test_chat_author_is_bound_to_publisher() {
     connect_and_wait_subscription(&mut alice, &mut bob, &topic).await;
 
     let genuine = ChatMessage::new_signed(&alice.identity, "geral", "sou a Alice", 1);
-    alice.swarm.behaviour_mut().gossipsub.publish(topic.clone(), serde_json::to_vec(&genuine).unwrap()).unwrap();
+    alice.swarm.behaviour_mut().gossipsub.publish(topic.clone(), p2p_core::wire::encode(&genuine)).unwrap();
     let received = next_message(&mut alice, &mut bob, Side::Bob).await;
-    let msg: ChatMessage = serde_json::from_slice(&received.data).unwrap();
+    let msg: ChatMessage = p2p_core::wire::decode_as(&received.data).unwrap();
     assert_eq!(received.source, Some(alice.peer_id), "Strict: a rede informa quem publicou");
     assert!(msg.verify(received.source.as_ref()));
 
@@ -234,9 +234,9 @@ async fn test_chat_author_is_bound_to_publisher() {
     let mut forged = ChatMessage::new_signed(&alice.identity, "geral", "sou a Carol", 2);
     forged.author_pubkey = carol.public_key_hex();
     forged.author_name = "Carol".into();
-    alice.swarm.behaviour_mut().gossipsub.publish(topic.clone(), serde_json::to_vec(&forged).unwrap()).unwrap();
+    alice.swarm.behaviour_mut().gossipsub.publish(topic.clone(), p2p_core::wire::encode(&forged)).unwrap();
     let received = next_message(&mut alice, &mut bob, Side::Bob).await;
-    let msg: ChatMessage = serde_json::from_slice(&received.data).unwrap();
+    let msg: ChatMessage = p2p_core::wire::decode_as(&received.data).unwrap();
     assert_eq!(msg.author_name, "Carol");
     assert!(!msg.verify(received.source.as_ref()), "falsificação deveria ser recusada");
 }
@@ -257,7 +257,7 @@ async fn send_server_messages(
             Side::Alice => &mut *alice,
             Side::Bob => &mut *bob,
         };
-        sender.swarm.behaviour_mut().gossipsub.publish(topic.clone(), m.to_bytes().unwrap()).unwrap();
+        sender.swarm.behaviour_mut().gossipsub.publish(topic.clone(), m.to_bytes()).unwrap();
     }
     let receiver = match from {
         Side::Alice => Side::Bob,

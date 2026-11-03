@@ -66,7 +66,7 @@ impl ModeratorCert {
             issued_at,
             expires_at: issued_at + validity_secs,
         };
-        let signature = server_key.sign(&serde_json::to_vec(&body).expect("certificado serializável"));
+        let signature = server_key.sign(&crate::wire::signing_bytes("cert", &body));
         Self { body, signature }
     }
 
@@ -79,7 +79,7 @@ impl ModeratorCert {
     pub fn verify(&self, server_id: &str) -> bool {
         self.body.server_id == server_id
             && self.body.level >= 1
-            && serde_json::to_vec(&self.body).is_ok_and(|bytes| verify_signature_hex(server_id, &bytes, &self.signature))
+            && verify_signature_hex(server_id, &crate::wire::signing_bytes("cert", &self.body), &self.signature)
     }
 
     /// Dentro do período de validade em `at` (tolerando relógios um pouco adiantados)
@@ -150,14 +150,14 @@ impl ModAction {
             created_at,
             reason: reason.to_string(),
         };
-        let signature = moderator.sign(&serde_json::to_vec(&body).expect("ação serializável"));
+        let signature = moderator.sign(&crate::wire::signing_bytes("modaction", &body));
         Self { body, cert: cert.clone(), signature }
     }
 
     /// Identificador da ação (para não aplicar duas vezes)
     pub fn id(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(serde_json::to_vec(&self.body).unwrap_or_default());
+        hasher.update(crate::wire::to_bytes(&self.body));
         hasher.update(&self.signature);
         hasher.finalize()[..16].iter().map(|b| format!("{:02x}", b)).collect()
     }
@@ -167,8 +167,7 @@ impl ModAction {
         self.body.server_id == server_id
             && self.cert.verify(server_id)
             && self.cert.body.serial == self.body.cert_serial
-            && serde_json::to_vec(&self.body)
-                .is_ok_and(|bytes| verify_signature_hex(&self.cert.body.subject, &bytes, &self.signature))
+            && verify_signature_hex(&self.cert.body.subject, &crate::wire::signing_bytes("modaction", &self.body), &self.signature)
     }
 
     pub fn actor(&self) -> &str {

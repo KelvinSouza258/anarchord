@@ -50,6 +50,10 @@ pub enum FileEvent {
     Progress { cid: Cid, name: String, progress: f32, peers: usize },
     Completed { cid: Cid, name: String, path: PathBuf },
     Failed { cid: Cid, name: String, reason: String },
+    /// Oferta recusada
+    Dismissed { name: String },
+    /// Parou de compartilhar ou cancelou o download
+    Unshared { name: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]

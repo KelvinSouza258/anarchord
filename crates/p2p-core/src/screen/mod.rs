@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Informações sobre uma tela/monitor disponível para captura
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScreenInfo {
     pub id: u32,
     pub name: String,
@@ -37,7 +37,7 @@ pub enum VideoCodec {
 }
 
 /// Pacote de transmissão de quadro de vídeo P2P (H.264 ou JPEG)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScreenPacket {
     pub stream_id: String,
     pub sender_pubkey: String,
@@ -64,22 +64,22 @@ pub struct ScreenAnnounce {
 }
 
 impl ScreenAnnounce {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        crate::wire::encode(self)
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::wire::WireError> {
+        crate::wire::decode_as(bytes)
     }
 }
 
 impl ScreenPacket {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        crate::wire::encode(self)
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::wire::WireError> {
+        crate::wire::decode_as(bytes)
     }
 }
 

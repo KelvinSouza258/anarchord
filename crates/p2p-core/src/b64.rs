@@ -9,10 +9,18 @@ use serde::{Deserialize, Deserializer, Serializer};
 const ENGINE: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&ENGINE.encode(bytes))
+    if serializer.is_human_readable() {
+        serializer.serialize_str(&ENGINE.encode(bytes))
+    } else {
+        // Formato binário (rede): bytes crus
+        serializer.serialize_bytes(bytes)
+    }
 }
 
 pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    if !deserializer.is_human_readable() {
+        return serde_bytes::deserialize(deserializer);
+    }
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Repr {

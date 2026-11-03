@@ -89,7 +89,7 @@ impl libp2p::request_response::Codec for FileCodec {
         T: AsyncRead + Unpin + Send,
     {
         let frame = read_frame(io, MAX_REQUEST).await?;
-        serde_json::from_slice(&frame).map_err(|_| invalid("pedido ilegível"))
+        crate::wire::from_bytes(&frame).ok_or_else(|| invalid("pedido ilegível"))
     }
 
     async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
@@ -103,7 +103,7 @@ impl libp2p::request_response::Codec for FileCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let bytes = serde_json::to_vec(&req).map_err(|_| invalid("pedido não serializável"))?;
+        let bytes = crate::wire::to_bytes(&req);
         write_frame(io, &[&bytes]).await
     }
 

@@ -145,12 +145,12 @@ pub enum ServerMessage {
 }
 
 impl ServerMessage {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        crate::wire::encode(self)
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::wire::WireError> {
+        crate::wire::decode_as(bytes)
     }
 }
 
@@ -302,7 +302,7 @@ struct StoredServer {
 }
 
 /// Uma linha do histórico de alterações (para exibição)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HistoryEntry {
     pub height: u64,
     pub timestamp: UtcSecs,

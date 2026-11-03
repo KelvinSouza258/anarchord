@@ -1,58 +1,7 @@
-//! Comandos de servidor e canal ativo da interface.
-//! A lógica de servidores (manifestos, moderação, persistência) fica no core (`p2p_core::community`);
-//! aqui só ficam o parser dos comandos e a troca de inscrição de tópico ao mudar de canal.
+//! Texto dos comandos `/server ...` -> `ServerCommand` do core.
 
-use libp2p::gossipsub::{self, IdentTopic};
-use p2p_core::community::{channel_topic, parse_duration, Space};
-
-/// Comandos `/server ...` (e o atalho `/lobby`)
-#[derive(Debug, PartialEq, Clone)]
-pub enum ServerCommand {
-    Create(String),
-    Join(String),
-    /// Entra no servidor do último convite recebido no chat
-    Accept,
-    Leave,
-    List,
-    Info,
-    Switch(String),
-    Invite,
-    History,
-    AddChannel { name: String, voice: bool },
-    RemoveChannel(String),
-    /// Emite certificado de moderador (nível 1 = mais autoridade abaixo do dono)
-    AddModerator { target: String, level: u8 },
-    /// Revoga os certificados de moderador
-    RemoveModerator(String),
-    /// Ban com duração em segundos (`None` = permanente)
-    Ban { target: String, duration: Option<u64>, reason: String },
-    Unban(String),
-    /// Allow-list (servidor fechado)
-    Allow(String),
-    Disallow(String),
-    Close,
-    Open,
-    /// Validade dos certificados e janela de renovação, em segundos
-    Policy { validity: u64, renewal_window: u64 },
-    Help,
-}
-
-pub const SERVER_HELP: &str = "Comandos: /server create <nome> | join <id> | accept | list | switch <nome|id|lobby> | info | history \
-| invite | channel add <nome> [voz] | channel remove <nome> | mod add <par> [nível] | mod remove <par> \
-| ban <par> [30m|12h|3d|2w|perm] [motivo] | unban <par> | allow <par> | disallow <par> | close | open \
-| policy <validade> <janela> (ex.: 7d 2d) | leave  (atalho: /lobby)";
-
-/// Texto do convite publicado no chat. Quem recebe usa `/server accept`.
-pub fn invite_text(server_name: &str, server_id: &str) -> String {
-    format!("📨 Convite para o servidor '{}'. Para entrar: /server accept  (ou /server join {})", server_name, server_id)
-}
-
-/// Se a mensagem de chat contém um convite (`/server join <id>`), devolve o id do servidor
-pub fn parse_invite(text: &str) -> Option<String> {
-    let rest = text.split("/server join ").nth(1)?;
-    let id: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-    p2p_core::community::is_valid_server_id(&id).then_some(id)
-}
+use p2p_core::community::parse_duration;
+use p2p_core::runtime::ServerCommand;
 
 /// Interpreta o que vem depois de `/server` (já sem o prefixo)
 pub fn parse_server_command(rest: &str) -> ServerCommand {
@@ -123,44 +72,6 @@ pub fn parse_server_command(rest: &str) -> ServerCommand {
     .unwrap_or(ServerCommand::Help)
 }
 
-/// Canal de texto em que o usuário está (espaço + nome + tópico inscrito)
-pub struct ActiveChannel {
-    pub space: Space,
-    pub channel: String,
-    pub topic: IdentTopic,
-}
-
-impl ActiveChannel {
-    pub fn new(space: Space, channel: String) -> Self {
-        let topic = IdentTopic::new(channel_topic(&space, &channel));
-        Self { space, channel, topic }
-    }
-
-    /// Sai do tópico atual e entra no do novo canal. Não faz nada se já estiver nele.
-    pub fn switch(
-        &mut self,
-        gossipsub: &mut gossipsub::Behaviour,
-        space: Space,
-        channel: String,
-    ) -> Result<(), gossipsub::SubscriptionError> {
-        if self.space == space && self.channel == channel {
-            return Ok(());
-        }
-        let next = ActiveChannel::new(space, channel);
-        gossipsub.subscribe(&next.topic)?;
-        let _ = gossipsub.unsubscribe(&self.topic);
-        *self = next;
-        Ok(())
-    }
-
-    pub fn server_id(&self) -> Option<&str> {
-        match &self.space {
-            Space::Server(id) => Some(id),
-            Space::Lobby => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,15 +109,6 @@ mod tests {
             parse_server_command("policy 7d 2d"),
             ServerCommand::Policy { validity: 7 * 86_400, renewal_window: 2 * 86_400 }
         );
-    }
-
-    #[test]
-    fn test_invite_roundtrip() {
-        let id = "ab".repeat(32);
-        assert_eq!(parse_invite(&invite_text("Rust Guild", &id)), Some(id.clone()));
-        assert_eq!(parse_invite(&format!("entra aí: /server join {} valeu", id)), Some(id));
-        assert_eq!(parse_invite("/server join abc"), None, "id curto não é convite");
-        assert_eq!(parse_invite("bom dia"), None);
     }
 
     #[test]

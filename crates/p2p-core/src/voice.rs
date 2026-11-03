@@ -176,13 +176,13 @@ impl VoicePacket {
     }
 
     /// Serializa o pacote para transmissão na rede
-    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        crate::wire::encode(self)
     }
 
     /// Desserializa o pacote recebido da rede
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::wire::WireError> {
+        crate::wire::decode_as(bytes)
     }
 
     /// Retorna se o pacote contém voz perceptível (Voice Activity Detection simples)
@@ -478,7 +478,7 @@ mod tests {
             85,
         );
 
-        let bytes = packet.to_bytes().expect("Serialização falhou");
+        let bytes = packet.to_bytes();
         let decoded = VoicePacket::from_bytes(&bytes).expect("Desserialização falhou");
 
         assert_eq!(packet, decoded);

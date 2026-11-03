@@ -3,10 +3,7 @@ use openh264::decoder::Decoder;
 use openh264::encoder::{Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, SpsPpsStrategy, UsageType};
 use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
 use openh264::{nal_units, OpenH264API};
-use p2p_core::api::ChatMessage;
-use p2p_core::files::SwarmMessage;
 use p2p_core::screen::{ScreenPacket, VideoCodec};
-use p2p_core::voice::VoicePacket;
 use std::time::{Duration, Instant};
 use xcap::Monitor;
 
@@ -102,15 +99,14 @@ fn main() {
             codec: VideoCodec::H264, is_keyframe: key, video_data: bytes.clone(),
         };
         let t = Instant::now();
-        let json = pkt.to_bytes().unwrap();
+        let json = pkt.to_bytes();
         s_ser.add(t.elapsed());
         if key { json_key.push(json.len()) } else { json_p.push(json.len()) }
         if json.len() > 1024 * 1024 { too_large += 1; }
 
         let t = Instant::now();
-        let _ = serde_json::from_slice::<ChatMessage>(&json);
-        let _ = VoicePacket::from_bytes(&json);
-        let _ = SwarmMessage::from_bytes(&json);
+        // O tipo vem no envelope: nada de tentar desserializar em sequência
+        let _ = p2p_core::wire::decode(&json);
         s_try.add(t.elapsed());
 
         let t = Instant::now();
