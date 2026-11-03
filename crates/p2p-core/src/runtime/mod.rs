@@ -192,6 +192,9 @@ pub(crate) struct Runtime {
     identified: HashSet<PeerId>,
     /// Endereços discados com conexão aberta (o tracker repete os mesmos pares)
     dialed_open: HashSet<Multiaddr>,
+    /// Histórico de discagens de endereços IP descobertos via tracker: Multiaddr -> Instant
+    tracker_dial_attempts: HashMap<Multiaddr, std::time::Instant>,
+    has_anarchord_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     relay_manager: RelayManager,
     discovery: discovery::DiscoveryState,
     tracker_rx: Option<UnboundedReceiver<String>>,
@@ -237,6 +240,8 @@ impl Runtime {
             peer_metadata: HashMap::new(),
             identified: HashSet::new(),
             dialed_open: HashSet::new(),
+            tracker_dial_attempts: HashMap::new(),
+            has_anarchord_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_manager,
             discovery: discovery::DiscoveryState::new(config.lab),
             tracker_rx: None,

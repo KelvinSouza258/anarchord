@@ -50,14 +50,33 @@ impl Runtime {
         let port = self.node.listen_port;
         let bt_peer_id = self.bt_peer_id();
         let events = self.events.clone();
-        let interval = std::time::Duration::from_secs(if self.config.lab { 3 } else { 10 });
+        let has_peers = self.has_anarchord_connected.clone();
+        let is_lab = self.config.lab;
+        let base_interval = std::time::Duration::from_secs(if is_lab { 3 } else { 15 });
+        let max_interval = std::time::Duration::from_secs(if is_lab { 30 } else { 600 });
         tokio::task::spawn_blocking(move || {
             let info_hash = make_info_hash(DHT_DISCOVERY_NAMESPACE);
+            let mut seen_peers = std::collections::HashSet::<std::net::SocketAddr>::new();
+            let mut announced_trackers = std::collections::HashSet::<String>::new();
+
             loop {
+                let mut reported_interval: Option<u32> = None;
                 for tracker in &trackers {
-                    if let Ok(peers) = TorrentTrackerClient::discover_peers(tracker, &info_hash, &bt_peer_id, port) {
-                        for peer in peers {
-                            let _ = events.send(CoreEvent::Network(NetworkEvent::TrackerPeer(peer.to_string())));
+                    let first = !announced_trackers.contains(tracker);
+                    let event = if first { 2 } else { 0 }; // 2 = started, 0 = none
+                    if let Ok(resp) = TorrentTrackerClient::discover(tracker, &info_hash, &bt_peer_id, port, event) {
+                        announced_trackers.insert(tracker.clone());
+                        if resp.interval > 0 {
+                            reported_interval = Some(reported_interval.map_or(resp.interval, |cur| cur.max(resp.interval)));
+                        }
+                        for peer in resp.peers {
+                            // Não processa a si mesmo caso o tracker devolva
+                            if peer.port() == port && (peer.ip().is_loopback() || peer.ip().is_unspecified()) {
+                                continue;
+                            }
+                            if seen_peers.insert(peer) {
+                                let _ = events.send(CoreEvent::Network(NetworkEvent::TrackerPeer(peer.to_string())));
+                            }
                             let _ = tx.send(format!("/ip4/{}/tcp/{}", peer.ip(), peer.port()));
                             if tx.send(format!("/ip4/{}/udp/{}/quic-v1", peer.ip(), peer.port())).is_err() {
                                 return;
@@ -66,7 +85,18 @@ impl Runtime {
                         break;
                     }
                 }
-                std::thread::sleep(interval);
+
+                // Cálculo do próximo intervalo de consulta
+                let mut sleep_dur = if has_peers.load(std::sync::atomic::Ordering::Relaxed) {
+                    max_interval
+                } else {
+                    base_interval
+                };
+                if let Some(tracker_interval_secs) = reported_interval {
+                    sleep_dur = sleep_dur.max(std::time::Duration::from_secs(tracker_interval_secs as u64));
+                }
+
+                std::thread::sleep(sleep_dur);
             }
         });
     }
@@ -94,9 +124,15 @@ impl Runtime {
 
     pub(super) fn dial_discovered(&mut self, address: String) {
         if let Ok(multiaddr) = address.parse::<Multiaddr>() {
-            // O tracker repete os mesmos pares a cada 10 s: não redisca quem já está conectado
-            if !self.dialed_open.contains(&multiaddr) {
-                let _ = self.node.swarm.dial(multiaddr);
+            let now = std::time::Instant::now();
+            let redial_after = self.discovery.redial_after;
+            self.tracker_dial_attempts.retain(|_, at| now.duration_since(*at) < redial_after);
+
+            // Não redisca quem já está com conexão aberta nem quem tentou recentemente
+            if !self.dialed_open.contains(&multiaddr) && !self.tracker_dial_attempts.contains_key(&multiaddr) {
+                if self.node.swarm.dial(multiaddr.clone()).is_ok() {
+                    self.tracker_dial_attempts.insert(multiaddr, now);
+                }
             }
         }
     }
@@ -135,6 +171,8 @@ impl Runtime {
                     self.discovery.addresses.remove(&peer_id);
                     self.identified.remove(&peer_id);
                     self.relay_manager.remove_peer(&peer_id);
+                    let has_peers = self.anarchord_peers().next().is_some();
+                    self.has_anarchord_connected.store(has_peers, std::sync::atomic::Ordering::Relaxed);
                     if let Some((nick, _)) = self.peer_metadata.get(&peer_id).cloned() {
                         self.emit(CoreEvent::PeerLeft { peer_id: peer_id.to_string(), nick });
                         let cause = cause.map(|c| c.to_string()).unwrap_or_default();
@@ -172,6 +210,8 @@ impl Runtime {
                     }
                     if first || changed {
                         self.emit(CoreEvent::PeerIdentified { peer_id: peer_id.to_string(), nick, pubkey });
+                        let has_peers = self.anarchord_peers().next().is_some();
+                        self.has_anarchord_connected.store(has_peers, std::sync::atomic::Ordering::Relaxed);
                         self.publish_channel_members();
                     }
                 }

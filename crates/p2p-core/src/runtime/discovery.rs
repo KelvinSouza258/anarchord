@@ -147,7 +147,7 @@ impl Runtime {
     }
 
     /// Pares Anarchord identificados e conectados
-    fn anarchord_peers(&self) -> impl Iterator<Item = &PeerId> {
+    pub(super) fn anarchord_peers(&self) -> impl Iterator<Item = &PeerId> {
         self.identified.iter().filter(|p| self.connected_peers.contains(p))
     }
 

@@ -14,6 +14,14 @@ pub enum TrackerError {
     ResolutionFailed,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackerAnnounceResponse {
+    pub interval: u32,
+    pub leechers: u32,
+    pub seeders: u32,
+    pub peers: Vec<SocketAddr>,
+}
+
 /// Cliente UDP para BitTorrent Open Trackers (BEP 15)
 pub struct TorrentTrackerClient {
     pub socket: UdpSocket,
@@ -57,8 +65,8 @@ impl TorrentTrackerClient {
         Ok(connection_id)
     }
 
-    /// Envia Announce e recebe a lista de pares IP:Porta disponíveis
-    pub fn announce(
+    /// Envia Announce e recebe a resposta completa (intervalo, contadores e lista de pares)
+    pub fn announce_response(
         &self,
         tracker_addr: SocketAddr,
         connection_id: u64,
@@ -66,7 +74,7 @@ impl TorrentTrackerClient {
         peer_id: &[u8; 20],
         listen_port: u16,
         event: u32, // 0 = none, 1 = completed, 2 = started, 3 = stopped
-    ) -> Result<Vec<SocketAddr>, TrackerError> {
+    ) -> Result<TrackerAnnounceResponse, TrackerError> {
         let action: u32 = 1; // 1 = Announce
         let transaction_id: u32 = rand::random();
 
@@ -79,7 +87,7 @@ impl TorrentTrackerClient {
         packet.extend_from_slice(&0u64.to_be_bytes()); // downloaded
         packet.extend_from_slice(&0u64.to_be_bytes()); // left
         packet.extend_from_slice(&0u64.to_be_bytes()); // uploaded
-        packet.extend_from_slice(&event.to_be_bytes()); // event: 0=none, 3=stopped
+        packet.extend_from_slice(&event.to_be_bytes()); // event: 0=none, 1=completed, 2=started, 3=stopped
         packet.extend_from_slice(&0u32.to_be_bytes()); // IP address: 0 default
         packet.extend_from_slice(&rand::random::<u32>().to_be_bytes()); // key
         packet.extend_from_slice(&50i32.to_be_bytes()); // num_want: 50
@@ -100,6 +108,10 @@ impl TorrentTrackerClient {
             return Err(TrackerError::TransactionMismatch);
         }
 
+        let interval = u32::from_be_bytes(response[8..12].try_into().unwrap());
+        let leechers = u32::from_be_bytes(response[12..16].try_into().unwrap());
+        let seeders = u32::from_be_bytes(response[16..20].try_into().unwrap());
+
         // Os pares vêm compactados em blocos de 6 bytes: 4 bytes IP + 2 bytes Porta
         let mut peers = Vec::new();
         let peer_data = &response[20..bytes_read];
@@ -109,7 +121,26 @@ impl TorrentTrackerClient {
             peers.push(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)));
         }
 
-        Ok(peers)
+        Ok(TrackerAnnounceResponse {
+            interval,
+            leechers,
+            seeders,
+            peers,
+        })
+    }
+
+    /// Envia Announce e recebe a lista de pares IP:Porta disponíveis
+    pub fn announce(
+        &self,
+        tracker_addr: SocketAddr,
+        connection_id: u64,
+        info_hash: &[u8; 20],
+        peer_id: &[u8; 20],
+        listen_port: u16,
+        event: u32, // 0 = none, 1 = completed, 2 = started, 3 = stopped
+    ) -> Result<Vec<SocketAddr>, TrackerError> {
+        let resp = self.announce_response(tracker_addr, connection_id, info_hash, peer_id, listen_port, event)?;
+        Ok(resp.peers)
     }
 
     /// Resolve host:porta e busca pares anunciados
@@ -119,6 +150,18 @@ impl TorrentTrackerClient {
         peer_id: &[u8; 20],
         listen_port: u16,
     ) -> Result<Vec<SocketAddr>, TrackerError> {
+        let resp = Self::discover(tracker_host_port, info_hash, peer_id, listen_port, 2)?;
+        Ok(resp.peers)
+    }
+
+    /// Resolve host:porta, conecta e anuncia com evento configurável (started ou none)
+    pub fn discover(
+        tracker_host_port: &str,
+        info_hash: &[u8; 20],
+        peer_id: &[u8; 20],
+        listen_port: u16,
+        event: u32,
+    ) -> Result<TrackerAnnounceResponse, TrackerError> {
         let client = TorrentTrackerClient::new()?;
         let addr = tracker_host_port
             .to_socket_addrs()
@@ -127,7 +170,7 @@ impl TorrentTrackerClient {
             .ok_or(TrackerError::ResolutionFailed)?;
 
         let conn_id = client.connect_handshake(addr)?;
-        client.announce(addr, conn_id, info_hash, peer_id, listen_port, 2) // 2 = started
+        client.announce_response(addr, conn_id, info_hash, peer_id, listen_port, event)
     }
 
     /// Desanuncia do tracker notificando que o nó foi encerrado (event = stopped)
