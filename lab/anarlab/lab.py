@@ -50,9 +50,7 @@ class Lab:
         self.nats = {}
         self.nodes = {}
         self.publics = 0
-        self.bootstrap = None
         self.tracker_ip = None
-        self.bootstrap_node = None
 
     # ------------------------------------------------------------------ topologia
 
@@ -163,19 +161,17 @@ class Lab:
         raise StepFailed(f"{container} não ficou pronto (esperando '{marker}')")
 
     async def start_relay(self, name="relay"):
-        """Nó público que é bootstrap da DHT e servidor de relay; os outros nós usam ele como bootstrap"""
+        """Inicia o nó público de relay (--relay-server). Ele também é nó da DHT: os outros nós
+        o usam como bootstrap passando `*relay.bootstrap_args` no start"""
         relay = self.nodes[name]
         await relay.start("--relay-server", nick="Relay")
-        # TCP e QUIC: a conexão QUIC com o relay usa a mesma porta UDP da escuta, então o
-        # endereço observado serve para o hole punching (DCUtR)
-        self.bootstrap, self.bootstrap_node = [relay.address, relay.quic_address], relay
         return relay
 
     async def start_root(self, name="root"):
-        """Nó raiz da DHT (só bootstrap, sem relay); os outros nós usam ele como bootstrap"""
+        """Inicia o nó raiz da DHT (sem relay). Os outros nós o usam como bootstrap passando
+        `*root.bootstrap_args` no start"""
         root = self.nodes[name]
         await root.start(nick="Root")
-        self.bootstrap, self.bootstrap_node = [root.address, root.quic_address], root
         return root
 
     async def down(self, keep=False):

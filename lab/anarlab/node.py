@@ -9,6 +9,10 @@ from .events import get, kind
 
 DEFAULT_TIMEOUT = 45
 
+# Todo nó: modo laboratório (IPs privados valem como públicos, AutoNAT rápido), rede isolada
+# (--isolated: sem bootstraps do IPFS nem trackers públicos), sem mDNS, porta fixa
+BASE_ARGS = ["--lab", "--isolated", "--no-mdns", "--port", "4001"]
+
 
 class StepFailed(Exception):
     """Um passo do cenário não aconteceu no tempo esperado"""
@@ -33,14 +37,14 @@ class Node:
     # ------------------------------------------------------------------ processo
 
     async def start(self, *extra, nick=None):
-        """Inicia o agente no contêiner e espera o evento Started"""
+        """Inicia o agente no contêiner e espera o evento Started.
+
+        Argumentos fixos de todo nó do laboratório (BASE_ARGS): rede isolada, sem os bootstraps
+        do IPFS, sem trackers públicos e sem mDNS. Todo o resto vem do cenário em `extra`,
+        inclusive como o nó acha os outros (`*relay.bootstrap_args`, `--tracker`, `--connect`).
+        """
         self.nick = nick or self.name.capitalize()
-        # Rede isolada: nada de bootstrap/trackers públicos nem mDNS; só o que o cenário passar
-        args = ["--nick", self.nick, "--data-dir", "/data/agent", "--lab", "--isolated", "--no-mdns", "--port", "4001"]
-        if self.lab.bootstrap and self.lab.bootstrap_node is not self:
-            for address in self.lab.bootstrap:
-                args += ["--bootstrap", address]
-        args += list(extra)
+        args = ["--nick", self.nick, "--data-dir", "/data/agent", *BASE_ARGS, *extra]
         self.proc = await asyncio.create_subprocess_exec(
             "docker", "exec", "-i", "-e", f"RUST_LOG={os.environ.get('LAB_RUST_LOG', 'warn')}", self.container, "anarchord-agent", *args,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -179,6 +183,15 @@ class Node:
     def quic_address(self):
         """Endereço direto (QUIC) do nó, com /p2p/<id>"""
         return f"/ip4/{self.ip}/udp/4001/quic-v1/p2p/{self.peer_id}"
+
+    @property
+    def bootstrap_args(self):
+        """Argumentos para outro nó usar este como bootstrap da DHT (TCP e QUIC).
+
+        O QUIC importa para o hole punching: a conexão QUIC usa a mesma porta UDP da escuta,
+        então o endereço que o relay observa serve para o DCUtR.
+        """
+        return ["--bootstrap", self.address, "--bootstrap", self.quic_address]
 
     @property
     def downloads(self):

@@ -1,7 +1,12 @@
 """Cenários do laboratório: testes de ponta a ponta com vários nós, cada um atrás do seu NAT.
 
 Cada cenário recebe um `Lab` vazio, monta a topologia, sobe os contêineres (`await lab.up()`),
-dirige os nós com comandos e valida com `wait`. Um passo que não acontece no tempo levanta
+dirige os nós com comandos e valida com `wait`.
+
+Os argumentos de cada nó ficam explícitos no `start`. Só os fixos de todo nó (rede isolada,
+sem mDNS, porta 4001) vêm de `anarlab.node.BASE_ARGS`. Como o nó acha os outros é sempre do
+cenário: `*relay.bootstrap_args` (DHT pelo relay), `*root.bootstrap_args` (DHT pelo nó raiz),
+`--tracker` ou `--connect`. Um passo que não acontece no tempo levanta
 StepFailed, e o cenário falha com o log completo em lab/results/<cenário>/events.log.
 """
 
@@ -17,9 +22,9 @@ async def hole_punching_cone(lab):
     alice, bob = lab.peer("alice", a), lab.peer("bob", b)
     lab.relay()
     await lab.up()
-    await lab.start_relay()
-    await alice.start()
-    await bob.start()
+    relay = await lab.start_relay()
+    await alice.start(*relay.bootstrap_args)
+    await bob.start(*relay.bootstrap_args)
 
     lab.step("os dois detectam o NAT e reservam um endereço no relay")
     await lab.relay_address(alice)
@@ -44,9 +49,9 @@ async def symmetric_nat_relay(lab):
     alice, bob = lab.peer("alice", a), lab.peer("bob", b)
     lab.relay()
     await lab.up()
-    await lab.start_relay()
-    await alice.start()
-    await bob.start()
+    relay = await lab.start_relay()
+    await alice.start(*relay.bootstrap_args)
+    await bob.start(*relay.bootstrap_args)
 
     lab.step("conexão pelo relay")
     await lab.connect(bob, alice)
@@ -74,9 +79,9 @@ async def chat_three_lans(lab):
     alice, bob, carol = nodes
     lab.relay()
     await lab.up()
-    await lab.start_relay()
+    relay = await lab.start_relay()
     for node in nodes:
-        await node.start()
+        await node.start(*relay.bootstrap_args)
 
     lab.step("malha completa: Bob e Carol conectam em Alice, Carol em Bob")
     await lab.connect(bob, alice)
@@ -102,9 +107,9 @@ async def file_swarm(lab):
     alice, bob, carol = (lab.peer(n, lab.nat(n)) for n in ("alice", "bob", "carol"))
     lab.relay()
     await lab.up()
-    await lab.start_relay()
+    relay = await lab.start_relay()
     for node in (alice, bob, carol):
-        await node.start()
+        await node.start(*relay.bootstrap_args)
     await lab.connect(bob, alice)
     await lab.connect(carol, alice)
     await lab.connect(carol, bob)
@@ -135,9 +140,9 @@ async def resume_download(lab):
     alice, bob = lab.peer("alice", lab.nat("a"), netem="rate 8mbit"), lab.peer("bob", lab.nat("b"))
     lab.relay()
     await lab.up()
-    await lab.start_relay()
-    await alice.start()
-    await bob.start()
+    relay = await lab.start_relay()
+    await alice.start(*relay.bootstrap_args)
+    await bob.start(*relay.bootstrap_args)
     await lab.connect(bob, alice)
     await lab.join_room("arquivos", alice, bob)
 
@@ -159,7 +164,7 @@ async def resume_download(lab):
 
     lab.step("Bob volta, reconecta e o download continua de onde parou")
     mark = bob.mark()
-    await bob.start()
+    await bob.start(*relay.bootstrap_args)
     await bob.wait("File.Started", where=lambda s: s["name"] == "grande.bin", since=mark, desc="download retomado")
     await lab.connect(bob, alice)
     await bob.wait("File.Completed", where=lambda c: c["name"] == "grande.bin", since=mark, timeout=240)
@@ -171,9 +176,9 @@ async def server_lifecycle(lab):
     alice, bob = lab.peer("alice", lab.nat("a")), lab.peer("bob", lab.nat("b"))
     lab.relay()
     await lab.up()
-    await lab.start_relay()
-    await alice.start()
-    await bob.start()
+    relay = await lab.start_relay()
+    await alice.start(*relay.bootstrap_args)
+    await bob.start(*relay.bootstrap_args)
     await lab.connect(bob, alice)
     await lab.join_room("geral", alice, bob)
 
@@ -222,9 +227,9 @@ async def voice_and_screen(lab):
     alice, bob = lab.peer("alice", lab.nat("a")), lab.peer("bob", lab.nat("b"))
     lab.relay()
     await lab.up()
-    await lab.start_relay()
-    await alice.start("--synth-audio", "--synth-video", "--auto-voice", "sala")
-    await bob.start("--auto-voice", "sala")
+    relay = await lab.start_relay()
+    await alice.start(*relay.bootstrap_args, "--synth-audio", "--synth-video", "--auto-voice", "sala")
+    await bob.start(*relay.bootstrap_args, "--auto-voice", "sala")
     await lab.connect(bob, alice)
 
     lab.step("Bob ouve Alice na sala de voz")
@@ -245,9 +250,9 @@ async def lossy_network(lab):
     bob = lab.peer("bob", lab.nat("b"), netem="delay 40ms loss 3%")
     lab.relay()
     await lab.up()
-    await lab.start_relay()
-    await alice.start()
-    await bob.start()
+    relay = await lab.start_relay()
+    await alice.start(*relay.bootstrap_args)
+    await bob.start(*relay.bootstrap_args)
     await lab.connect(bob, alice, timeout=90)
     await lab.join_room("sala", alice, bob, timeout=90)
 
@@ -318,9 +323,9 @@ async def dht_root_bootstrap(lab):
     alice, bob = lab.public("alice"), lab.public("bob")
     lab.root()
     await lab.up()
-    await lab.start_root()
-    await alice.start()
-    await bob.start()
+    root = await lab.start_root()
+    await alice.start(*root.bootstrap_args)
+    await bob.start(*root.bootstrap_args)
 
     lab.step("os dois entram na DHT pelo nó raiz e se acham pelo registro de provedor")
     await alice.wait("Network.DhtBootstrap", where=lambda b: b["nodes"] >= 1)
