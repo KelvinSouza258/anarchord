@@ -115,13 +115,16 @@ impl Runtime {
                 let address = endpoint.get_remote_address().clone();
                 // Do lado de quem recebe, o endereço de uma conexão relayada é só /p2p/<id>
                 let relayed = endpoint.is_relayed();
-                // Avisa a primeira conexão e a primeira direta (ex.: depois do hole punching)
+                // Guarda a primeira conexão e a primeira direta (ex.: depois do hole punching). Só
+                // avisa a interface se o par já foi identificado como Anarchord; senão o aviso sai
+                // no Identify. Conexões com nós do IPFS (DHT) nunca viram evento
                 let first = self.connected_peers.insert(peer_id);
-                if first || (!relayed && self.relayed_only.remove(&peer_id)) {
-                    if relayed {
-                        self.relayed_only.insert(peer_id);
+                let upgrade = !relayed && self.links.get(&peer_id).is_some_and(|(_, r)| *r);
+                if first || upgrade {
+                    self.links.insert(peer_id, (address.to_string(), relayed));
+                    if self.identified.contains(&peer_id) {
+                        self.emit(CoreEvent::Network(NetworkEvent::Connected { peer_id: peer_id.to_string(), address: address.to_string(), relayed }));
                     }
-                    self.emit(CoreEvent::Network(NetworkEvent::Connected { peer_id: peer_id.to_string(), address: address.to_string(), relayed }));
                 }
                 if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
                     self.dialed_open.insert(address.clone());
@@ -135,7 +138,7 @@ impl Runtime {
                 }
                 if num_established == 0 {
                     self.connected_peers.remove(&peer_id);
-                    self.relayed_only.remove(&peer_id);
+                    self.links.remove(&peer_id);
                     self.identified.remove(&peer_id);
                     self.relay_manager.remove_peer(&peer_id);
                     if let Some((nick, _)) = self.peer_metadata.get(&peer_id).cloned() {
@@ -161,7 +164,13 @@ impl Runtime {
                 if let Some((nick, pubkey)) = parse_agent_version(&info.agent_version) {
                     // O Identify se repete a cada conexão: só avisa na primeira identificação ou se o nick mudou
                     let changed = self.peer_metadata.insert(peer_id, (nick.clone(), pubkey.clone())) != Some((nick.clone(), pubkey.clone()));
-                    if self.identified.insert(peer_id) || changed {
+                    let first = self.identified.insert(peer_id);
+                    if first {
+                        if let Some((address, relayed)) = self.links.get(&peer_id).cloned() {
+                            self.emit(CoreEvent::Network(NetworkEvent::Connected { peer_id: peer_id.to_string(), address, relayed }));
+                        }
+                    }
+                    if first || changed {
                         self.emit(CoreEvent::PeerIdentified { peer_id: peer_id.to_string(), nick, pubkey });
                         self.publish_channel_members();
                     }

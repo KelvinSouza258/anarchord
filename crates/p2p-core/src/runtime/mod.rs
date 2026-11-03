@@ -182,8 +182,9 @@ pub(crate) struct Runtime {
 
     // Rede
     connected_peers: HashSet<PeerId>,
-    /// Pares com quem só há conexão via relay (para avisar quando surgir uma direta)
-    relayed_only: HashSet<PeerId>,
+    /// Melhor conexão conhecida com cada par: (endereço, relayed). O `Connected` só é emitido
+    /// para pares Anarchord identificados (a maioria das conexões é com nós do IPFS na DHT)
+    links: HashMap<PeerId, (String, bool)>,
     /// PeerId -> (nick, pubkey) dos pares Anarchord identificados
     peer_metadata: HashMap<PeerId, (String, String)>,
     /// Pares já anunciados na interface desde que conectaram
@@ -230,7 +231,7 @@ impl Runtime {
             events,
             node,
             connected_peers: HashSet::new(),
-            relayed_only: HashSet::new(),
+            links: HashMap::new(),
             peer_metadata: HashMap::new(),
             identified: HashSet::new(),
             dialed_open: HashSet::new(),
