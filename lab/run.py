@@ -3,7 +3,8 @@
 
     python lab/run.py                 # compila a imagem e roda todos
     python lab/run.py chat file       # só cenários cujo nome contém "chat" ou "file"
-    python lab/run.py --no-build      # usa a imagem anarchord-lab já compilada
+    python lab/run.py --keep-images   # não apaga as imagens no fim (para repetir com --no-build)
+    python lab/run.py --no-build      # usa a imagem anarchord-lab já compilada (de um --keep-images)
     python lab/run.py --keep          # não derruba os contêineres do cenário que falhar
     python lab/run.py --list          # lista os cenários
     python lab/run.py --target-volume # artefatos do cargo num volume do Docker (mais rápido fora do Linux)
@@ -91,6 +92,20 @@ def cleanup_leftovers():
         subprocess.run(["docker", "network", "rm", *networks], capture_output=True)
 
 
+def remove_images():
+    """Apaga as imagens do laboratório (anarchord-lab e anarchord-toolchain). Os artefatos do
+    cargo ficam em target/lab-linux, então a próxima compilação só refaz a imagem, não o código"""
+    for image in (IMAGE, "anarchord-toolchain"):
+        subprocess.run(["docker", "rmi", "-f", image], capture_output=True)
+    # Versões anteriores, que ficaram sem nome quando uma compilação nova tomou a tag
+    subprocess.run(["docker", "image", "prune", "-f", "--filter", "label=anarchord.lab=1"], capture_output=True)
+    print("🧹 Imagens do laboratório removidas (use --keep-images para mantê-las)", flush=True)
+
+
+def image_exists():
+    return subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True).returncode == 0
+
+
 async def run_one(name, title, fn, keep, timeout):
     lab = Lab(name, ROOT / "results")
     started = time.time()
@@ -117,6 +132,7 @@ async def main():
     parser.add_argument("filters", nargs="*", help="roda só cenários cujo nome contém um destes textos")
     parser.add_argument("--no-build", action="store_true", help="não recompila a imagem")
     parser.add_argument("--keep", action="store_true", help="mantém os contêineres de cenários que falharem")
+    parser.add_argument("--keep-images", action="store_true", help="não apaga as imagens do laboratório no fim")
     parser.add_argument("--list", action="store_true", help="lista os cenários e sai")
     parser.add_argument("--target-volume", action="store_true",
                         help="artefatos do cargo num volume do Docker em vez de target/lab-linux (mais rápido no Windows/macOS)")
@@ -131,9 +147,22 @@ async def main():
     if not selected:
         print("Nenhum cenário corresponde aos filtros.")
         return 1
-    if not args.no_build:
-        build_image(args.target_volume)
+    if args.no_build and not image_exists():
+        print(f"A imagem {IMAGE} não existe: rode sem --no-build (e com --keep-images para reaproveitá-la depois).")
+        return 1
+    try:
+        if not args.no_build:
+            build_image(args.target_volume)
+        return await run_all(selected, args)
+    finally:
+        # Com --keep, os contêineres de cenários que falharam ficam para inspeção
+        if not args.keep:
+            cleanup_leftovers()
+        if not args.keep_images:
+            remove_images()
 
+
+async def run_all(selected, args):
     cleanup_leftovers()
     results = []
     for index, (name, title, fn) in enumerate(selected, 1):

@@ -15,6 +15,8 @@ ARG BINS=docker
 # ==============================================================================
 # Mesma distribuição do runtime (bookworm): a glibc do build e da execução batem
 FROM rust:1-bookworm AS toolchain
+# Marca as imagens do laboratório para o run.py apagá-las no fim (inclusive versões antigas sem nome)
+LABEL anarchord.lab=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake nasm clang pkg-config \
     libasound2-dev libxcb1-dev libxcb-randr0-dev libgbm-dev \
@@ -46,6 +48,7 @@ FROM bins-${BINS} AS bins
 # Runtime
 # ==============================================================================
 FROM debian:bookworm-slim AS runtime
+LABEL anarchord.lab=1
 
 # Bibliotecas de runtime e ferramentas do laboratório (rotas, NAT, netem, tracker em Python)
 RUN apt-get update && apt-get install -y --no-install-recommends \
