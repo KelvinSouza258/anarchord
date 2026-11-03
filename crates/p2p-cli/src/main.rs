@@ -640,4 +640,25 @@ mod tests {
             })
             .await;
     }
+
+    /// Testa que o runtime do app permanece ativo e não encerra prematuramente
+    /// até que a UI ou o comando de encerramento seja emitido.
+    #[tokio::test]
+    async fn test_app_runtime_does_not_exit_prematurely() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (app, _) = FakeUi::start("Dave", None);
+                // Espera 3.5 segundos (tempo superior ao antigo timeout de 3s)
+                tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+
+                // Envia comando para garantir que o runtime e a ponte ainda estão vivos e operantes
+                app.type_line("/peers");
+                // Se o runtime tivesse encerrado, o canal estaria fechado e não receberíamos nada
+                let mut app = app;
+                let log = app.wait_log("resposta ao comando /peers após tempo de espera", "Pares Anarchord conectados").await;
+                assert!(log.contains("Pares Anarchord conectados"));
+            })
+            .await;
+    }
 }
