@@ -558,4 +558,126 @@ mod tests {
         assert_eq!(servers_dir_for(Path::new("dados/bob.json")), PathBuf::from("dados/bob.servers"));
         assert_ne!(servers_dir_for(Path::new("alice.json")), servers_dir_for(Path::new("bob.json")));
     }
+
+    #[test]
+    fn test_text_commands_become_core_commands() {
+        let command = |text: &str| parse_user_input(text).into_command();
+        assert!(matches!(command("/share \"C:\\a b.txt\""), Some(CoreCommand::ShareFile(p)) if p == Path::new("C:\\a b.txt")));
+        assert!(matches!(command("/send Bob foto.png"), Some(CoreCommand::SendFile { to, path }) if to == "Bob" && path == Path::new("foto.png")));
+        assert!(matches!(command("/get bafk1234"), Some(CoreCommand::GetFile(q)) if q == "bafk1234"));
+        assert!(matches!(command("/accept bafk1234"), Some(CoreCommand::GetFile(q)) if q == "bafk1234"));
+        assert!(matches!(command("/reject bafk1234"), Some(CoreCommand::RejectFile(q)) if q == "bafk1234"));
+        assert!(matches!(command("/unshare notas.txt"), Some(CoreCommand::Unshare(q)) if q == "notas.txt"));
+        assert!(matches!(command("/files"), Some(CoreCommand::ListFiles)));
+        assert!(matches!(command("/screen start 1 1080"), Some(CoreCommand::StartScreenShare { monitor: 1, quality: 1080 })));
+        assert!(matches!(command("/voice join papo"), Some(CoreCommand::JoinVoice(r)) if r == "papo"));
+        assert!(matches!(command("/server create Guilda"), Some(CoreCommand::Server(ServerCommand::Create(n))) if n == "Guilda"));
+        assert!(matches!(command("olá"), Some(CoreCommand::SendMessage(t)) if t == "olá"));
+        assert!(command("/screen watch Alice").is_none(), "assistir precisa da janela: tratado pela ponte");
+        assert!(command("").is_none());
+    }
+
+    /// Uma TUI de mentira ligada a um core de verdade pela mesma ponte do app
+    struct FakeUi {
+        actions: UnboundedSender<UiAction>,
+        events: UnboundedReceiver<UiEvent>,
+        seen: Vec<UiEvent>,
+        downloads: PathBuf,
+    }
+
+    impl FakeUi {
+        fn start(nick: &str, connect_to: Option<u16>) -> (Self, u16) {
+            let base = std::env::temp_dir().join(format!("anarchord_cli_{}_{}_{}", nick, std::process::id(), PeerId::random()));
+            let mut config = CoreConfig::new(UserIdentity::generate_with_nick(nick), base.join("servers"), base.join("downloads"));
+            config.connect = connect_to.map(|port| format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap());
+            let (core, task) = Core::start(config).unwrap();
+            let port = task.listen_port();
+            let (commands, core_events) = core.split();
+            let (tx_ui, events) = tokio::sync::mpsc::unbounded_channel();
+            let (actions, rx_actions) = tokio::sync::mpsc::unbounded_channel();
+            tokio::task::spawn_local(task.run());
+            tokio::task::spawn_local(bridge(core_events, rx_actions, commands, tx_ui, Arc::new(AtomicBool::new(false))));
+            (Self { actions, events, seen: Vec::new(), downloads: base.join("downloads") }, port)
+        }
+
+        /// Digita uma linha na caixa de texto
+        fn type_line(&self, text: &str) {
+            self.actions.send(UiAction::SendMessage(text.to_string())).unwrap();
+        }
+
+        async fn wait(&mut self, what: &str, pred: impl Fn(&UiEvent) -> bool) -> UiEvent {
+            if let Some(found) = self.seen.iter().find(|e| pred(e)) {
+                return found.clone();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    let event = self.events.recv().await.expect("ponte encerrou");
+                    self.seen.push(event.clone());
+                    if pred(&event) {
+                        return event;
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("tempo esgotado esperando: {}", what))
+        }
+
+        async fn wait_log(&mut self, what: &str, needle: &str) -> String {
+            let needle = needle.to_string();
+            match self.wait(what, move |e| matches!(e, UiEvent::SystemLog(t) if t.contains(&needle))).await {
+                UiEvent::SystemLog(text) => text,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// `/share`, `/get`, `/files`, `/unshare` e `/reject` digitados na TUI, passando pela ponte,
+    /// por dois cores reais e pela rede, até o que a TUI mostra
+    #[tokio::test]
+    async fn test_share_and_get_typed_in_the_tui() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut alice, port) = FakeUi::start("Alice", None);
+                let (mut bob, _) = FakeUi::start("Bob", Some(port));
+                // Sala exclusiva do teste, para não misturar com nós reais na LAN (mDNS)
+                let room = format!("arquivos-{}", PeerId::random());
+                alice.type_line(&format!("/join {}", room));
+                bob.type_line(&format!("/join {}", room));
+                let r = room.clone();
+                alice
+                    .wait("Alice ver Bob na sala", move |e| {
+                        matches!(e, UiEvent::ChannelMembers { channel, members } if *channel == r && members.iter().any(|m| m == "Bob"))
+                    })
+                    .await;
+
+                let dir = std::env::temp_dir().join(format!("anarchord_cli_share_{}", PeerId::random()));
+                std::fs::create_dir_all(&dir).unwrap();
+                let path = dir.join("notas.txt");
+                let data: Vec<u8> = (0..600_000).map(|i| (i % 251) as u8).collect();
+                std::fs::write(&path, &data).unwrap();
+
+                alice.type_line(&format!("/share \"{}\"", path.display()));
+                alice.wait_log("Alice compartilhar", "compartilhado (id").await;
+                let offer = bob.wait_log("oferta aparecer para Bob", "compartilhou 'notas.txt'").await;
+                let id = offer.rsplit("/get ").next().unwrap().trim().to_string();
+
+                bob.type_line("/reject zzzz");
+                bob.wait_log("id inexistente", "nenhum arquivo com id ou nome 'zzzz'").await;
+                bob.type_line(&format!("/get {}", id));
+                bob.wait("barra de progresso chegar a 100%", |e| matches!(e, UiEvent::FileTransferProgress { percentage, .. } if *percentage >= 100.0))
+                    .await;
+                let saved = bob.wait_log("arquivo salvo", "salvo em").await;
+                assert!(saved.contains("notas.txt"), "{}", saved);
+                assert_eq!(std::fs::read(bob.downloads.join("notas.txt")).unwrap(), data);
+
+                bob.type_line("/files");
+                bob.wait_log("Bob listar e já estar compartilhando", "notas.txt (586 KB) — compartilhando").await;
+                alice.type_line("/unshare notas.txt");
+                alice.wait_log("Alice parar de compartilhar", "não está mais sendo compartilhado").await;
+                alice.type_line("/files");
+                alice.wait_log("lista vazia", "Nenhum arquivo").await;
+            })
+            .await;
+    }
 }
