@@ -272,12 +272,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // O loop do core roda nesta tarefa enquanto a UI estiver aberta
+    let run = task.run();
+    tokio::pin!(run);
     tokio::select! {
-        _ = task.run() => {},
-        _ = ui_handle => {},
+        _ = &mut run => {},
+        // A UI fechou (o Shutdown já foi enviado): o core termina de desanunciar o nó
+        _ = ui_handle => { let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut run).await; }
     }
     TerminalUi::restore_terminal();
-    Ok(())
+    // Encerra na hora: threads de áudio, captura e rede não seguram o processo
+    std::process::exit(0)
 }
 
 fn setup_logging(args: &Args) -> Result<(), Box<dyn std::error::Error>> {

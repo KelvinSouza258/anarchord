@@ -54,7 +54,9 @@ impl Runtime {
         let is_lab = self.config.lab;
         let base_interval = std::time::Duration::from_secs(if is_lab { 3 } else { 15 });
         let max_interval = std::time::Duration::from_secs(if is_lab { 30 } else { 600 });
-        tokio::task::spawn_blocking(move || {
+        // Thread comum, não `spawn_blocking`: o laço não termina, e o runtime do tokio espera
+        // as tarefas bloqueantes ao ser descartado (o app travava ao sair)
+        std::thread::spawn(move || {
             let info_hash = make_info_hash(DHT_DISCOVERY_NAMESPACE);
             let mut seen_peers = std::collections::HashSet::<std::net::SocketAddr>::new();
             let mut announced_trackers = std::collections::HashSet::<String>::new();
