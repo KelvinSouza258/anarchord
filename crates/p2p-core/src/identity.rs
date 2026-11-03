@@ -47,6 +47,18 @@ pub struct IdentityKeys {
     pub public_key_pem: String,
 }
 
+/// Registro de amigo / contato na lista de amigos local
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FriendEntry {
+    /// Chave pública Ed25519 em hexadecimal (64 caracteres)
+    pub public_key: String,
+    /// Apelido customizado definido localmente pelo usuário
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// Timestamp Unix (segundos) de quando foi adicionado
+    pub added_at: u64,
+}
+
 /// Documento JSON persistido da Identidade do Usuário
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IdentityDocument {
@@ -55,12 +67,15 @@ pub struct IdentityDocument {
     pub user_id: String,
     pub profile: UserProfile,
     pub keys: IdentityKeys,
+    #[serde(default)]
+    pub friends: Vec<FriendEntry>,
 }
 
 /// Identidade Permanente do Usuário em memória
 #[derive(Clone)]
 pub struct UserIdentity {
     pub profile: UserProfile,
+    pub friends: Vec<FriendEntry>,
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
 }
@@ -81,6 +96,7 @@ impl UserIdentity {
                 display_name: nick.to_string(),
                 ..Default::default()
             },
+            friends: Vec::new(),
             signing_key,
             verifying_key,
         }
@@ -107,6 +123,7 @@ impl UserIdentity {
                 let verifying_key = signing_key.verifying_key();
                 let identity = Self {
                     profile: UserProfile::default(),
+                    friends: Vec::new(),
                     signing_key,
                     verifying_key,
                 };
@@ -124,6 +141,7 @@ impl UserIdentity {
                     let verifying_key = signing_key.verifying_key();
                     let identity = Self {
                         profile: UserProfile::default(),
+                        friends: Vec::new(),
                         signing_key,
                         verifying_key,
                     };
@@ -163,6 +181,7 @@ impl UserIdentity {
 
         Ok(Self {
             profile: doc.profile.clone(),
+            friends: doc.friends.clone(),
             signing_key,
             verifying_key,
         })
@@ -195,6 +214,7 @@ impl UserIdentity {
                 private_key_pem: priv_pem.to_string(),
                 public_key_pem: pub_pem,
             },
+            friends: self.friends.clone(),
         })
     }
 
@@ -215,6 +235,46 @@ impl UserIdentity {
     /// Atualiza o apelido do perfil
     pub fn set_nick(&mut self, nick: &str) {
         self.profile.display_name = nick.to_string();
+    }
+
+    /// Adiciona ou atualiza um amigo na lista local
+    pub fn add_friend(&mut self, pubkey_hex: &str, alias: Option<&str>) -> Result<(), IdentityError> {
+        let pubkey_clean = pubkey_hex.trim().to_lowercase();
+        if hex_decode_32(&pubkey_clean).is_err() {
+            return Err(IdentityError::InvalidKey("A chave pública deve ter exatamente 64 caracteres hexadecimais (32 bytes)".into()));
+        }
+        if pubkey_clean == self.public_key_hex().to_lowercase() {
+            return Err(IdentityError::InvalidKey("Você não pode adicionar a si mesmo como amigo".into()));
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if let Some(existing) = self.friends.iter_mut().find(|f| f.public_key.eq_ignore_ascii_case(&pubkey_clean)) {
+            existing.alias = alias.map(|a| a.trim().to_string());
+        } else {
+            self.friends.push(FriendEntry {
+                public_key: pubkey_clean,
+                alias: alias.map(|a| a.trim().to_string()),
+                added_at: now,
+            });
+        }
+        Ok(())
+    }
+
+    /// Remove um amigo da lista local pelo pubkey_hex. Retorna `true` se encontrou e removeu.
+    pub fn remove_friend(&mut self, pubkey_hex: &str) -> bool {
+        let pubkey_clean = pubkey_hex.trim().to_lowercase();
+        let initial_len = self.friends.len();
+        self.friends.retain(|f| !f.public_key.eq_ignore_ascii_case(&pubkey_clean));
+        self.friends.len() < initial_len
+    }
+
+    /// Retorna a lista de amigos cadastrados
+    pub fn get_friends(&self) -> &[FriendEntry] {
+        &self.friends
     }
 
     /// Retorna a chave pública (UserID) em formato Hexadecimal legível
@@ -340,6 +400,43 @@ mod tests {
         let updated_content = fs::read_to_string(&key_file).unwrap();
         assert!(updated_content.contains("BEGIN PRIVATE KEY"));
         assert!(updated_content.contains("\"version\": 1"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_friends_management_and_persistence() {
+        let temp_dir = std::env::temp_dir().join(format!("p2p_test_friends_{}", std::process::id()));
+        let key_file = temp_dir.join("identity.json");
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let mut user = UserIdentity::generate_with_nick("Alice");
+        let friend_id = UserIdentity::generate_with_nick("Bob");
+        let friend_pk = friend_id.public_key_hex();
+
+        // Adicionar a si mesmo deve falhar
+        assert!(user.add_friend(&user.public_key_hex(), None).is_err());
+        // Chave inválida deve falhar
+        assert!(user.add_friend("chave_invalida", None).is_err());
+
+        // Adicionar Bob
+        assert!(user.add_friend(&friend_pk, Some("Bobby")).is_ok());
+        assert_eq!(user.get_friends().len(), 1);
+        assert_eq!(user.get_friends()[0].public_key, friend_pk);
+        assert_eq!(user.get_friends()[0].alias.as_deref(), Some("Bobby"));
+
+        // Persistir e recarregar
+        user.save_to(&key_file).unwrap();
+        let loaded = UserIdentity::load_or_create(&key_file).unwrap();
+        assert_eq!(loaded.get_friends().len(), 1);
+        assert_eq!(loaded.get_friends()[0].public_key, friend_pk);
+        assert_eq!(loaded.get_friends()[0].alias.as_deref(), Some("Bobby"));
+
+        // Remover amigo
+        let mut loaded = loaded;
+        assert!(loaded.remove_friend(&friend_pk));
+        assert_eq!(loaded.get_friends().len(), 0);
+        assert!(!loaded.remove_friend(&friend_pk)); // já removido
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

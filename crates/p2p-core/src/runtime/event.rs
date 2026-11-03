@@ -32,12 +32,28 @@ pub enum CoreEvent {
     File(FileEvent),
     /// Resposta a `ListFiles`
     Files(Vec<FileSummary>),
+    /// Resposta a `ListFriends` e atualizações de presença de amigos
+    Friends(Vec<FriendStatus>),
+    /// Um amigo ficou online ou offline
+    FriendPresence { public_key: String, alias: Option<String>, online: bool },
+    /// Amigo adicionado ou removido com sucesso
+    FriendUpdated { pubkey: String, alias: Option<String>, removed: bool },
     /// Lendo o arquivo para montar o manifesto
     FilePreparing { name: String },
     Server(ServerNotice),
     Error(CoreError),
     /// O nó encerrou (depois de `Shutdown`)
     Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FriendStatus {
+    pub public_key: String,
+    pub alias: Option<String>,
+    pub added_at: u64,
+    pub online: bool,
+    pub current_nick: Option<String>,
+    pub peer_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -215,6 +231,7 @@ pub enum CoreError {
     /// Erro de regra de servidor (permissão, nível, canal...)
     Server(String),
     File(String),
+    Friend(String),
     Io { context: String, message: String },
     Network(String),
 }

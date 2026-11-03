@@ -77,6 +77,9 @@ pub enum ChatAction {
     RejectFile(String),
     ListFiles,
     Unshare(String),
+    AddFriend { pubkey: String, alias: Option<String> },
+    RemoveFriend(String),
+    ListFriends,
     ScreenStart { monitor_idx: usize, quality: u32 },
     ScreenStop,
     ScreenWatch(String),
@@ -180,6 +183,22 @@ pub fn parse_user_input(input: &str) -> ChatAction {
     if trimmed == "/files" {
         return ChatAction::ListFiles;
     }
+    if trimmed == "/friends" || trimmed == "/amigos" || trimmed == "/friend" {
+        return ChatAction::ListFriends;
+    }
+    for prefix in ["/friend ", "/amigo "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix).map(str::trim) {
+            let mut parts = rest.splitn(3, char::is_whitespace);
+            match (parts.next(), parts.next().map(str::trim), parts.next().map(str::trim)) {
+                (Some("add"), Some(pubkey), alias) if !pubkey.is_empty() => {
+                    return ChatAction::AddFriend { pubkey: pubkey.to_string(), alias: alias.filter(|a| !a.is_empty()).map(str::to_string) };
+                }
+                (Some("remove" | "rm"), Some(pubkey), _) if !pubkey.is_empty() => return ChatAction::RemoveFriend(pubkey.to_string()),
+                (Some("list"), _, _) => return ChatAction::ListFriends,
+                _ => {}
+            }
+        }
+    }
     ChatAction::SendTextMessage(trimmed.to_string())
 }
 
@@ -196,6 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = CoreConfig {
+        identity_path: Some(args.identity_file.clone()),
         identity: identity.clone(),
         port: args.port,
         servers_dir: servers_dir_for(&args.identity_file),
@@ -392,6 +412,9 @@ impl ChatAction {
             ChatAction::RejectFile(query) => CoreCommand::RejectFile(query),
             ChatAction::ListFiles => CoreCommand::ListFiles,
             ChatAction::Unshare(query) => CoreCommand::Unshare(query),
+            ChatAction::AddFriend { pubkey, alias } => CoreCommand::AddFriend { pubkey, alias },
+            ChatAction::RemoveFriend(pubkey) => CoreCommand::RemoveFriend { pubkey },
+            ChatAction::ListFriends => CoreCommand::ListFriends,
             ChatAction::ScreenStart { monitor_idx, quality } => CoreCommand::StartScreenShare { monitor: monitor_idx, quality },
             ChatAction::ScreenStop => CoreCommand::StopScreenShare,
             ChatAction::ScreenList => CoreCommand::ListScreens,
@@ -459,6 +482,39 @@ mod tests {
             parse_user_input("/reject 8f4a123b"),
             ChatAction::RejectFile("8f4a123b".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_friend_commands() {
+        let pk = "a".repeat(64);
+        assert_eq!(parse_user_input("/friends"), ChatAction::ListFriends);
+        assert_eq!(
+            parse_user_input(&format!("/friend add {} Bob da Silva", pk)),
+            ChatAction::AddFriend { pubkey: pk.clone(), alias: Some("Bob da Silva".into()) }
+        );
+        assert_eq!(parse_user_input(&format!("/friend add {}", pk)), ChatAction::AddFriend { pubkey: pk.clone(), alias: None });
+        assert_eq!(parse_user_input(&format!("/friend remove {}", pk)), ChatAction::RemoveFriend(pk));
+    }
+
+    /// Amigo adicionado pela TUI aparece offline e passa a online quando o par conecta
+    #[tokio::test]
+    async fn test_friend_presence_typed_in_the_tui() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut alice, port) = FakeUi::start("Alice", None);
+                alice.type_line("/friend add nao-e-chave");
+                alice.wait_log("chave inválida recusada", "Amigos:").await;
+
+                let (bob, _) = FakeUi::start("Bob", Some(port));
+                let bob_key = bob.pubkey.clone();
+                alice.wait("Alice identificar Bob", move |e| matches!(e, UiEvent::PeerConnected { pubkey, .. } if *pubkey == bob_key)).await;
+
+                alice.type_line(&format!("/friend add {} Bobby", bob.pubkey));
+                alice.wait_log("amigo adicionado", "Bobby adicionado").await;
+                alice.wait_log("lista com Bob online", "🟢 Bobby").await;
+            })
+            .await;
     }
 
     #[test]
@@ -543,12 +599,15 @@ mod tests {
         events: UnboundedReceiver<UiEvent>,
         seen: Vec<UiEvent>,
         downloads: PathBuf,
+        pubkey: String,
     }
 
     impl FakeUi {
         fn start(nick: &str, connect_to: Option<u16>) -> (Self, u16) {
             let base = std::env::temp_dir().join(format!("anarchord_cli_{}_{}_{}", nick, std::process::id(), PeerId::random()));
-            let mut config = CoreConfig::new(UserIdentity::generate_with_nick(nick), base.join("servers"), base.join("downloads"));
+            let identity = UserIdentity::generate_with_nick(nick);
+            let pubkey = identity.public_key_hex();
+            let mut config = CoreConfig::new(identity, base.join("servers"), base.join("downloads"));
             config.connect = connect_to.map(|port| format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap());
             let (core, task) = Core::start(config).unwrap();
             let port = task.listen_port();
@@ -557,7 +616,7 @@ mod tests {
             let (actions, rx_actions) = tokio::sync::mpsc::unbounded_channel();
             tokio::task::spawn_local(task.run());
             tokio::task::spawn_local(bridge(core_events, rx_actions, commands, tx_ui, Arc::new(AtomicBool::new(false))));
-            (Self { actions, events, seen: Vec::new(), downloads: base.join("downloads") }, port)
+            (Self { actions, events, seen: Vec::new(), downloads: base.join("downloads"), pubkey }, port)
         }
 
         /// Digita uma linha na caixa de texto

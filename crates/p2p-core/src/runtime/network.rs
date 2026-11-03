@@ -187,11 +187,12 @@ impl Runtime {
                     self.relay_manager.remove_peer(&peer_id);
                     let has_peers = self.anarchord_peers().next().is_some();
                     self.has_anarchord_connected.store(has_peers, std::sync::atomic::Ordering::Relaxed);
-                    if let Some((nick, _)) = self.peer_metadata.get(&peer_id).cloned() {
+                    if let Some((nick, pubkey)) = self.peer_metadata.get(&peer_id).cloned() {
                         self.emit(CoreEvent::PeerLeft { peer_id: peer_id.to_string(), nick });
                         let cause = cause.map(|c| c.to_string()).unwrap_or_default();
                         self.emit(CoreEvent::Network(NetworkEvent::ConnectionClosed { peer_id: peer_id.to_string(), cause }));
                         self.publish_channel_members();
+                        self.friend_presence(&pubkey, false);
                     }
                 }
             }
@@ -223,10 +224,14 @@ impl Runtime {
                         }
                     }
                     if first || changed {
+                        let friend_pubkey = pubkey.clone();
                         self.emit(CoreEvent::PeerIdentified { peer_id: peer_id.to_string(), nick, pubkey });
                         let has_peers = self.anarchord_peers().next().is_some();
                         self.has_anarchord_connected.store(has_peers, std::sync::atomic::Ordering::Relaxed);
                         self.publish_channel_members();
+                        if first {
+                            self.friend_presence(&friend_pubkey, true);
+                        }
                     }
                 }
             }

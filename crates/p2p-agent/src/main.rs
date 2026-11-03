@@ -105,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bootstrap = args.bootstrap.iter().map(|a| a.parse()).collect::<Result<Vec<_>, _>>()?;
     let config = CoreConfig {
+        identity_path: None,
         identity,
         port: args.port,
         servers_dir: args.data_dir.join("servers"),

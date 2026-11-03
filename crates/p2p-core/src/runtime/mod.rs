@@ -21,6 +21,7 @@ pub use chat::ActiveChannel;
 pub use command::{CoreCommand, FrameSink, ServerCommand};
 pub use event::*;
 pub use servers::{invite_text, parse_invite};
+// FriendStatus vem de `event::*`
 
 use crate::community::{self, e2ee::ServerGroups, ServerRegistry, Space};
 use crate::identity::UserIdentity;
@@ -36,6 +37,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 /// Como o nó deve rodar
 #[derive(Clone)]
 pub struct CoreConfig {
+    /// Caminho do arquivo de identidade no disco (para persistir amigos e perfil)
+    pub identity_path: Option<PathBuf>,
     pub identity: UserIdentity,
     /// Porta TCP + QUIC (0 = escolhe uma livre)
     pub port: u16,
@@ -78,6 +81,7 @@ impl CoreConfig {
     /// Configuração padrão para uma identidade (sem áudio nem descoberta, útil em testes)
     pub fn new(identity: UserIdentity, servers_dir: PathBuf, download_dir: PathBuf) -> Self {
         Self {
+            identity_path: None,
             identity,
             port: 0,
             servers_dir,
@@ -363,6 +367,9 @@ impl Runtime {
             CoreCommand::RejectFile(query) => self.reject_file(&query),
             CoreCommand::Unshare(query) => self.unshare_file(&query),
             CoreCommand::ListFiles => self.list_files(),
+            CoreCommand::AddFriend { pubkey, alias } => self.add_friend(&pubkey, alias.as_deref()),
+            CoreCommand::RemoveFriend { pubkey } => self.remove_friend(&pubkey),
+            CoreCommand::ListFriends => self.list_friends(),
             CoreCommand::Server(command) => self.run_server_command(command),
             CoreCommand::Shutdown => {}
         }
@@ -395,6 +402,81 @@ impl Runtime {
         self.peer_metadata.iter().find_map(|(peer, (nick, pubkey))| {
             (nick.eq_ignore_ascii_case(query) || peer.to_string().starts_with(query) || pubkey.starts_with(query)).then_some(*peer)
         })
+    }
+
+    /// Salva a identidade no disco se houver caminho configurado
+    fn persist_identity(&self) {
+        if let Some(path) = &self.config.identity_path {
+            let _ = self.identity.save_to(path);
+        }
+    }
+
+    /// Adiciona um amigo localmente
+    fn add_friend(&mut self, pubkey: &str, alias: Option<&str>) {
+        match self.identity.add_friend(pubkey, alias) {
+            Ok(_) => {
+                self.persist_identity();
+                let pubkey_clean = pubkey.trim().to_lowercase();
+                self.emit(CoreEvent::FriendUpdated {
+                    pubkey: pubkey_clean,
+                    alias: alias.map(str::to_string),
+                    removed: false,
+                });
+                self.list_friends();
+            }
+            Err(e) => self.error(CoreError::Friend(e.to_string())),
+        }
+    }
+
+    /// Remove um amigo localmente
+    fn remove_friend(&mut self, pubkey: &str) {
+        let pubkey_clean = pubkey.trim().to_lowercase();
+        if self.identity.remove_friend(&pubkey_clean) {
+            self.persist_identity();
+            self.emit(CoreEvent::FriendUpdated {
+                pubkey: pubkey_clean,
+                alias: None,
+                removed: true,
+            });
+            self.list_friends();
+        } else {
+            self.error(CoreError::Friend("Amigo não encontrado na sua lista".into()));
+        }
+    }
+
+    /// Avisa a interface quando um amigo fica online/offline (ignora quem não é amigo)
+    pub(super) fn friend_presence(&self, pubkey: &str, online: bool) {
+        if let Some(friend) = self.identity.get_friends().iter().find(|f| f.public_key.eq_ignore_ascii_case(pubkey)) {
+            self.emit(CoreEvent::FriendPresence { public_key: friend.public_key.clone(), alias: friend.alias.clone(), online });
+        }
+    }
+
+    /// Lista os amigos e seu status de presença atual
+    pub(super) fn list_friends(&self) {
+        let statuses: Vec<FriendStatus> = self
+            .identity
+            .get_friends()
+            .iter()
+            .map(|f| {
+                // Procura se a pubkey do amigo está ativa em algum par conectado
+                let active = self.peer_metadata.iter().find(|(peer, (_, pk))| {
+                    pk.eq_ignore_ascii_case(&f.public_key) && self.connected_peers.contains(peer)
+                });
+                let (online, current_nick, peer_id) = match active {
+                    Some((peer, (nick, _))) => (true, Some(nick.clone()), Some(peer.to_string())),
+                    None => (false, None, None),
+                };
+                FriendStatus {
+                    public_key: f.public_key.clone(),
+                    alias: f.alias.clone(),
+                    added_at: f.added_at,
+                    online,
+                    current_nick,
+                    peer_id,
+                }
+            })
+            .collect();
+        self.emit(CoreEvent::Friends(statuses));
     }
 }
 

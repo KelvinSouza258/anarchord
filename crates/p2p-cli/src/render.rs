@@ -4,7 +4,7 @@
 use p2p_core::community::{format_duration, short_id, ModKind};
 use p2p_core::files::{FileEvent, FileState, FileSummary};
 use p2p_core::runtime::{
-    CoreError, CoreEvent, NetworkEvent, Role, ScreenEvent, ServerChange, ServerInfo, ServerNotice, SpaceInfo, VoiceEvent,
+    CoreError, CoreEvent, FriendStatus, NetworkEvent, Role, ScreenEvent, ServerChange, ServerInfo, ServerNotice, SpaceInfo, VoiceEvent,
 };
 
 /// Ajuda dos comandos de servidor
@@ -70,6 +70,15 @@ pub fn describe(event: &CoreEvent) -> Vec<String> {
         CoreEvent::Screen(e) => screen(e),
         CoreEvent::File(e) => file(e).into_iter().collect(),
         CoreEvent::Files(list) => files(list),
+        CoreEvent::Friends(list) => friends(list),
+        CoreEvent::FriendPresence { public_key, alias, online } => {
+            let name = alias.clone().unwrap_or_else(|| short_id(public_key).to_string());
+            one(format!("{} Amigo {} está {}", if *online { "🟢" } else { "⚪" }, name, if *online { "online" } else { "offline" }))
+        }
+        CoreEvent::FriendUpdated { pubkey, alias, removed } => {
+            let name = alias.clone().unwrap_or_else(|| short_id(pubkey).to_string());
+            one(if *removed { format!("💔 Amigo {} removido", name) } else { format!("💚 Amigo {} adicionado", name) })
+        }
         CoreEvent::FilePreparing { name } => one(format!("📁 Preparando '{}' para compartilhar...", name)),
         CoreEvent::Server(notice) => server(notice),
         CoreEvent::Error(e) => one(error(e)),
@@ -350,8 +359,27 @@ fn server_info(info: &ServerInfo) -> Vec<String> {
     ]
 }
 
+fn friends(list: &[FriendStatus]) -> Vec<String> {
+    if list.is_empty() {
+        return vec!["Nenhum amigo ainda. Use /friend add <pubkey> [apelido]".to_string()];
+    }
+    let mut lines = vec![format!("👥 Amigos ({}):", list.len())];
+    for f in list {
+        let name = f.alias.clone().or_else(|| f.current_nick.clone()).unwrap_or_else(|| "(sem nome)".to_string());
+        lines.push(format!(
+            "   {} {} · {} · {}",
+            if f.online { "🟢" } else { "⚪" },
+            name,
+            short_id(&f.public_key),
+            if f.online { "online" } else { "offline" }
+        ));
+    }
+    lines
+}
+
 fn error(error: &CoreError) -> String {
     match error {
+        CoreError::Friend(message) => format!("❌ Amigos: {}", message),
         CoreError::PeerNotFound(query) => format!("❌ Par '{}' não encontrado. Use o nick de alguém conectado ou a pubkey completa.", query),
         CoreError::NoStream(query) => format!("⚠️ Nenhuma tela ativa encontrada para '{}'. Verifique os pares ou aguarde.", query),
         CoreError::AlreadyStreaming => "Você já está transmitindo sua tela. Use /screen stop para parar.".to_string(),

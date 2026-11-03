@@ -40,6 +40,10 @@ pub enum CoreCommand {
     RejectFile(String),
     Unshare(String),
     ListFiles,
+    /// Gerenciamento de amigos locais
+    AddFriend { pubkey: String, alias: Option<String> },
+    RemoveFriend { pubkey: String },
+    ListFriends,
     Server(ServerCommand),
     /// Encerra o nó (desanuncia nos trackers e emite `CoreEvent::Stopped`)
     Shutdown,
