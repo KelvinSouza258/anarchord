@@ -8,6 +8,7 @@
 //! (`network`, `chat`, `voice`, `screen`, `servers`, `files`).
 
 mod chat;
+pub mod discovery;
 pub mod command;
 pub mod event;
 mod files;
@@ -192,6 +193,7 @@ pub(crate) struct Runtime {
     /// Endereços discados com conexão aberta (o tracker repete os mesmos pares)
     dialed_open: HashSet<Multiaddr>,
     relay_manager: RelayManager,
+    discovery: discovery::DiscoveryState,
     tracker_rx: Option<UnboundedReceiver<String>>,
 
     // Chat e servidores
@@ -236,6 +238,7 @@ impl Runtime {
             identified: HashSet::new(),
             dialed_open: HashSet::new(),
             relay_manager,
+            discovery: discovery::DiscoveryState::new(config.lab),
             tracker_rx: None,
             active,
             servers,
@@ -279,13 +282,14 @@ impl Runtime {
                 self.error(CoreError::Network(e.to_string()));
             }
         }
+        self.subscribe_peer_exchange();
         self.start_discovery();
         self.start_voice();
         self.start_synthetic_video();
         self.publish_servers();
         self.resume_files();
 
-        let mut dht_search = tokio::time::interval(Duration::from_secs(if self.config.lab { 5 } else { 30 }));
+        let mut discovery_tick = tokio::time::interval(Duration::from_secs(1));
         let mut server_sync = tokio::time::interval(Duration::from_secs(5));
         let mut screen_announce = tokio::time::interval(Duration::from_secs(2));
         let mut speaker_check = tokio::time::interval(Duration::from_millis(200));
@@ -302,7 +306,7 @@ impl Runtime {
                     Some(command) => self.handle_command(command),
                 },
                 event = self.node.swarm.next_event() => self.handle_swarm_event(event),
-                _ = dht_search.tick(), if self.config.discovery => self.search_dht(),
+                _ = discovery_tick.tick() => self.discovery_tick(),
                 _ = server_sync.tick() => self.server_sync_tick(),
                 _ = screen_announce.tick() => self.screen_tick(),
                 _ = speaker_check.tick() => self.speaker_tick(),

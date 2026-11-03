@@ -336,3 +336,27 @@ async def dht_root_bootstrap(lab):
     await lab.join_room("sala", alice, bob)
     alice.send({"SendMessage": "achei você pela DHT"})
     await bob.wait("ChatMessage", where=lambda m: m["text"] == "achei você pela DHT")
+
+
+@scenario("Troca de pares: quem conhece apresenta, inclusive atrás de NAT")
+async def peer_exchange(lab):
+    alice = lab.public("alice")
+    bob, carol = lab.peer("bob", lab.nat("b")), lab.peer("carol", lab.nat("c"))
+    await lab.up()
+    # Sem DHT, tracker nem mDNS: Bob e Carol só conhecem Alice, que é relay público
+    await alice.start("--no-discovery", "--relay-server")
+    await bob.start("--no-discovery", "--connect", alice.address)
+    await carol.start("--no-discovery", "--connect", alice.address)
+
+    lab.step("Bob e Carol reservam um circuito em Alice")
+    await lab.relay_address(bob)
+    await lab.relay_address(carol)
+
+    lab.step("Alice conta a cada um como alcançar o outro (pelo circuito); eles se conectam")
+    await bob.wait("PeerIdentified", where=lambda p: p["nick"] == "Carol", timeout=90, desc="Bob achar Carol pela troca de pares")
+    await carol.wait("PeerIdentified", where=lambda p: p["nick"] == "Bob", timeout=90, desc="Carol achar Bob pela troca de pares")
+    if not (bob.find("Network.PeerExchange") or carol.find("Network.PeerExchange")):
+        raise StepFailed("a conexão deveria ter vindo da troca de pares")
+    await lab.join_room("sala", alice, bob, carol)
+    bob.send({"SendMessage": "achei você pela Alice"})
+    await carol.wait("ChatMessage", where=lambda m: m["text"] == "achei você pela Alice")

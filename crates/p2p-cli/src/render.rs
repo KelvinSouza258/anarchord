@@ -93,6 +93,7 @@ fn network(event: &NetworkEvent) -> String {
             format!("🔗 Conectado a {} ({})", peer_id, if *relayed { "via relay" } else { "direto" })
         }
         NetworkEvent::ConnectionClosed { peer_id, cause } => format!("👋 Conexão fechada com {} ({})", peer_id, cause),
+        NetworkEvent::PeerExchange { from, dialed } => format!("🤝 {} par(es) novo(s) indicados por {}", dialed, from),
         NetworkEvent::AudioUnavailable(reason) => format!("⚠️ Áudio nativo indisponível: {}", reason),
     }
 }

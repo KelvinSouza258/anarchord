@@ -11,6 +11,7 @@
 use crate::api::ChatMessage;
 use crate::community::ServerMessage;
 use crate::files::SwarmMessage;
+use crate::runtime::discovery::PeerList;
 use crate::screen::{ScreenAnnounce, ScreenPacket};
 use crate::voice::VoicePacket;
 use serde::de::DeserializeOwned;
@@ -28,6 +29,7 @@ pub enum Kind {
     ScreenFrame = 4,
     ScreenAnnounce = 5,
     Server = 6,
+    Peers = 7,
 }
 
 impl Kind {
@@ -39,6 +41,7 @@ impl Kind {
             4 => Kind::ScreenFrame,
             5 => Kind::ScreenAnnounce,
             6 => Kind::Server,
+            7 => Kind::Peers,
             _ => return None,
         })
     }
@@ -77,6 +80,7 @@ pub enum Incoming {
     ScreenFrame(ScreenPacket),
     ScreenAnnounce(ScreenAnnounce),
     Server(ServerMessage),
+    Peers(PeerList),
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -117,6 +121,7 @@ pub fn decode(bytes: &[u8]) -> Result<Incoming, WireError> {
         Kind::ScreenFrame => Incoming::ScreenFrame(read(body)?),
         Kind::ScreenAnnounce => Incoming::ScreenAnnounce(read(body)?),
         Kind::Server => Incoming::Server(read(body)?),
+        Kind::Peers => Incoming::Peers(read(body)?),
     })
 }
 

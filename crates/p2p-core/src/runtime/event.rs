@@ -79,6 +79,8 @@ pub enum NetworkEvent {
     /// Primeira conexão com um par Anarchord, ou a primeira direta depois de uma relayada
     Connected { peer_id: String, address: String, relayed: bool },
     ConnectionClosed { peer_id: String, cause: String },
+    /// Pares novos recebidos na troca de pares e discados
+    PeerExchange { from: String, dialed: usize },
     AudioUnavailable(String),
 }
 

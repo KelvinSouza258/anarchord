@@ -100,7 +100,7 @@ impl RelayManager {
 }
 
 /// Endereço direto (não relayado), com IP público ou DNS, sobre TCP ou QUIC puros
-fn is_dialable_addr(addr: &Multiaddr, allow_private: bool) -> bool {
+pub(crate) fn is_dialable_addr(addr: &Multiaddr, allow_private: bool) -> bool {
     let mut has_public_host = false;
     let mut has_supported_transport = false;
     for proto in addr.iter() {

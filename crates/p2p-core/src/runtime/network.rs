@@ -91,13 +91,6 @@ impl Runtime {
         id
     }
 
-    pub(super) fn search_dht(&mut self) {
-        self.node.dht_find_peers();
-        // Membros online dos servidores acompanhados
-        for id in self.servers.list().map(|s| s.server_id.clone()).collect::<Vec<_>>() {
-            self.node.dht_find(server_dht_key(&id));
-        }
-    }
 
     pub(super) fn dial_discovered(&mut self, address: String) {
         if let Ok(multiaddr) = address.parse::<Multiaddr>() {
@@ -139,6 +132,7 @@ impl Runtime {
                 if num_established == 0 {
                     self.connected_peers.remove(&peer_id);
                     self.links.remove(&peer_id);
+                    self.discovery.addresses.remove(&peer_id);
                     self.identified.remove(&peer_id);
                     self.relay_manager.remove_peer(&peer_id);
                     if let Some((nick, _)) = self.peer_metadata.get(&peer_id).cloned() {
@@ -165,6 +159,12 @@ impl Runtime {
                     // O Identify se repete a cada conexão: só avisa na primeira identificação ou se o nick mudou
                     let changed = self.peer_metadata.insert(peer_id, (nick.clone(), pubkey.clone())) != Some((nick.clone(), pubkey.clone()));
                     let first = self.identified.insert(peer_id);
+                    // Endereços para a troca de pares; par novo ou com endereços novos (ex.: circuito
+                    // no relay) é contado aos outros
+                    let previous = self.discovery.addresses.insert(peer_id, info.listen_addrs.clone());
+                    if first || previous.as_ref() != Some(&info.listen_addrs) {
+                        self.discovery.peers_changed = true;
+                    }
                     if first {
                         if let Some((address, relayed)) = self.links.get(&peer_id).cloned() {
                             self.emit(CoreEvent::Network(NetworkEvent::Connected { peer_id: peer_id.to_string(), address, relayed }));
@@ -360,6 +360,7 @@ impl Runtime {
                     self.on_screen_announce(announce, &topic)
                 }
             }
+            Incoming::Peers(list) => self.on_peer_list(source, list),
             Incoming::Server(_) => tracing::debug!("Mensagem de servidor fora do tópico de controle descartada"),
         }
     }

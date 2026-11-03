@@ -152,7 +152,9 @@ impl P2PNode {
                     "/p2p-anarchord/1.0.0".to_string(),
                     key.public(),
                 )
-                .with_agent_version(user_agent);
+                .with_agent_version(user_agent)
+                // Reenvia os endereços quando mudam (ex.: reserva no relay), para a troca de pares
+                .with_push_listen_addr_updates(true);
                 let identify = identify::Behaviour::new(identify_config);
 
                 // 4. mDNS: Descoberta automática instantânea em redes locais (LAN / Wi-Fi / Localhost)
