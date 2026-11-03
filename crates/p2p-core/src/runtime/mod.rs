@@ -411,31 +411,52 @@ impl Runtime {
         }
     }
 
-    /// Adiciona um amigo localmente
-    fn add_friend(&mut self, pubkey: &str, alias: Option<&str>) {
-        match self.identity.add_friend(pubkey, alias) {
+    /// Adiciona um amigo localmente. Aceita a pubkey completa ou o nick de um par conectado
+    fn add_friend(&mut self, who: &str, alias: Option<&str>) {
+        let who = who.trim();
+        let is_key = who.len() == 64 && who.chars().all(|c| c.is_ascii_hexdigit());
+        let (pubkey, alias) = if is_key {
+            (who.to_string(), alias.map(str::to_string))
+        } else {
+            match self.find_peer(who).and_then(|peer| self.peer_metadata.get(&peer).cloned()) {
+                // Pelo nick: o apelido padrão é o próprio nick
+                Some((nick, pubkey)) => (pubkey, Some(alias.map(str::to_string).unwrap_or(nick))),
+                None => return self.error(CoreError::PeerNotFound(who.to_string())),
+            }
+        };
+        match self.identity.add_friend(&pubkey, alias.as_deref()) {
             Ok(_) => {
                 self.persist_identity();
-                let pubkey_clean = pubkey.trim().to_lowercase();
-                self.emit(CoreEvent::FriendUpdated {
-                    pubkey: pubkey_clean,
-                    alias: alias.map(str::to_string),
-                    removed: false,
-                });
+                self.emit(CoreEvent::FriendUpdated { pubkey: pubkey.to_lowercase(), alias, removed: false });
                 self.list_friends();
             }
             Err(e) => self.error(CoreError::Friend(e.to_string())),
         }
     }
 
-    /// Remove um amigo localmente
-    fn remove_friend(&mut self, pubkey: &str) {
-        let pubkey_clean = pubkey.trim().to_lowercase();
+    /// Remove um amigo localmente (pubkey ou nick/apelido)
+    fn remove_friend(&mut self, who: &str) {
+        let who = who.trim();
+        let by_alias = self
+            .identity
+            .get_friends()
+            .iter()
+            .find(|f| f.alias.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(who)))
+            .map(|f| f.public_key.clone());
+        // Senão, o nick de um par conectado (menu de contexto) e, por fim, a pubkey digitada
+        let by_nick = || self.find_peer(who).and_then(|p| self.peer_metadata.get(&p).map(|(_, pk)| pk.to_lowercase()));
+        let pubkey_clean = by_alias.or_else(by_nick).unwrap_or_else(|| who.to_lowercase());
+        let alias = self
+            .identity
+            .get_friends()
+            .iter()
+            .find(|f| f.public_key.eq_ignore_ascii_case(&pubkey_clean))
+            .and_then(|f| f.alias.clone());
         if self.identity.remove_friend(&pubkey_clean) {
             self.persist_identity();
             self.emit(CoreEvent::FriendUpdated {
                 pubkey: pubkey_clean,
-                alias: None,
+                alias,
                 removed: true,
             });
             self.list_friends();

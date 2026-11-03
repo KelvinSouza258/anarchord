@@ -142,6 +142,8 @@ pub fn member_menu(nick: &str, in_server: bool) -> Menu {
     let mut items = vec![
         ask("📁 Enviar arquivo…", format!("Caminho do arquivo para {}", nick), format!("/send {} \"{{}}\"", nick)),
         run("📺 Assistir tela", format!("/screen watch {}", nick)),
+        run("💚 Adicionar aos amigos", format!("/friend add {}", nick)),
+        run("💔 Remover dos amigos", format!("/friend remove {}", nick)),
     ];
     if in_server {
         items.extend([

@@ -504,7 +504,9 @@ mod tests {
             .run_until(async {
                 let (mut alice, port) = FakeUi::start("Alice", None);
                 alice.type_line("/friend add nao-e-chave");
-                alice.wait_log("chave inválida recusada", "Amigos:").await;
+                alice.wait_log("nick desconhecido recusado", "'nao-e-chave' não encontrado").await;
+                alice.type_line(&format!("/friend add {}", alice.pubkey));
+                alice.wait_log("adicionar a si mesmo recusado", "Amigos:").await;
 
                 let (bob, _) = FakeUi::start("Bob", Some(port));
                 let bob_key = bob.pubkey.clone();
@@ -513,6 +515,14 @@ mod tests {
                 alice.type_line(&format!("/friend add {} Bobby", bob.pubkey));
                 alice.wait_log("amigo adicionado", "Bobby adicionado").await;
                 alice.wait_log("lista com Bob online", "🟢 Bobby").await;
+
+                // Pelo nick (como o menu de contexto faz): remove pelo apelido e readiciona
+                alice.type_line("/friend remove Bobby");
+                alice.wait_log("amigo removido", "Bobby removido").await;
+                alice.type_line("/friend add Bob");
+                alice.wait_log("adicionado pelo nick", "Bob adicionado").await;
+                alice.type_line("/friend add Fantasma");
+                alice.wait_log("nick desconhecido", "'Fantasma' não encontrado").await;
             })
             .await;
     }

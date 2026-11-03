@@ -1301,6 +1301,13 @@ mod tests {
     }
 
     #[test]
+    fn test_add_friend_from_member_menu() {
+        let mut ui = ui_for("Alice");
+        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false)]));
+        assert_eq!(sent(&select(&mut ui, "Adicionar aos amigos")), vec!["/friend add Bob"]);
+    }
+
+    #[test]
     fn test_send_file_from_member_menu_quotes_path() {
         let mut ui = ui_for("Alice");
         ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false)]));
