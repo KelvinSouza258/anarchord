@@ -58,6 +58,19 @@ pub struct CoreConfig {
     pub discovery: bool,
     /// Modo de teste: baixa todo arquivo oferecido e assiste toda tela anunciada
     pub test_mode: bool,
+    /// Bootstrap da DHT (com `/p2p/<id>`), além dos públicos se `public_defaults`
+    pub bootstrap: Vec<Multiaddr>,
+    /// Trackers BitTorrent UDP (`host:porta`), além dos públicos se `public_defaults`
+    pub trackers: Vec<String>,
+    /// Usa também os nós de bootstrap do IPFS e os trackers públicos embutidos.
+    /// Desligado, o nó só conhece o que foi informado (redes isoladas, laboratório).
+    pub public_defaults: bool,
+    /// Descoberta na rede local (mDNS)
+    pub mdns: bool,
+    /// Atende como servidor de relay (nós públicos)
+    pub relay_server: bool,
+    /// Rede de laboratório: IPs privados valem como públicos e as sondagens são rápidas
+    pub lab: bool,
 }
 
 impl CoreConfig {
@@ -76,6 +89,12 @@ impl CoreConfig {
             synth_video: false,
             discovery: false,
             test_mode: false,
+            bootstrap: Vec::new(),
+            trackers: Vec::new(),
+            public_defaults: false,
+            mdns: true,
+            relay_server: false,
+            lab: false,
         }
     }
 }
@@ -163,6 +182,8 @@ pub(crate) struct Runtime {
 
     // Rede
     connected_peers: HashSet<PeerId>,
+    /// Pares com quem só há conexão via relay (para avisar quando surgir uma direta)
+    relayed_only: HashSet<PeerId>,
     /// PeerId -> (nick, pubkey) dos pares Anarchord identificados
     peer_metadata: HashMap<PeerId, (String, String)>,
     /// Pares já anunciados na interface desde que conectaram
@@ -191,7 +212,12 @@ impl Runtime {
     fn new(config: CoreConfig, events: UnboundedSender<CoreEvent>) -> Result<Self, CoreStartError> {
         let identity = config.identity.clone();
         let nick = identity.profile.display_name.clone();
-        let mut node = P2PNode::new(identity.clone(), config.port)?;
+        let mut node = P2PNode::with_options(
+            identity.clone(),
+            crate::node::NodeOptions { port: config.port, relay_server: config.relay_server, lab: config.lab, mdns: config.mdns },
+        )?;
+        let mut relay_manager = RelayManager::new();
+        relay_manager.allow_private(config.lab);
         let servers = ServerRegistry::load(config.servers_dir.clone(), now_secs())?;
         let mls = ServerGroups::new(&identity, Some(config.servers_dir.join("mls-state.json")));
         let active = ActiveChannel::new(Space::Lobby, config.channel.clone());
@@ -204,10 +230,11 @@ impl Runtime {
             events,
             node,
             connected_peers: HashSet::new(),
+            relayed_only: HashSet::new(),
             peer_metadata: HashMap::new(),
             identified: HashSet::new(),
             dialed_open: HashSet::new(),
-            relay_manager: RelayManager::new(),
+            relay_manager,
             tracker_rx: None,
             active,
             servers,
@@ -257,7 +284,7 @@ impl Runtime {
         self.publish_servers();
         self.resume_files();
 
-        let mut dht_search = tokio::time::interval(Duration::from_secs(30));
+        let mut dht_search = tokio::time::interval(Duration::from_secs(if self.config.lab { 5 } else { 30 }));
         let mut server_sync = tokio::time::interval(Duration::from_secs(5));
         let mut screen_announce = tokio::time::interval(Duration::from_secs(2));
         let mut speaker_check = tokio::time::interval(Duration::from_millis(200));
@@ -311,6 +338,15 @@ impl Runtime {
             CoreCommand::StartScreenShare { monitor, quality } => self.start_screen_share(monitor, quality),
             CoreCommand::StopScreenShare => self.stop_screen_share(),
             CoreCommand::WatchScreen { query, sink } => self.watch_screen(&query, sink),
+            CoreCommand::Dial(address) => match address.parse::<Multiaddr>() {
+                Ok(address) => {
+                    self.emit(CoreEvent::Network(NetworkEvent::Dialing(address.to_string())));
+                    if let Err(e) = self.node.swarm.dial(address) {
+                        self.error(CoreError::Network(e.to_string()));
+                    }
+                }
+                Err(e) => self.error(CoreError::Network(e.to_string())),
+            },
             CoreCommand::ShareFile(path) => self.share_file(path),
             CoreCommand::SendFile { to, path } => self.send_file(&to, path),
             CoreCommand::GetFile(query) => self.get_file(&query),

@@ -1,0 +1,12 @@
+target
+**/target
+!target/lab-linux/release/anarchord-agent
+!target/lab-linux/release/p2p-cli
+lab/results
+*.servers
+*.history
+*.log
+*.json
+!crates/**/*.json
+downloads
+.git

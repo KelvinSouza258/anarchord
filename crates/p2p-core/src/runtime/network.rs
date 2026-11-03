@@ -16,24 +16,45 @@ use libp2p::{gossipsub, Multiaddr, PeerId};
 use std::collections::HashMap;
 
 impl Runtime {
-    /// DHT Amino e trackers BitTorrent (se a descoberta estiver ligada)
+    /// Trackers em uso: os informados e, com `public_defaults`, os públicos embutidos
+    fn trackers(&self) -> Vec<String> {
+        let mut trackers = self.config.trackers.clone();
+        if self.config.public_defaults {
+            trackers.extend(OPENTRACKER_SERVERS.iter().map(|t| t.to_string()));
+        }
+        trackers
+    }
+
+    /// Bootstrap da DHT e trackers BitTorrent (se a descoberta estiver ligada)
     pub(super) fn start_discovery(&mut self) {
         if !self.config.discovery {
             return;
         }
-        let nodes = self.node.bootstrap_dht();
+        let mut nodes = 0;
+        if self.config.public_defaults {
+            nodes += self.node.bootstrap_dht();
+        }
+        if !self.config.bootstrap.is_empty() {
+            let bootstrap = self.config.bootstrap.clone();
+            nodes += self.node.bootstrap_with(&bootstrap);
+        }
         self.emit(CoreEvent::Network(NetworkEvent::DhtBootstrap { nodes }));
 
+        let trackers = self.trackers();
+        if trackers.is_empty() {
+            return;
+        }
         // Trackers em segundo plano: TCP e QUIC usam a mesma porta, então a porta anunciada vale para os dois
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         self.tracker_rx = Some(rx);
         let port = self.node.listen_port;
         let bt_peer_id = self.bt_peer_id();
         let events = self.events.clone();
+        let interval = std::time::Duration::from_secs(if self.config.lab { 3 } else { 10 });
         tokio::task::spawn_blocking(move || {
             let info_hash = make_info_hash(DHT_DISCOVERY_NAMESPACE);
             loop {
-                for tracker in OPENTRACKER_SERVERS {
+                for tracker in &trackers {
                     if let Ok(peers) = TorrentTrackerClient::discover_peers(tracker, &info_hash, &bt_peer_id, port) {
                         for peer in peers {
                             let _ = events.send(CoreEvent::Network(NetworkEvent::TrackerPeer(peer.to_string())));
@@ -45,7 +66,7 @@ impl Runtime {
                         break;
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_secs(10));
+                std::thread::sleep(interval);
             }
         });
     }
@@ -57,8 +78,8 @@ impl Runtime {
         }
         let info_hash = make_info_hash(DHT_DISCOVERY_NAMESPACE);
         let bt_peer_id = self.bt_peer_id();
-        for tracker in OPENTRACKER_SERVERS {
-            let _ = TorrentTrackerClient::announce_stopped(tracker, &info_hash, &bt_peer_id, self.node.listen_port);
+        for tracker in self.trackers() {
+            let _ = TorrentTrackerClient::announce_stopped(&tracker, &info_hash, &bt_peer_id, self.node.listen_port);
         }
     }
 
@@ -91,7 +112,17 @@ impl Runtime {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => self.emit(CoreEvent::Network(NetworkEvent::Listening(address.to_string()))),
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                self.connected_peers.insert(peer_id);
+                let address = endpoint.get_remote_address().clone();
+                // Do lado de quem recebe, o endereço de uma conexão relayada é só /p2p/<id>
+                let relayed = endpoint.is_relayed();
+                // Avisa a primeira conexão e a primeira direta (ex.: depois do hole punching)
+                let first = self.connected_peers.insert(peer_id);
+                if first || (!relayed && self.relayed_only.remove(&peer_id)) {
+                    if relayed {
+                        self.relayed_only.insert(peer_id);
+                    }
+                    self.emit(CoreEvent::Network(NetworkEvent::Connected { peer_id: peer_id.to_string(), address: address.to_string(), relayed }));
+                }
                 if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
                     self.dialed_open.insert(address.clone());
                 }
@@ -104,6 +135,7 @@ impl Runtime {
                 }
                 if num_established == 0 {
                     self.connected_peers.remove(&peer_id);
+                    self.relayed_only.remove(&peer_id);
                     self.identified.remove(&peer_id);
                     self.relay_manager.remove_peer(&peer_id);
                     if let Some((nick, _)) = self.peer_metadata.get(&peer_id).cloned() {
@@ -220,7 +252,7 @@ impl Runtime {
             }
             SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(libp2p::dcutr::Event { remote_peer_id, result })) => match result {
                 Ok(_) => self.emit(CoreEvent::Network(NetworkEvent::HolePunched(remote_peer_id.to_string()))),
-                Err(e) => tracing::info!("Hole punching com {} falhou (segue via relay): {}", remote_peer_id, e),
+                Err(e) => self.emit(CoreEvent::Network(NetworkEvent::HolePunchFailed { peer_id: remote_peer_id.to_string(), error: e.to_string() })),
             },
             _ => {}
         }

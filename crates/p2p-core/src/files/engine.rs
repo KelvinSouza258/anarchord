@@ -42,7 +42,7 @@ pub enum ShareTarget {
     Peer(PeerId),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum FileEvent {
     Offered { cid: Cid, name: String, size: u64, from: String, direct: bool },
     Shared { cid: Cid, name: String },
@@ -69,14 +69,14 @@ pub enum FileAction {
     Event(FileEvent),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum FileState {
     Offered,
     Downloading { progress: f32, peers: usize },
     Seeding,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileSummary {
     pub cid: Cid,
     pub name: String,
@@ -523,6 +523,16 @@ impl FileEngine {
     /// CIDs dos arquivos que estamos baixando (para reconhecer respostas da DHT)
     pub fn downloading(&self) -> impl Iterator<Item = &Cid> {
         self.files.iter().filter(|(_, e)| e.download.is_some()).map(|(cid, _)| cid)
+    }
+
+    /// Salas dos downloads em andamento: o nó precisa continuar inscrito nelas para receber
+    /// os mapas de pedaços (Have) mesmo depois de trocar de canal ou reiniciar
+    pub fn download_topics(&self) -> Vec<String> {
+        let mut topics: Vec<String> =
+            self.files.values().filter(|e| e.download.is_some()).filter_map(|e| e.topic().map(str::to_string)).collect();
+        topics.sort();
+        topics.dedup();
+        topics
     }
 
     /// Arquivos públicos que temos (para reanunciar na DHT)

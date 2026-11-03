@@ -20,11 +20,18 @@ pub struct RelayManager {
     reservations: HashMap<ListenerId, PeerId>,
     /// Relays que recusaram ou derrubaram a reserva (não são tentados de novo)
     failed: HashSet<PeerId>,
+    /// Aceita relays em endereços privados (rede de laboratório)
+    allow_private: bool,
 }
 
 impl RelayManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Rede de laboratório: relays em IPs privados também servem
+    pub fn allow_private(&mut self, allow: bool) {
+        self.allow_private = allow;
     }
 
     /// Atualiza o estado de NAT informado pelo AutoNAT
@@ -42,7 +49,7 @@ impl RelayManager {
         if self.failed.contains(&peer) {
             return;
         }
-        if let Some(addr) = listen_addrs.iter().find(|a| is_dialable_public_addr(a)) {
+        if let Some(addr) = listen_addrs.iter().find(|a| is_dialable_addr(a, self.allow_private)) {
             self.candidates.insert(peer, strip_peer_id(addr));
         }
     }
@@ -93,7 +100,7 @@ impl RelayManager {
 }
 
 /// Endereço direto (não relayado), com IP público ou DNS, sobre TCP ou QUIC puros
-fn is_dialable_public_addr(addr: &Multiaddr) -> bool {
+fn is_dialable_addr(addr: &Multiaddr, allow_private: bool) -> bool {
     let mut has_public_host = false;
     let mut has_supported_transport = false;
     for proto in addr.iter() {
@@ -111,7 +118,8 @@ fn is_dialable_public_addr(addr: &Multiaddr) -> bool {
             _ => {}
         }
     }
-    has_public_host && has_supported_transport
+    (has_public_host || (allow_private && addr.iter().any(|p| matches!(p, Protocol::Ip4(ip) if !ip.is_loopback() && !ip.is_unspecified()))))
+        && has_supported_transport
 }
 
 fn is_public_ipv4(ip: &Ipv4Addr) -> bool {
@@ -149,14 +157,18 @@ mod tests {
 
     #[test]
     fn test_only_public_direct_addrs_are_candidates() {
-        assert!(is_dialable_public_addr(&addr("/ip4/8.8.8.8/tcp/4001")));
-        assert!(is_dialable_public_addr(&addr("/ip4/8.8.8.8/udp/4001/quic-v1")));
-        assert!(is_dialable_public_addr(&addr("/dns4/relay.example.com/tcp/4001")));
-        assert!(!is_dialable_public_addr(&addr("/ip4/192.168.0.10/tcp/4001")));
-        assert!(!is_dialable_public_addr(&addr("/ip4/127.0.0.1/tcp/4001")));
-        assert!(!is_dialable_public_addr(&addr("/ip4/100.64.1.1/tcp/4001")));
-        assert!(!is_dialable_public_addr(&addr("/ip4/8.8.8.8/tcp/443/wss")));
-        assert!(!is_dialable_public_addr(&addr("/ip4/8.8.8.8/udp/4001/quic-v1/webtransport")));
+        assert!(is_dialable_addr(&addr("/ip4/8.8.8.8/tcp/4001"), false));
+        assert!(is_dialable_addr(&addr("/ip4/8.8.8.8/udp/4001/quic-v1"), false));
+        assert!(is_dialable_addr(&addr("/dns4/relay.example.com/tcp/4001"), false));
+        assert!(!is_dialable_addr(&addr("/ip4/192.168.0.10/tcp/4001"), false));
+        assert!(!is_dialable_addr(&addr("/ip4/127.0.0.1/tcp/4001"), false));
+        assert!(!is_dialable_addr(&addr("/ip4/100.64.1.1/tcp/4001"), false));
+        assert!(!is_dialable_addr(&addr("/ip4/8.8.8.8/tcp/443/wss"), false));
+        assert!(!is_dialable_addr(&addr("/ip4/8.8.8.8/udp/4001/quic-v1/webtransport"), false));
+        // Rede de laboratório: IP privado vale, loopback e circuito continuam fora
+        assert!(is_dialable_addr(&addr("/ip4/192.168.0.10/tcp/4001"), true));
+        assert!(!is_dialable_addr(&addr("/ip4/127.0.0.1/tcp/4001"), true));
+        assert!(!is_dialable_addr(&addr("/ip4/10.0.0.1/tcp/4001/p2p-circuit"), true));
     }
 
     #[test]

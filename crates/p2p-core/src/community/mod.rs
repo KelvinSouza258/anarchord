@@ -302,7 +302,7 @@ struct StoredServer {
 }
 
 /// Uma linha do histórico de alterações (para exibição)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub height: u64,
     pub timestamp: UtcSecs,

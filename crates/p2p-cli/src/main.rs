@@ -4,7 +4,6 @@ mod spaces;
 mod ui;
 
 use clap::Parser;
-use libp2p::PeerId;
 use p2p_core::files::FileEvent;
 use p2p_core::runtime::{Core, CoreCommand, CoreConfig, CoreError, CoreEvent, ScreenEvent, ServerCommand, SpaceInfo, VoiceEvent};
 use p2p_core::screen::VideoCodec;
@@ -46,18 +45,6 @@ pub struct Args {
     /// Entrar automaticamente em uma sala de voz P2P ao iniciar (útil para nós bots/rádio)
     #[arg(long)]
     pub auto_voice: Option<String>,
-
-    /// Executar como Daemon sem ler stdin do terminal
-    #[arg(long, default_value_t = false)]
-    pub daemon: bool,
-
-    /// Transmitir tom sintético de teste de áudio (440Hz / 880Hz) continuamente na sala de voz
-    #[arg(long, default_value_t = false)]
-    pub synth_audio: bool,
-
-    /// Transmitir vídeo sintético/fake em loop na malha P2P (útil para bots/servidores de teste de tela)
-    #[arg(long, default_value_t = false)]
-    pub synth_video: bool,
 
     /// Desativar descoberta automática via IPFS Amino DHT e Open Trackers BitTorrent
     #[arg(long, default_value_t = false)]
@@ -216,13 +203,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         channel: args.channel.clone(),
         connect: args.connect.as_deref().map(str::parse).transpose()?,
         auto_voice: args.auto_voice.clone(),
-        // Daemon sem sintetizador nem sala de voz não precisa (nem costuma ter) microfone
-        audio: !(args.daemon && !args.synth_audio && args.auto_voice.is_none()),
-        synth_audio: args.synth_audio,
-        synth_video: args.synth_video,
+        audio: true,
+        synth_audio: false,
+        synth_video: false,
         discovery: !args.no_auto_bootstrap,
-        // O daemon só existe para testes: baixa todo arquivo e assiste toda tela anunciada
-        test_mode: args.daemon,
+        test_mode: false,
+        bootstrap: Vec::new(),
+        trackers: Vec::new(),
+        // Rede pública: nós de bootstrap do IPFS e trackers BitTorrent embutidos
+        public_defaults: true,
+        mdns: true,
+        relay_server: false,
+        lab: false,
     };
     let (core, task) = Core::start(config)?;
     let (commands, events) = core.split();
@@ -235,10 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    if args.daemon {
-        print_banner(&identity, &args, task.peer_id(), task.listen_port());
-        tokio::spawn(daemon_output(events));
-    } else {
+    {
         let (tx_ui_event, rx_ui_event) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
         let (tx_ui_action, rx_ui_action) = tokio::sync::mpsc::unbounded_channel::<UiAction>();
         let muted = Arc::new(AtomicBool::new(false));
@@ -264,48 +253,12 @@ fn setup_logging(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         let file = std::fs::OpenOptions::new().create(true).append(true).open(log_path)?;
         let subscriber = FmtSubscriber::builder().with_max_level(Level::DEBUG).with_writer(file).finish();
         let _ = tracing::subscriber::set_global_default(subscriber);
-    } else if args.daemon {
-        let subscriber = FmtSubscriber::builder().with_max_level(Level::INFO).finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
     } else {
         // Na TUI, logs no stdout distorceriam a tela
         let subscriber = FmtSubscriber::builder().with_writer(std::io::sink).finish();
         let _ = tracing::subscriber::set_global_default(subscriber);
     }
     Ok(())
-}
-
-fn print_banner(identity: &UserIdentity, args: &Args, peer_id: PeerId, port: u16) {
-    println!("============================================================");
-    println!(" 🚀 Anarchord P2P Daemon / CLI (100% Descentralizado)");
-    println!("============================================================");
-    println!("👤 Apelido     : {}", identity.profile.display_name);
-    println!("🔑 User ID     : {}", identity.public_key_hex());
-    println!("🌐 Peer ID P2P : {}", peer_id);
-    println!("🚪 Porta Local : {} (TCP + QUIC)", port);
-    println!("💬 Sala Ativa  : #{}", args.channel);
-    println!("============================================================");
-    println!("🤖 Modo daemon: só exibe eventos (sem entrada de comandos). Ctrl+C encerra.");
-    println!("============================================================\n");
-}
-
-/// Daemon: imprime os eventos no terminal
-async fn daemon_output(mut events: UnboundedReceiver<CoreEvent>) {
-    while let Some(event) = events.recv().await {
-        match &event {
-            CoreEvent::PeerIdentified { peer_id, nick, pubkey } => {
-                println!("✨ Identidade confirmada: {} é '{}' (User ID: {})", peer_id, nick, pubkey)
-            }
-            CoreEvent::ChatMessage { channel, author, text, .. } => println!("\n📩 [#{}] {}: {}", channel, author, text),
-            CoreEvent::File(FileEvent::Completed { name, path, .. }) => {
-                println!("📁 [DAEMON ARQUIVO] '{}' recebido e conferido: {}", name, path.display())
-            }
-            _ => {}
-        }
-        for line in render::describe(&event) {
-            println!("{}", line);
-        }
-    }
 }
 
 /// Liga a TUI ao core: eventos viram atualizações de tela; o que o usuário digita vira comando
@@ -346,7 +299,7 @@ async fn bridge(
                         ChatAction::ScreenWatch(query) => {
                             let (sink, rx) = std::sync::mpsc::sync_channel(VIEWER_QUEUE_FRAMES);
                             pending_viewer = Some(rx);
-                            Some(CoreCommand::WatchScreen { query, sink })
+                            Some(CoreCommand::WatchScreen { query, sink: Some(sink) })
                         }
                         action => action.into_command(),
                     },
@@ -452,6 +405,7 @@ fn download_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p::PeerId;
 
     #[test]
     fn test_parse_user_input_commands() {
@@ -519,8 +473,6 @@ mod tests {
         assert_eq!(args.nick, "Peer");
         assert_eq!(args.port, 0);
         assert_eq!(args.channel, "geral");
-        assert!(!args.daemon);
-        assert!(!args.synth_audio);
         assert!(!args.no_auto_bootstrap);
         assert_eq!(args.auto_voice, None);
 
@@ -531,16 +483,12 @@ mod tests {
             "--port", "4001",
             "--channel", "crypto",
             "--auto-voice", "geral",
-            "--daemon",
-            "--synth-audio",
             "--no-auto-bootstrap",
         ]);
         assert_eq!(custom_args.nick, "Satoshi");
         assert_eq!(custom_args.port, 4001);
         assert_eq!(custom_args.channel, "crypto");
         assert_eq!(custom_args.auto_voice, Some("geral".to_string()));
-        assert!(custom_args.daemon);
-        assert!(custom_args.synth_audio);
         assert!(custom_args.no_auto_bootstrap);
     }
 

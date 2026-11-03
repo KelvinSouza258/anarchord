@@ -1,6 +1,7 @@
 //! Comandos que a interface (TUI, GUI, daemon) manda para o core.
 
 use crate::screen::VideoCodec;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Para onde vão os quadros da tela que o usuário está assistindo. Fila curta e limitada:
@@ -8,7 +9,7 @@ use std::path::PathBuf;
 /// receptor é descartado), o core sai da transmissão sozinho.
 pub type FrameSink = std::sync::mpsc::SyncSender<(VideoCodec, Vec<u8>)>;
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum CoreCommand {
     /// Mensagem de texto no canal atual
     SendMessage(String),
@@ -22,8 +23,15 @@ pub enum CoreCommand {
     ListScreens,
     StartScreenShare { monitor: usize, quality: u32 },
     StopScreenShare,
-    /// Assiste a transmissão de um par (nick, id da stream ou prefixo da pubkey)
-    WatchScreen { query: String, sink: FrameSink },
+    /// Assiste a transmissão de um par (nick, id da stream ou prefixo da pubkey). Sem `sink`
+    /// (ex.: controle remoto), o core só conta os quadros (`ScreenEvent::FrameReceived`).
+    WatchScreen {
+        query: String,
+        #[serde(skip)]
+        sink: Option<FrameSink>,
+    },
+    /// Disca um endereço (ex.: `/ip4/.../p2p/<relay>/p2p-circuit/p2p/<par>`)
+    Dial(String),
     /// Compartilha um arquivo na sala atual
     ShareFile(PathBuf),
     /// Oferece um arquivo só a um par
@@ -38,7 +46,7 @@ pub enum CoreCommand {
 }
 
 /// Comandos de servidor
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub enum ServerCommand {
     Create(String),
     Join(String),

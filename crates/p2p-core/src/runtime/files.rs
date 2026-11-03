@@ -23,6 +23,8 @@ pub(super) struct ManifestJob {
 pub(super) struct FilesState {
     pub(super) engine: FileEngine,
     requests: HashMap<OutboundRequestId, (PeerId, FileRequest)>,
+    /// Salas em que o nó se inscreveu por causa de downloads
+    followed: std::collections::HashSet<String>,
     tx: UnboundedSender<ManifestJob>,
     pub(super) manifests: Option<UnboundedReceiver<ManifestJob>>,
 }
@@ -32,14 +34,25 @@ impl FilesState {
         // Parciais separados por identidade: vários nós na mesma máquina não se misturam
         let partial_dir = download_dir.join(".parcial").join(&identity.public_key_hex()[..8]);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        Self { engine: FileEngine::new(partial_dir, download_dir), requests: HashMap::new(), tx, manifests: Some(rx) }
+        Self { engine: FileEngine::new(partial_dir, download_dir), requests: HashMap::new(), followed: Default::default(), tx, manifests: Some(rx) }
     }
 }
 
 impl Runtime {
     pub(super) fn resume_files(&mut self) {
         let actions = self.files.engine.resume(Instant::now());
+        self.follow_download_topics();
         self.apply_file_actions(actions);
+    }
+
+    /// Fica inscrito nas salas dos downloads em andamento (Have/Want circulam lá)
+    fn follow_download_topics(&mut self) {
+        for topic in self.files.engine.download_topics() {
+            let topic = libp2p::gossipsub::IdentTopic::new(topic);
+            if self.files.followed.insert(topic.hash().into_string()) {
+                let _ = self.node.swarm.behaviour_mut().gossipsub.subscribe(&topic);
+            }
+        }
     }
 
     pub(super) fn share_file(&mut self, path: PathBuf) {
@@ -109,6 +122,7 @@ impl Runtime {
     }
 
     pub(super) fn files_tick(&mut self) {
+        self.follow_download_topics();
         let actions = self.files.engine.tick(Instant::now());
         self.apply_file_actions(actions);
     }

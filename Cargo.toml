@@ -2,5 +2,6 @@
 members = [
     "crates/p2p-core",
     "crates/p2p-cli",
+    "crates/p2p-agent",
 ]
 resolver = "2"

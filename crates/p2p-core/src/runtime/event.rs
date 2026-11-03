@@ -4,8 +4,9 @@
 use crate::community::{HistoryEntry, ModKind, UtcSecs};
 use crate::files::{FileEvent, FileSummary};
 use crate::screen::ScreenInfo;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CoreEvent {
     /// Nó no ar
     Started { nick: String, pubkey: String, peer_id: String, port: u16 },
@@ -39,20 +40,20 @@ pub enum CoreEvent {
     Stopped,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SpaceInfo {
     Lobby,
     /// `name` é `None` enquanto a configuração do servidor não chegou
     Server { id: String, name: Option<String> },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelInfo {
     pub name: String,
     pub voice: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerSummary {
     pub id: String,
     pub name: String,
@@ -62,7 +63,7 @@ pub struct ServerSummary {
     pub pending: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NetworkEvent {
     Listening(String),
     ExternalAddress(String),
@@ -73,11 +74,15 @@ pub enum NetworkEvent {
     RelayRequested { relay: String, address: String },
     RelayReserved(String),
     HolePunched(String),
+    /// Tentativa de hole punching falhou (a conexão segue pelo relay)
+    HolePunchFailed { peer_id: String, error: String },
+    /// Primeira conexão com um par Anarchord, ou a primeira direta depois de uma relayada
+    Connected { peer_id: String, address: String, relayed: bool },
     ConnectionClosed { peer_id: String, cause: String },
     AudioUnavailable(String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum VoiceEvent {
     Joined(String),
     Left(String),
@@ -88,7 +93,7 @@ pub enum VoiceEvent {
     SynthStarted,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ScreenEvent {
     Monitors(Vec<ScreenInfo>),
     ShareStarted { stream_id: String, quality: u32, synthetic: bool },
@@ -103,7 +108,7 @@ pub enum ScreenEvent {
     WatchEnded,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerNotice {
     Created { id: String, name: String },
     /// Procurando membros online para receber a configuração
@@ -139,7 +144,7 @@ pub enum ServerNotice {
     Help,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerChange {
     ChannelAdded { name: String, voice: bool },
     ChannelRemoved(String),
@@ -150,7 +155,7 @@ pub enum ServerChange {
     Policy { validity_secs: u64, renewal_window_secs: u64 },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerListEntry {
     pub id: String,
     pub name: String,
@@ -162,14 +167,14 @@ pub struct ServerListEntry {
     pub banned: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Role {
     Owner,
     Moderator(u8),
     Member,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerInfo {
     pub id: String,
     pub name: String,
@@ -188,7 +193,7 @@ pub struct ServerInfo {
     pub pending_actions: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CoreError {
     PeerNotFound(String),
     NoStream(String),

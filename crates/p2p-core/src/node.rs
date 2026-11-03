@@ -74,9 +74,34 @@ fn pick_shared_tcp_udp_port() -> std::io::Result<u16> {
     ))
 }
 
+/// Opções de construção do nó
+#[derive(Debug, Clone)]
+pub struct NodeOptions {
+    /// Porta TCP + QUIC (0 = escolhe uma livre)
+    pub port: u16,
+    /// Atende como servidor de Circuit Relay v2 (nós públicos)
+    pub relay_server: bool,
+    /// Rede de laboratório: endereços privados contam como "públicos" para AutoNAT e relay,
+    /// e as sondagens do AutoNAT são rápidas
+    pub lab: bool,
+    /// Descoberta na rede local (mDNS)
+    pub mdns: bool,
+}
+
+impl Default for NodeOptions {
+    fn default() -> Self {
+        Self { port: 0, relay_server: false, lab: false, mdns: true }
+    }
+}
+
 impl P2PNode {
     /// Inicializa o Nó P2P com Kademlia DHT, GossipSub, DCUtR e Criptografia Noise
     pub fn new(identity: UserIdentity, listen_port: u16) -> Result<Self, NodeError> {
+        Self::with_options(identity, NodeOptions { port: listen_port, ..Default::default() })
+    }
+
+    pub fn with_options(identity: UserIdentity, options: NodeOptions) -> Result<Self, NodeError> {
+        let listen_port = options.port;
         let keypair = identity.to_libp2p_keypair();
         let peer_id = PeerId::from(keypair.public());
 
@@ -131,17 +156,47 @@ impl P2PNode {
                 let identify = identify::Behaviour::new(identify_config);
 
                 // 4. mDNS: Descoberta automática instantânea em redes locais (LAN / Wi-Fi / Localhost)
-                let mdns = libp2p::mdns::tokio::Behaviour::new(
-                    libp2p::mdns::Config::default(),
-                    key.public().to_peer_id(),
-                )
-                .map_err(|e| NodeError::SwarmInit(format!("Falha ao inicializar mDNS: {}", e)))?;
+                let mdns = if options.mdns {
+                    Some(
+                        libp2p::mdns::tokio::Behaviour::new(libp2p::mdns::Config::default(), key.public().to_peer_id())
+                            .map_err(|e| NodeError::SwarmInit(format!("Falha ao inicializar mDNS: {}", e)))?,
+                    )
+                } else {
+                    None
+                }
+                .into();
 
                 // 5. Ping
                 let ping = ping::Behaviour::new(ping::Config::default());
 
                 // 6. AutoNAT & DCUtR (Hole Punching)
-                let autonat = autonat::Behaviour::new(key.public().to_peer_id(), autonat::Config::default());
+                let autonat_config = if options.lab {
+                    autonat::Config {
+                        only_global_ips: false,
+                        boot_delay: Duration::from_secs(1),
+                        retry_interval: Duration::from_secs(3),
+                        refresh_interval: Duration::from_secs(10),
+                        confidence_max: 1,
+                        throttle_server_period: Duration::ZERO,
+                        ..Default::default()
+                    }
+                } else {
+                    autonat::Config::default()
+                };
+                let autonat = autonat::Behaviour::new(key.public().to_peer_id(), autonat_config);
+                let relay_server = options
+                    .relay_server
+                    .then(|| {
+                        // O padrão do libp2p (128 KB e 2 min por circuito) só serve para sinalização;
+                        // nossos relays carregam chat, voz e arquivos de quem não consegue hole punching
+                        let config = libp2p::relay::Config {
+                            max_circuit_duration: Duration::from_secs(3600),
+                            max_circuit_bytes: 1 << 30,
+                            ..Default::default()
+                        };
+                        libp2p::relay::Behaviour::new(key.public().to_peer_id(), config)
+                    })
+                    .into();
                 let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
 
                 // 7. Protocolo de arquivos do enxame (pedaços em bytes crus, um stream por pedido)
@@ -160,6 +215,7 @@ impl P2PNode {
                     autonat,
                     dcutr,
                     relay_client,
+                    relay_server,
                     files,
                 })
             })
@@ -185,6 +241,23 @@ impl P2PNode {
             swarm,
             listen_port,
         })
+    }
+
+    /// Usa `addresses` (com `/p2p/<id>` no fim) como bootstrap da DHT, no lugar dos nós do IPFS.
+    /// Retorna quantos foram registrados.
+    pub fn bootstrap_with(&mut self, addresses: &[Multiaddr]) -> usize {
+        let mut added = 0;
+        for addr in addresses {
+            if let Some(Protocol::P2p(peer_id)) = addr.iter().last() {
+                self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                let _ = self.swarm.dial(addr.clone());
+                added += 1;
+            }
+        }
+        if added > 0 {
+            let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
+        }
+        added
     }
 
     /// Registra os nós de bootstrap da DHT Amino no Kademlia e inicia o bootstrap da tabela de roteamento.

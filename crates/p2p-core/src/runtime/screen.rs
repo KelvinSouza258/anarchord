@@ -146,7 +146,7 @@ impl Runtime {
         }
     }
 
-    pub(super) fn watch_screen(&mut self, query: &str, sink: FrameSink) {
+    pub(super) fn watch_screen(&mut self, query: &str, sink: Option<FrameSink>) {
         let found = self
             .screen
             .streams
@@ -159,7 +159,7 @@ impl Runtime {
         }
         // Só agora passa a receber os quadros dessa stream
         let _ = self.node.swarm.behaviour_mut().gossipsub.subscribe(&topic);
-        self.screen.watching = Some((stream_id.clone(), topic, Some(sink)));
+        self.screen.watching = Some((stream_id.clone(), topic, sink));
         self.screen.gate = KeyframeGate::new();
         self.emit(CoreEvent::Screen(ScreenEvent::Watching { stream_id, nick }));
     }

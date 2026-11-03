@@ -88,6 +88,10 @@ fn network(event: &NetworkEvent) -> String {
         NetworkEvent::RelayRequested { relay, .. } => format!("🛰️ Pedindo reserva no relay {}", relay),
         NetworkEvent::RelayReserved(relay) => format!("🛰️ Reserva aceita no relay {}", relay),
         NetworkEvent::HolePunched(peer) => format!("🕳️ Hole punching OK: conexão direta com {}", peer),
+        NetworkEvent::HolePunchFailed { peer_id, error } => format!("🕳️ Hole punching com {} falhou (segue via relay): {}", peer_id, error),
+        NetworkEvent::Connected { peer_id, relayed, .. } => {
+            format!("🔗 Conectado a {} ({})", peer_id, if *relayed { "via relay" } else { "direto" })
+        }
         NetworkEvent::ConnectionClosed { peer_id, cause } => format!("👋 Conexão fechada com {} ({})", peer_id, cause),
         NetworkEvent::AudioUnavailable(reason) => format!("⚠️ Áudio nativo indisponível: {}", reason),
     }
