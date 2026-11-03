@@ -29,9 +29,13 @@ pub struct TorrentTrackerClient {
 
 impl TorrentTrackerClient {
     pub fn new() -> Result<Self, TrackerError> {
+        Self::with_timeout(Duration::from_secs(3))
+    }
+
+    pub fn with_timeout(timeout: Duration) -> Result<Self, TrackerError> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
-        socket.set_read_timeout(Some(Duration::from_secs(3)))?;
-        socket.set_write_timeout(Some(Duration::from_secs(3)))?;
+        socket.set_read_timeout(Some(timeout))?;
+        socket.set_write_timeout(Some(timeout))?;
         Ok(Self { socket })
     }
 
@@ -173,14 +177,14 @@ impl TorrentTrackerClient {
         client.announce_response(addr, conn_id, info_hash, peer_id, listen_port, event)
     }
 
-    /// Desanuncia do tracker notificando que o nó foi encerrado (event = stopped)
+    /// Desanuncia do tracker notificando que o nó foi encerrado (event = stopped) com timeout curto
     pub fn announce_stopped(
         tracker_host_port: &str,
         info_hash: &[u8; 20],
         peer_id: &[u8; 20],
         listen_port: u16,
     ) -> Result<(), TrackerError> {
-        let client = TorrentTrackerClient::new()?;
+        let client = TorrentTrackerClient::with_timeout(Duration::from_millis(500))?;
         let addr = tracker_host_port
             .to_socket_addrs()
             .map_err(|_| TrackerError::ResolutionFailed)?

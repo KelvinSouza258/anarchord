@@ -101,15 +101,29 @@ impl Runtime {
         });
     }
 
-    /// Desanuncia o nó dos trackers (event = stopped)
+    /// Desanuncia o nó dos trackers (event = stopped) em paralelo
     pub(super) fn stop_discovery(&mut self) {
         if !self.config.discovery {
             return;
         }
+        let trackers = self.trackers();
+        if trackers.is_empty() {
+            return;
+        }
         let info_hash = make_info_hash(DHT_DISCOVERY_NAMESPACE);
         let bt_peer_id = self.bt_peer_id();
-        for tracker in self.trackers() {
-            let _ = TorrentTrackerClient::announce_stopped(&tracker, &info_hash, &bt_peer_id, self.node.listen_port);
+        let port = self.node.listen_port;
+
+        // Dispara o desanúncio em paralelo em threads para não travar sequencialmente
+        let mut handles = Vec::new();
+        for tracker in trackers {
+            let h = std::thread::spawn(move || {
+                let _ = TorrentTrackerClient::announce_stopped(&tracker, &info_hash, &bt_peer_id, port);
+            });
+            handles.push(h);
+        }
+        for h in handles {
+            let _ = h.join();
         }
     }
 

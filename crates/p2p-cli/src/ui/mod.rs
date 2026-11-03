@@ -911,6 +911,11 @@ impl TerminalUi {
         f.render_widget(messages_list, area);
     }
 
+    pub fn restore_terminal() {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
+    }
+
     fn cleanup_terminal(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;

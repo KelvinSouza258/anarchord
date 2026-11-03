@@ -219,6 +219,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (core, task) = Core::start(config)?;
     let (commands, events) = core.split();
 
+    // Configura panic hook para garantir que o terminal seja sempre restaurado
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        TerminalUi::restore_terminal();
+        default_panic(info);
+    }));
+
     // Ctrl+C encerra com calma (desanuncia o nó nos trackers)
     let on_ctrl_c = commands.clone();
     tokio::spawn(async move {
@@ -243,8 +250,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(bridge(events, rx_ui_action, commands, tx_ui_event, muted));
     }
 
-    // O loop do core roda nesta tarefa (o áudio do sistema não pode trocar de thread)
-    task.run().await;
+    // O loop do core roda com timeout de saída para nunca travar o terminal
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task.run()).await;
+    TerminalUi::restore_terminal();
     Ok(())
 }
 
