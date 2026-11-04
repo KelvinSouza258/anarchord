@@ -156,6 +156,7 @@ Tracked as [GitHub milestones](https://github.com/VictorGerin/anarchord/mileston
 
 **v0.2 Foundation** ⏳
 - [ ] Protocol versioning & cross-version compatibility [#51](https://github.com/VictorGerin/anarchord/issues/51)
+- [ ] Versioned protocol engine with version/capability negotiation [#61](https://github.com/VictorGerin/anarchord/issues/61)
 - [ ] Git-based versioning [#19](https://github.com/VictorGerin/anarchord/issues/19) and signed, verifiable releases [#49](https://github.com/VictorGerin/anarchord/issues/49)
 - [ ] Crypto hardening: keys encrypted at rest, periodic key updates, safety numbers, fuzzing [#45](https://github.com/VictorGerin/anarchord/issues/45)
 - [ ] Application firewall against spam/abuse with progressive blocking [#48](https://github.com/VictorGerin/anarchord/issues/48)
