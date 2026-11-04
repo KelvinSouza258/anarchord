@@ -168,6 +168,7 @@ Tracked as [GitHub milestones](https://github.com/VictorGerin/anarchord/mileston
 - [ ] Configuration chain consolidation [#52](https://github.com/VictorGerin/anarchord/issues/52)
 - [ ] MLS & control-topic scaling (batched commits, commit catch-up, no polling) [#53](https://github.com/VictorGerin/anarchord/issues/53), control topic split by function [#58](https://github.com/VictorGerin/anarchord/issues/58)
 - [ ] Metadata leakage review (topics, DHT) [#47](https://github.com/VictorGerin/anarchord/issues/47)
+- [ ] Server discovery: open directory and tag search [#60](https://github.com/VictorGerin/anarchord/issues/60)
 
 **v0.4 Channels, DMs & History**
 - [ ] 1:1 DMs with ephemeral session keys [#36](https://github.com/VictorGerin/anarchord/issues/36) and offline delivery via guardians [#37](https://github.com/VictorGerin/anarchord/issues/37)
