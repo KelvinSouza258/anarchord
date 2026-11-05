@@ -4,7 +4,7 @@ mod spaces;
 mod ui;
 
 use clap::Parser;
-use p2p_core::files::FileEvent;
+use p2p_core::files::{FileEvent, FileState};
 use p2p_core::runtime::{Core, CoreCommand, CoreConfig, CoreError, CoreEvent, ScreenEvent, ServerCommand, SpaceInfo, VoiceEvent};
 use p2p_core::screen::VideoCodec;
 use p2p_core::UserIdentity;
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
-use ui::menu::{FriendUiEntry, ServerEntry};
+use ui::menu::{FileUiEntry, FileUiState, FriendUiEntry, ServerEntry};
 use ui::{TerminalUi, UiAction, UiEvent};
 
 #[derive(Parser, Debug, PartialEq)]
@@ -469,12 +469,50 @@ fn ui_events(event: &CoreEvent) -> Vec<UiEvent> {
         CoreEvent::File(event) => {
             let progress = |name: &String, percentage: f32| UiEvent::FileTransferProgress { file_name: name.clone(), percentage, is_download: true };
             match event {
+                FileEvent::Offered { cid, name, size, from, .. } => {
+                    out.push(UiEvent::FileKnown(FileUiEntry {
+                        id: cid.short(),
+                        name: name.clone(),
+                        size: render::human_size(*size),
+                        from: from.clone(),
+                        state: FileUiState::Offered,
+                    }));
+                }
+                FileEvent::Shared { cid, name } => {
+                    out.push(UiEvent::FileKnown(FileUiEntry {
+                        id: cid.short(),
+                        name: name.clone(),
+                        size: String::new(),
+                        from: "você".to_string(),
+                        state: FileUiState::Seeding,
+                    }));
+                }
                 FileEvent::Started { name, .. } => out.push(progress(name, 0.0)),
                 FileEvent::Progress { name, progress: p, .. } => out.push(progress(name, (p * 100.0).min(99.9))),
                 FileEvent::Completed { name, .. } => out.push(progress(name, 100.0)),
                 FileEvent::Failed { name, .. } => out.push(progress(name, -1.0)),
                 _ => {}
             }
+        }
+        CoreEvent::Files(list) => {
+            let entries = list
+                .iter()
+                .map(|f| FileUiEntry {
+                    id: f.cid.short(),
+                    name: f.name.clone(),
+                    size: render::human_size(f.size),
+                    from: f.from.clone(),
+                    state: match &f.state {
+                        FileState::Offered => FileUiState::Offered,
+                        FileState::Downloading { progress, peers } => FileUiState::Downloading {
+                            progress: *progress,
+                            peers: *peers,
+                        },
+                        FileState::Seeding => FileUiState::Seeding,
+                    },
+                })
+                .collect();
+            out.push(UiEvent::FilesListed(entries));
         }
         _ => {}
     }

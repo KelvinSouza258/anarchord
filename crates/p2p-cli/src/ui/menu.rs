@@ -2,6 +2,25 @@
 //! Cada item gera um comando de texto igual ao que o usuário digitaria, então o backend não
 //! precisa saber de menus.
 
+/// Estado resumido de um arquivo exibido no popup de `/files` e usado no autocompletar da TUI
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileUiState {
+    Offered,
+    Downloading { progress: f32, peers: usize },
+    Seeding,
+}
+
+/// Arquivo exibido no popup de `/files` e registrado para autocompletar com `Tab`
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileUiEntry {
+    /// ID curto do manifesto (`cid.short()`, ex.: `"bafk1234"`)
+    pub id: String,
+    pub name: String,
+    pub size: String,
+    pub from: String,
+    pub state: FileUiState,
+}
+
 /// Amigo exibido nos menus e painel lateral (enviado pelo backend em `UiEvent::FriendsChanged`)
 #[derive(Debug, Clone, PartialEq)]
 pub struct FriendUiEntry {
@@ -46,8 +65,8 @@ pub struct Menu {
     pub selected: usize,
 }
 
-fn run(label: &str, command: impl Into<String>) -> MenuItem {
-    MenuItem { label: label.to_string(), action: MenuAction::Run(command.into()) }
+fn run(label: impl Into<String>, command: impl Into<String>) -> MenuItem {
+    MenuItem { label: label.into(), action: MenuAction::Run(command.into()) }
 }
 
 fn ask(label: &str, prompt: impl Into<String>, template: impl Into<String>) -> MenuItem {
@@ -213,6 +232,49 @@ pub fn channel_menu(name: &str, is_voice: bool) -> Menu {
         vec![run("# Entrar no canal", format!("/join {}", name))]
     };
     Menu::new(format!(" {}{} ", if is_voice { "🔊 " } else { "#" }, name), items)
+}
+
+/// Popup interativo e clicável de arquivos (`/files`), permitindo clicar num arquivo para
+/// baixar (`/get`), recusar (`/reject`) ou parar de compartilhar (`/unshare`).
+pub fn files_menu(files: &[FileUiEntry]) -> Menu {
+    let mut items = Vec::new();
+    for f in files {
+        let (icon, status, actions) = match &f.state {
+            FileUiState::Offered => (
+                "📥",
+                format!("oferecido por {} · clique para baixar", f.from),
+                vec![
+                    run(format!("📥 Baixar '{}' (/get {})", f.name, f.id), format!("/get {}", f.id)),
+                    run(format!("❌ Recusar oferta (/reject {})", f.id), format!("/reject {}", f.id)),
+                ],
+            ),
+            FileUiState::Downloading { progress, peers } => (
+                "⏳",
+                format!("baixando {:.0}% ({} par(es))", progress * 100.0, peers),
+                vec![
+                    run(format!("🛑 Cancelar download (/unshare {})", f.id), format!("/unshare {}", f.id)),
+                ],
+            ),
+            FileUiState::Seeding => (
+                "📤",
+                "compartilhando".to_string(),
+                vec![
+                    run(format!("🛑 Parar de compartilhar (/unshare {})", f.id), format!("/unshare {}", f.id)),
+                ],
+            ),
+        };
+        let size_part = if f.size.is_empty() { String::new() } else { format!(" ({})", f.size) };
+        let label = format!("{} [{}] {}{} — {} ▸", icon, f.id, f.name, size_part, status);
+        let sub = Menu::new(format!(" 📁 {} [{}] ", f.name, f.id), actions);
+        items.push(MenuItem { label, action: MenuAction::Submenu(sub) });
+    }
+    items.push(ask("📎 Compartilhar novo arquivo na sala…", "Caminho do arquivo", "/share \"{}\""));
+    let title = if files.is_empty() {
+        " 📁 Arquivos (nenhum arquivo ativo) ".to_string()
+    } else {
+        format!(" 📁 Arquivos ({}) — clique ou Enter para escolher ", files.len())
+    };
+    Menu::new(title, items)
 }
 
 /// Comando para entrar num canal ao clicar nele

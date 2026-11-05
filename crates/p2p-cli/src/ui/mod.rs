@@ -19,7 +19,10 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 use editor::LineEditor;
-use menu::{channel_command, channel_menu, main_menu, member_menu, spaces_menu, FriendUiEntry, Menu, MenuAction, MenuContext, ServerEntry, HELP_LINES};
+use menu::{
+    channel_command, channel_menu, files_menu, main_menu, member_menu, spaces_menu, FileUiEntry,
+    FileUiState, FriendUiEntry, Menu, MenuAction, MenuContext, ServerEntry, HELP_LINES,
+};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,6 +95,10 @@ pub enum UiEvent {
         percentage: f32,
         is_download: bool,
     },
+    /// Novo arquivo conhecido (oferecido ou compartilhado) — atualiza o autocompletar (`Tab`) imediatamente
+    FileKnown(FileUiEntry),
+    /// Resposta a `/files` — atualiza a lista de arquivos e abre o popup clicável de arquivos
+    FilesListed(Vec<FileUiEntry>),
 }
 
 /// Ações disparadas pela UI para o backend P2P
@@ -126,6 +133,8 @@ pub struct TerminalUi {
     overlay: Option<Overlay>,
     servers: Vec<ServerEntry>,
     friends: Vec<FriendUiEntry>,
+    /// Arquivos conhecidos (oferecidos, baixando e compartilhando) para o popup `/files` e autocompletar `Tab`
+    known_files: Vec<FileUiEntry>,
     in_server: bool,
     chat_area: Rect,
     /// Largura do rótulo da aba Chat no título (para saber em qual aba o clique caiu)
@@ -177,6 +186,7 @@ impl TerminalUi {
             overlay: None,
             servers: Vec::new(),
             friends: Vec::new(),
+            known_files: Vec::new(),
             in_server: false,
             chat_area: Rect::default(),
             tab_split: 0,
@@ -355,9 +365,25 @@ impl TerminalUi {
                 } else if percentage >= 100.0 {
                     self.file_transfer = None;
                     self.push_system(format!("✅ Arquivo '{}' concluído com sucesso!", file_name));
+                    for f in &mut self.known_files {
+                        if f.name == file_name {
+                            f.state = FileUiState::Seeding;
+                        }
+                    }
                 } else {
                     self.file_transfer = Some((file_name, percentage, is_download));
                 }
+            }
+            UiEvent::FileKnown(entry) => {
+                if let Some(existing) = self.known_files.iter_mut().find(|f| f.id == entry.id) {
+                    *existing = entry;
+                } else {
+                    self.known_files.push(entry);
+                }
+            }
+            UiEvent::FilesListed(entries) => {
+                self.known_files = entries;
+                self.overlay = Some(Overlay::Menu(vec![files_menu(&self.known_files)]));
             }
         }
     }
@@ -583,12 +609,16 @@ impl TerminalUi {
         }
     }
 
-    /// Palavras para completar com Tab: nicks conhecidos, amigos e canais do espaço
+    /// Palavras para completar com Tab: nicks conhecidos, amigos, canais do espaço e IDs/nomes de arquivos
     fn completion_words(&self) -> Vec<String> {
         let mut words: Vec<String> = self.peers.iter().map(|(_, nick, _)| nick.clone()).collect();
         words.extend(self.friends.iter().map(|f| f.display_name.clone()));
         words.extend(self.channel_members.values().flatten().cloned());
         words.extend(self.space_channels.iter().map(|(name, _)| name.clone()));
+        for file in &self.known_files {
+            words.push(file.id.clone());
+            words.push(file.name.clone());
+        }
         words.retain(|w| *w != self.my_nick);
         words.sort();
         words.dedup();
@@ -1662,5 +1692,75 @@ mod tests {
         let pos_3 = screen.find("terceira (enviada em .450s").expect("3a na tela");
         let pos_4 = screen.find("quarta (enviada em .850s").expect("4a na tela");
         assert!(pos_1 < pos_2 && pos_2 < pos_3 && pos_3 < pos_4, "tela fora de ordem:\n{}", screen);
+    }
+
+    /// Issue #63:
+    /// 1. Quando um arquivo é oferecido ou compartilhado (`UiEvent::FileKnown`), o autocompletar com `Tab`
+    ///    passa a completar o `<id>` (e o nome) do arquivo para `/get `, `/accept `, `/reject ` e `/unshare `.
+    /// 2. Ao executar `/files` (`UiEvent::FilesListed`), a TUI abre um popup clicável (`Overlay::Menu`)
+    ///    onde o usuário pode clicar com o mouse (ou usar Enter) para escolher o arquivo e baixar/recusar/parar de compartilhar.
+    #[test]
+    fn test_file_id_tab_autocomplete_and_clickable_files_popup() {
+        let mut ui = ui_for("Alice");
+
+        // 1) Bob oferece um arquivo para Alice -> FileKnown registra o ID curto "bafk9a8b" e nome "relatorio.pdf"
+        ui.handle_event(UiEvent::FileKnown(FileUiEntry {
+            id: "bafk9a8b".into(),
+            name: "relatorio.pdf".into(),
+            size: "586 KB".into(),
+            from: "Bob".into(),
+            state: FileUiState::Offered,
+        }));
+
+        // Autocompletar com Tab para `/get bafk` -> `/get bafk9a8b `
+        type_text(&mut ui, "/get bafk");
+        ui.handle_key(key(KeyCode::Tab));
+        assert_eq!(ui.editor.text(), "/get bafk9a8b ");
+        ui.handle_key(key(KeyCode::Esc));
+
+        // Autocompletar com Tab também funciona pelo nome do arquivo ou em `/reject ` e `/unshare `
+        type_text(&mut ui, "/reject relat");
+        ui.handle_key(key(KeyCode::Tab));
+        assert_eq!(ui.editor.text(), "/reject relatorio.pdf ");
+        ui.handle_key(key(KeyCode::Esc));
+
+        // 2) Usuário executa `/files` e recebe `UiEvent::FilesListed` -> popup interativo abre automaticamente!
+        ui.handle_event(UiEvent::FilesListed(vec![
+            FileUiEntry {
+                id: "bafk9a8b".into(),
+                name: "relatorio.pdf".into(),
+                size: "586 KB".into(),
+                from: "Bob".into(),
+                state: FileUiState::Offered,
+            },
+            FileUiEntry {
+                id: "bafk7777".into(),
+                name: "musica.ogg".into(),
+                size: "4.2 MB".into(),
+                from: "você".into(),
+                state: FileUiState::Seeding,
+            },
+        ]));
+
+        let screen = render(&mut ui);
+        assert!(
+            screen.contains("Arquivos (2)") && screen.contains("[bafk9a8b] relatorio.pdf") && screen.contains("[bafk7777] musica.ogg"),
+            "popup de /files deveria listar os arquivos na tela:\n{}",
+            screen
+        );
+
+        // Clicar com o mouse na 1ª linha do popup (`relatorio.pdf`) abre o submenu de ações daquele arquivo
+        assert!(click(&mut ui, |ui| ui.popup_area, 0, false).is_empty());
+        let sub_screen = render(&mut ui);
+        assert!(
+            sub_screen.contains("Baixar 'relatorio.pdf' (/get bafk9a8b)") && sub_screen.contains("Recusar oferta (/reject bafk9a8b)"),
+            "submenu do arquivo oferecido:\n{}",
+            sub_screen
+        );
+
+        // Clicar na 1ª opção do submenu dispara `/get bafk9a8b`!
+        let actions = click(&mut ui, |ui| ui.popup_area, 0, false);
+        assert_eq!(sent(&actions), vec!["/get bafk9a8b"]);
+        assert!(ui.overlay.is_none());
     }
 }

@@ -19,6 +19,7 @@ pub const COMMANDS: &[&str] = &[
     "/share ",
     "/send ",
     "/get ",
+    "/accept ",
     "/reject ",
     "/files",
     "/unshare ",
