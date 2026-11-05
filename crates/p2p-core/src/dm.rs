@@ -12,7 +12,7 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -633,22 +633,55 @@ impl StoredEnvelope {
     }
 }
 
-/// Armazenamento local do Guardião (Carol) e Outbox do Remetente (Alice)
+/// Estado persistido em `mailbox.json` no disco
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct PersistedMailbox {
+    envelopes: Vec<StoredEnvelope>,
+    /// IDs de envelopes já recebidos pelo destinatário local (`envelope_id` -> `expires_at`)
+    delivered_ids: HashMap<String, u64>,
+    /// ACKs assinados pelos destinatários (`envelope_id` -> `ReceiptAck`) para sincronizar outros guardiões
+    acks: HashMap<String, ReceiptAck>,
+}
+
+/// Armazenamento local do Guardião (Carol/Bob) e Outbox do Remetente (Alice)
 pub struct MailboxStore {
     storage_path: Option<PathBuf>,
     /// Envelopes guardados por este nó: envelope_id -> StoredEnvelope
     envelopes: HashMap<String, StoredEnvelope>,
-    /// IDs de envelopes já recebidos e processados por este nó (evita duplicatas vindas de múltiplos guardiões)
-    delivered_ids: HashSet<String>,
+    /// IDs de envelopes já recebidos e processados por este nó: envelope_id -> expires_at
+    /// (persistido em disco para não exibir duplicado após reiniciar o app!)
+    delivered_ids: HashMap<String, u64>,
+    /// ACKs assinados conhecidos por este nó: envelope_id -> ReceiptAck
+    /// (permite que o destinatário ou um guardião informe ao remetente/outros guardiões que já foi entregue)
+    acks: HashMap<String, ReceiptAck>,
 }
 
 impl MailboxStore {
     pub fn load(storage_path: Option<PathBuf>, now: u64) -> Self {
         let mut envelopes = HashMap::new();
+        let mut delivered_ids = HashMap::new();
+        let mut acks = HashMap::new();
         if let Some(ref path) = storage_path {
             if let Ok(bytes) = fs::read(path) {
-                if let Ok(list) = serde_json::from_slice::<Vec<StoredEnvelope>>(&bytes) {
-                    for env in list {
+                if let Ok(persisted) = serde_json::from_slice::<PersistedMailbox>(&bytes) {
+                    for env in persisted.envelopes {
+                        if env.expires_at > now {
+                            envelopes.insert(env.envelope_id.clone(), env);
+                        }
+                    }
+                    for (id, exp) in persisted.delivered_ids {
+                        if exp > now {
+                            delivered_ids.insert(id, exp);
+                        }
+                    }
+                    for (id, ack) in persisted.acks {
+                        if ack.verify() {
+                            acks.insert(id, ack);
+                        }
+                    }
+                } else if let Ok(legacy_list) = serde_json::from_slice::<Vec<StoredEnvelope>>(&bytes) {
+                    for env in legacy_list {
                         if env.expires_at > now {
                             envelopes.insert(env.envelope_id.clone(), env);
                         }
@@ -659,7 +692,8 @@ impl MailboxStore {
         Self {
             storage_path,
             envelopes,
-            delivered_ids: HashSet::new(),
+            delivered_ids,
+            acks,
         }
     }
 
@@ -670,8 +704,12 @@ impl MailboxStore {
                     let _ = fs::create_dir_all(parent);
                 }
             }
-            let list: Vec<&StoredEnvelope> = self.envelopes.values().collect();
-            if let Ok(json) = serde_json::to_string_pretty(&list) {
+            let data = PersistedMailbox {
+                envelopes: self.envelopes.values().cloned().collect(),
+                delivered_ids: self.delivered_ids.clone(),
+                acks: self.acks.clone(),
+            };
+            if let Ok(json) = serde_json::to_string_pretty(&data) {
                 let _ = fs::write(path, json);
             }
         }
@@ -702,7 +740,7 @@ impl MailboxStore {
         if !envelope.verify_outer() {
             return Err(DmError::InvalidSignature);
         }
-        if self.delivered_ids.contains(&envelope.envelope_id) {
+        if self.delivered_ids.contains_key(&envelope.envelope_id) || self.acks.contains_key(&envelope.envelope_id) {
             // Já foi entregue anteriormente
             let effective_ttl = config.calculate_effective_ttl(envelope.suggested_ttl);
             return Ok(effective_ttl);
@@ -756,13 +794,23 @@ impl MailboxStore {
             .collect()
     }
 
-    /// Marca um envelope como recebido pelo destinatário local; retorna `true` se é inédito (não duplicado)
-    pub fn mark_delivered_to_me(&mut self, envelope_id: &str) -> bool {
+    /// Marca um envelope como recebido pelo destinatário local e guarda o ACK assinado;
+    /// retorna `true` se é inédito (não duplicado), mesmo após reiniciar o app!
+    pub fn mark_delivered_to_me(&mut self, envelope_id: &str, expires_at: u64, ack: ReceiptAck) -> bool {
         self.envelopes.remove(envelope_id);
-        self.delivered_ids.insert(envelope_id.to_string())
+        self.acks.insert(envelope_id.to_string(), ack);
+        let is_new = !self.delivered_ids.contains_key(envelope_id);
+        self.delivered_ids.insert(envelope_id.to_string(), expires_at);
+        self.persist();
+        is_new
     }
 
-    /// Processa um `ReceiptAck` assinado pelo destinatário e remove o envelope do disco do guardião
+    /// Retorna o ACK já assinado para um envelope (se já tiver sido entregue)
+    pub fn get_ack(&self, envelope_id: &str) -> Option<ReceiptAck> {
+        self.acks.get(envelope_id).cloned()
+    }
+
+    /// Processa um `ReceiptAck` assinado pelo destinatário e remove o envelope do disco do guardião/remetente
     pub fn apply_ack(&mut self, ack: &ReceiptAck) -> bool {
         if !ack.verify() {
             return false;
@@ -772,23 +820,32 @@ impl MailboxStore {
                 return false;
             }
         }
-        self.delivered_ids.insert(ack.envelope_id.clone());
+        let exp = ack.timestamp.saturating_add(7 * 86_400);
+        self.delivered_ids.entry(ack.envelope_id.clone()).or_insert(exp);
+        let is_new_ack = !self.acks.contains_key(&ack.envelope_id);
+        self.acks.insert(ack.envelope_id.clone(), ack.clone());
         let removed = self.envelopes.remove(&ack.envelope_id).is_some();
-        if removed {
+        if removed || is_new_ack {
             self.persist();
         }
         removed
     }
 
-    /// Remove envelopes expirados
+    /// Remove envelopes e registros de entrega expirados
     pub fn purge_expired(&mut self, now: u64) -> usize {
         let before = self.envelopes.len();
         self.envelopes.retain(|_, env| env.expires_at > now);
+        self.delivered_ids.retain(|_, &mut exp| exp > now);
         let removed = before.saturating_sub(self.envelopes.len());
         if removed > 0 {
             self.persist();
         }
         removed
+    }
+
+    /// Retorna todos os ACKs conhecidos (útil para avisar amigos/guardiões de entregas já concluídas)
+    pub fn known_acks(&self) -> Vec<ReceiptAck> {
+        self.acks.values().cloned().collect()
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -995,5 +1052,51 @@ mod tests {
         // Após 1000 + 86401 segundos, o envelope expira e é purgado
         assert_eq!(store.purge_expired(1000 + 86_401), 1);
         assert_eq!(store.envelope_count(), 0);
+    }
+
+    #[test]
+    fn test_delivered_ids_and_acks_persist_across_restarts_preventing_duplicate_delivery() {
+        let alice = UserIdentity::generate_with_nick("Alice");
+        let carol = UserIdentity::generate_with_nick("Carol");
+        let dir = std::env::temp_dir().join(format!("anarchord_mailbox_dedup_{}", rand::random::<u64>()));
+        let _ = fs::create_dir_all(&dir);
+        let carol_file = dir.join("carol_mailbox.json");
+        let alice_file = dir.join("alice_mailbox.json");
+
+        let cfg = NodeConfig::default();
+        let env = StoredEnvelope::create_signed_and_sealed(
+            &alice,
+            &carol.public_key_hex(),
+            "Oi Carol, mensagem única!",
+            5000,
+            Some(3600),
+        )
+        .unwrap();
+
+        // Alice guarda na sua outbox local
+        let mut alice_store = MailboxStore::load(Some(alice_file.clone()), 5000);
+        alice_store.insert_own(env.clone(), &cfg, 5000);
+        assert_eq!(alice_store.envelope_count(), 1);
+
+        // Carol recebe de Bob (enquanto Alice estava offline) e marca como entregue
+        let mut carol_store = MailboxStore::load(Some(carol_file.clone()), 5010);
+        let ack = ReceiptAck::new_signed(&carol, &env.envelope_id, 5010);
+        assert!(carol_store.mark_delivered_to_me(&env.envelope_id, env.expires_at, ack.clone()));
+        // Na mesma sessão já retorna false
+        assert!(!carol_store.mark_delivered_to_me(&env.envelope_id, env.expires_at, ack));
+
+        // Carol FECHA e ABRE o programa novamente (recarrega do disco)
+        let mut carol_restarted = MailboxStore::load(Some(carol_file), 5020);
+        let saved_ack = carol_restarted.get_ack(&env.envelope_id).expect("ACK deve estar salvo no disco");
+        assert!(
+            !carol_restarted.mark_delivered_to_me(&env.envelope_id, env.expires_at, saved_ack.clone()),
+            "Carol NÃO deve aceitar a mesma mensagem novamente após reiniciar o app!"
+        );
+
+        // E o ACK salvo por Carol limpa a outbox da Alice quando elas se reconectam
+        assert!(alice_store.apply_ack(&saved_ack));
+        assert_eq!(alice_store.envelope_count(), 0);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

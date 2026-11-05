@@ -342,6 +342,11 @@ impl Runtime {
         let now = super::now_secs();
         match msg {
             MailboxMessage::Store(envelope) => {
+                // Se já sabemos que este envelope foi entregue (temos o ACK assinado), avisamos na malha para o remetente/guardião limpar!
+                if let Some(ack) = self.dm.mailbox.get_ack(&envelope.envelope_id) {
+                    self.publish_mailbox_ack(ack);
+                    return;
+                }
                 // Se o envelope for para mim mesmo (eu estava online quando foi anunciado), recebo na hora!
                 if envelope.recipient_pubkey.eq_ignore_ascii_case(&my_pk) {
                     self.receive_sealed_envelope(envelope, now);
@@ -379,6 +384,10 @@ impl Runtime {
                 }
             }
             MailboxMessage::Deliver(envelope) => {
+                if let Some(ack) = self.dm.mailbox.get_ack(&envelope.envelope_id) {
+                    self.publish_mailbox_ack(ack);
+                    return;
+                }
                 if envelope.recipient_pubkey.eq_ignore_ascii_case(&my_pk) {
                     self.receive_sealed_envelope(envelope, now);
                 }
@@ -392,9 +401,14 @@ impl Runtime {
     }
 
     fn receive_sealed_envelope(&mut self, envelope: StoredEnvelope, now: u64) {
-        if !self.dm.mailbox.mark_delivered_to_me(&envelope.envelope_id) {
-            // Envelope já foi entregue antes; apenas reenvia o ACK para garantir limpeza nos guardiões
-            self.broadcast_mailbox_ack(&envelope.envelope_id, now);
+        let ack = self
+            .dm
+            .mailbox
+            .get_ack(&envelope.envelope_id)
+            .unwrap_or_else(|| ReceiptAck::new_signed(&self.identity, &envelope.envelope_id, now));
+        if !self.dm.mailbox.mark_delivered_to_me(&envelope.envelope_id, envelope.expires_at, ack.clone()) {
+            // Envelope já foi entregue antes (mesmo em sessão anterior!); apenas reenvia o ACK para limpar o remetente/guardião atrasado
+            self.publish_mailbox_ack(ack);
             return;
         }
         match envelope.unseal_and_verify(&self.identity) {
@@ -416,7 +430,7 @@ impl Runtime {
                     timestamp: payload.timestamp,
                     offline_delivery: true,
                 });
-                self.broadcast_mailbox_ack(&envelope.envelope_id, now);
+                self.publish_mailbox_ack(ack);
             }
             Err(e) => {
                 tracing::debug!("Envelope offline inválido descartado: {}", e);
@@ -424,8 +438,7 @@ impl Runtime {
         }
     }
 
-    fn broadcast_mailbox_ack(&mut self, envelope_id: &str, now: u64) {
-        let ack = ReceiptAck::new_signed(&self.identity, envelope_id, now);
+    fn publish_mailbox_ack(&mut self, ack: ReceiptAck) {
         let msg = MailboxMessage::Ack(ack);
         let bytes = wire::encode(&msg);
         let _ = self
@@ -464,6 +477,10 @@ impl Runtime {
                     .behaviour_mut()
                     .gossipsub
                     .publish(IdentTopic::new(MAILBOX_TOPIC), bytes);
+            }
+            // Propaga ACKs assinados que já recebemos para limpar a outbox/mailbox do amigo que estava offline
+            for ack in self.dm.mailbox.known_acks() {
+                self.publish_mailbox_ack(ack);
             }
         }
 
