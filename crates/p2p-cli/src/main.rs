@@ -725,6 +725,7 @@ mod tests {
         events: UnboundedReceiver<UiEvent>,
         seen: Vec<UiEvent>,
         downloads: PathBuf,
+        sniff_file: PathBuf,
         pubkey: String,
     }
 
@@ -733,8 +734,10 @@ mod tests {
             let nick = identity.profile.display_name.clone();
             let base = std::env::temp_dir().join(format!("anarchord_cli_{}_{}_{}", nick, std::process::id(), PeerId::random()));
             let pubkey = identity.public_key_hex();
+            let sniff_file = base.join("packets.jsonl");
             let mut config = CoreConfig::new(identity, base.join("servers"), base.join("downloads"));
             config.config_path = Some(base.join("config.json"));
+            config.sniff_file = Some(sniff_file.clone());
             config.connect = connect_to.map(|port| format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap());
             let (core, task) = Core::start(config).unwrap();
             let port = task.listen_port();
@@ -743,7 +746,7 @@ mod tests {
             let (actions, rx_actions) = tokio::sync::mpsc::unbounded_channel();
             tokio::task::spawn_local(task.run());
             tokio::task::spawn_local(bridge(core_events, rx_actions, commands, tx_ui, Arc::new(AtomicBool::new(false))));
-            (Self { actions, events, seen: Vec::new(), downloads: base.join("downloads"), pubkey }, port)
+            (Self { actions, events, seen: Vec::new(), downloads: base.join("downloads"), sniff_file, pubkey }, port)
         }
 
         fn stop(&self) {
@@ -946,6 +949,97 @@ mod tests {
                 carol.wait_log("Carol listar bloqueio ativo", "Pares bloqueados (1)").await;
                 carol.type_line("/firewall unblock Bob");
                 carol.wait_log("Carol desbloquear Bob", "foi desbloqueado").await;
+
+                // 5) Verifica e exporta os pacotes brutos do Sniffer (packets.jsonl e packets.log) de Alice, Carol e Bob
+                let out_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("lab/results/dm_mailbox_and_sniffer");
+                std::fs::create_dir_all(&out_dir).unwrap();
+                let mut all_packets = Vec::new();
+                for (name, path) in [("alice", &alice.sniff_file), ("carol", &carol.sniff_file), ("bob", &bob.sniff_file)] {
+                    let content = std::fs::read_to_string(path).unwrap_or_default();
+                    assert!(!content.is_empty(), "sniffer de {} deveria ter capturado pacotes", name);
+                    std::fs::write(out_dir.join(format!("packets_{}.jsonl", name)), &content).unwrap();
+                    for line in content.lines().filter(|l| !l.trim().is_empty()) {
+                        let pkt: p2p_core::sniffer::SniffedPacket = serde_json::from_str(line).unwrap();
+                        all_packets.push(pkt);
+                    }
+                }
+                all_packets.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.node.cmp(&b.node)));
+                let mut jsonl_out = String::new();
+                let mut log_out = String::from(
+                    "# ANARLAB RAW APPLICATION PACKET SNIFFER\n\
+                     # Inspeção crua de quadros wire.rs, chaves Ed25519/X25519, nonces, ciphertexts e assinaturas\n\n",
+                );
+                for (idx, p) in all_packets.iter().enumerate() {
+                    jsonl_out.push_str(&serde_json::to_string(p).unwrap());
+                    jsonl_out.push('\n');
+                    let c = &p.crypto;
+                    let sig_status = match c.signature_valid {
+                        Some(true) => "VALID ✓",
+                        Some(false) => "INVALID ✗",
+                        None => "N/A",
+                    };
+                    log_out.push_str(&format!(
+                        "[{:04}] ts={} node={:<8} {:<2} kind={:<24} len={:<4} sig={}\n       topic          : {}\n",
+                        idx + 1,
+                        p.timestamp,
+                        p.node,
+                        p.direction,
+                        p.kind,
+                        p.raw_len,
+                        sig_status,
+                        p.topic
+                    ));
+                    if let Some(s) = &c.sender_pubkey {
+                        log_out.push_str(&format!("       sender_ed25519 : {}\n", s));
+                    }
+                    if let Some(r) = &c.recipient_pubkey {
+                        log_out.push_str(&format!("       recip_ed25519  : {}\n", r));
+                    }
+                    if let Some(eph) = &c.ephemeral_x25519_pubkey {
+                        log_out.push_str(&format!(
+                            "       eph_x25519     : {} (session_key={:?})\n",
+                            eph, c.uses_session_key
+                        ));
+                    }
+                    if let Some(env_id) = &c.envelope_id {
+                        log_out.push_str(&format!("       envelope_id    : {}\n", env_id));
+                    }
+                    if let Some(n) = &c.nonce_hex {
+                        log_out.push_str(&format!("       nonce (12B)    : {}\n", n));
+                    }
+                    if let Some(ct) = &c.ciphertext_hex {
+                        let preview = if ct.len() <= 96 {
+                            ct.clone()
+                        } else {
+                            format!("{}... ({}B)", &ct[..96], ct.len() / 2)
+                        };
+                        log_out.push_str(&format!("       ciphertext     : {}\n", preview));
+                    }
+                    if let Some(sb) = &c.signing_bytes_hex {
+                        let preview = if sb.len() <= 96 {
+                            sb.clone()
+                        } else {
+                            format!("{}... ({}B)", &sb[..96], sb.len() / 2)
+                        };
+                        log_out.push_str(&format!("       signing_bytes  : {}\n", preview));
+                    }
+                    if let Some(sig) = &c.signature_hex {
+                        log_out.push_str(&format!("       sig_ed25519    : {}\n", sig));
+                    }
+                    let raw_preview = if p.raw_hex.len() <= 96 {
+                        p.raw_hex.clone()
+                    } else {
+                        format!("{}... ({}B)", &p.raw_hex[..96], p.raw_len)
+                    };
+                    log_out.push_str(&format!("       raw_wire_hex   : {}\n\n", raw_preview));
+                }
+                std::fs::write(out_dir.join("packets.jsonl"), jsonl_out).unwrap();
+                std::fs::write(out_dir.join("packets.log"), log_out).unwrap();
             })
             .await;
     }
