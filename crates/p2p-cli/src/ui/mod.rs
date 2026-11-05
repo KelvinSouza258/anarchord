@@ -1,13 +1,14 @@
 pub mod editor;
 pub mod menu;
+pub mod wrap;
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
-        MouseEvent, MouseEventKind,
+        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -157,6 +158,9 @@ pub struct TerminalUi {
     space_name: String,
     space_channels: Vec<(String, bool)>,
     last_status_bar: String,
+    unread_messages: usize,
+    has_mention: bool,
+    is_focused: bool,
 }
 
 impl TerminalUi {
@@ -206,7 +210,23 @@ impl TerminalUi {
             space_name: "🌐 Lobby".to_string(),
             space_channels: Vec::new(),
             last_status_bar: "Sistema pronto. Conectado à malha P2P.".to_string(),
+            unread_messages: 0,
+            has_mention: false,
+            is_focused: true,
         }
+    }
+
+    pub fn update_terminal_title(&self) {
+        let chan_prefix = if self.current_channel.starts_with('@') { "" } else { "#" };
+        let base = format!("Anarchord · {}{}", chan_prefix, self.current_channel);
+        let title = if self.has_mention {
+            format!("(@) {}", base)
+        } else if self.unread_messages > 0 {
+            format!("({}) {}", self.unread_messages, base)
+        } else {
+            base
+        };
+        let _ = execute!(io::stdout(), SetTitle(title));
     }
 
     pub async fn run(
@@ -217,7 +237,8 @@ impl TerminalUi {
         // Setup Terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableFocusChange)?;
+        self.update_terminal_title();
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -242,6 +263,17 @@ impl TerminalUi {
                             // No Windows, crossterm gera Press e Release; Release é ignorado para não duplicar teclas
                             Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
                             Event::Mouse(mouse) => self.handle_mouse(mouse),
+                            Event::FocusGained => {
+                                self.is_focused = true;
+                                self.unread_messages = 0;
+                                self.has_mention = false;
+                                self.update_terminal_title();
+                                Vec::new()
+                            }
+                            Event::FocusLost => {
+                                self.is_focused = false;
+                                Vec::new()
+                            }
                             _ => Vec::new(),
                         };
                         for action in actions {
@@ -274,12 +306,23 @@ impl TerminalUi {
     fn handle_event(&mut self, evt: UiEvent) {
         match evt {
             UiEvent::ChatMessage { channel, author, text, timestamp } => {
+                if !self.is_focused && author != self.my_nick {
+                    self.unread_messages += 1;
+                    let mention_needle = format!("@{}", self.my_nick);
+                    if text.contains(&mention_needle) || text.contains("@todos") || text.contains("@all") {
+                        self.has_mention = true;
+                        print!("\x07");
+                        let _ = io::Write::flush(&mut io::stdout());
+                    }
+                    self.update_terminal_title();
+                }
                 self.push_chat_message(timestamp, format!("[#{}] {}: {}", channel, author, text));
                 self.channel_members.entry(channel.clone()).or_default().insert(author);
             }
             UiEvent::ChannelChanged(new_channel) => {
                 self.current_channel = new_channel.clone();
                 self.channel_members.entry(new_channel).or_default().insert(self.my_nick.clone());
+                self.update_terminal_title();
             }
             UiEvent::VoiceChannelChanged(opt_channel) => {
                 self.current_voice_channel = opt_channel.clone();
@@ -314,6 +357,13 @@ impl TerminalUi {
                 self.friends = friends;
             }
             UiEvent::DirectMessage { peer_name, author, text, timestamp, offline_delivery } => {
+                if !self.is_focused && author != self.my_nick {
+                    self.unread_messages += 1;
+                    self.has_mention = true;
+                    print!("\x07");
+                    let _ = io::Write::flush(&mut io::stdout());
+                    self.update_terminal_title();
+                }
                 let dm_chan = format!("@{}", peer_name);
                 let tag = if offline_delivery { " [📬 Offline E2EE]" } else { " [🔒 E2EE]" };
                 self.push_chat_message(timestamp, format!("[{}{}] {}: {}", dm_chan, tag, author, text));
@@ -326,6 +376,7 @@ impl TerminalUi {
                 let set = self.channel_members.entry(channel).or_default();
                 set.insert(self.my_nick.clone());
                 set.insert(peer_name);
+                self.update_terminal_title();
             }
             UiEvent::ChannelMembers { channel, members } => {
                 let set = self.channel_members.entry(channel).or_default();
@@ -650,9 +701,15 @@ impl TerminalUi {
         }
     }
 
-    /// Rola a aba atual: positivo = mensagens mais antigas
+    /// Rola a aba atual: positivo = mensagens mais antigas (em linhas visuais na tela)
     fn scroll_chat(&mut self, delta: isize) {
-        let max = self.current_lines().len().saturating_sub(1) as isize;
+        let content_width = self.chat_area.width.saturating_sub(2).max(10) as usize;
+        let total_visual_lines: usize = self
+            .current_lines()
+            .iter()
+            .map(|m| wrap::wrap_message(m, content_width).len())
+            .sum();
+        let max = total_visual_lines.saturating_sub(1) as isize;
         self.chat_scroll = (self.chat_scroll as isize + delta).clamp(0, max) as usize;
     }
 
@@ -690,9 +747,13 @@ impl TerminalUi {
             }
             Some(Overlay::Prompt { title, editor, .. }) => {
                 let area = centered(screen, 64, 3);
+                let prefix = "❯ ";
+                let prefix_width = 2;
+                let avail_width = (area.width.saturating_sub(2) as usize).saturating_sub(prefix_width);
+                let (visible_text, cursor_col) = wrap::scroll_input(&editor.text(), editor.cursor(), avail_width);
                 f.render_widget(Clear, area);
                 f.render_widget(
-                    Paragraph::new(format!("❯ {}", editor.text())).block(
+                    Paragraph::new(format!("{}{}", prefix, visible_text)).block(
                         Block::default()
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(Color::Cyan))
@@ -701,7 +762,7 @@ impl TerminalUi {
                     ),
                     area,
                 );
-                f.set_cursor_position((area.x + 3 + editor.cursor() as u16, area.y + 1));
+                f.set_cursor_position((area.x + 1 + prefix_width as u16 + cursor_col as u16, area.y + 1));
                 area
             }
             Some(Overlay::Help) => {
@@ -952,7 +1013,12 @@ impl TerminalUi {
         f.render_widget(voice_list, side_chunks[2]);
 
         // 3. Barra de Entrada
-        let input_box = Paragraph::new(format!("❯ {}", self.editor.text()))
+        let prefix = "❯ ";
+        let prefix_width = 2;
+        let avail_width = (chunks[2].width.saturating_sub(2) as usize).saturating_sub(prefix_width);
+        let (visible_text, cursor_col) = wrap::scroll_input(&self.editor.text(), self.editor.cursor(), avail_width);
+
+        let input_box = Paragraph::new(format!("{}{}", prefix, visible_text))
             .style(Style::default().fg(Color::White))
             .block(
                 Block::default()
@@ -961,10 +1027,8 @@ impl TerminalUi {
             );
         f.render_widget(input_box, chunks[2]);
 
-        // Posiciona o cursor do terminal no final do texto digitado
-        // x = margem esquerda (1 borda) + 2 caracteres ("❯ ") + comprimento do texto
-        // y = topo do quadro de input + 1 (borda superior)
-        let cursor_x = chunks[2].x + 3 + self.editor.cursor() as u16;
+        // Posiciona o cursor do terminal no final do texto digitado ou deslocado pela rolagem
+        let cursor_x = chunks[2].x + 1 + prefix_width as u16 + cursor_col as u16;
         let cursor_y = chunks[2].y + 1;
         f.set_cursor_position((cursor_x, cursor_y));
 
@@ -982,24 +1046,32 @@ impl TerminalUi {
 
     fn render_messages(&mut self, f: &mut ratatui::Frame, area: Rect) {
         let max_lines = area.height.saturating_sub(2) as usize;
-        let lines = self.current_lines();
-        let end = lines.len().saturating_sub(self.chat_scroll);
+        let content_width = area.width.saturating_sub(2).max(10) as usize;
+        let raw_lines = self.current_lines();
+
+        let mut visual_lines: Vec<(String, Style)> = Vec::new();
+        for m in raw_lines {
+            let style = if m.starts_with("⚙️") {
+                Style::default().fg(Color::DarkGray)
+            } else if m.starts_with("🤝") || m.starts_with("✅") {
+                Style::default().fg(Color::Green)
+            } else if m.starts_with("❌") {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let wrapped = wrap::wrap_message(m, content_width);
+            for w in wrapped {
+                visual_lines.push((w, style));
+            }
+        }
+
+        let end = visual_lines.len().saturating_sub(self.chat_scroll);
         let start = end.saturating_sub(max_lines);
 
-        let visible_msgs: Vec<ListItem> = lines[start..end]
+        let visible_msgs: Vec<ListItem> = visual_lines[start..end]
             .iter()
-            .map(|m| {
-                let style = if m.starts_with("⚙️") {
-                    Style::default().fg(Color::DarkGray)
-                } else if m.starts_with("🤝") || m.starts_with("✅") {
-                    Style::default().fg(Color::Green)
-                } else if m.starts_with("❌") {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                ListItem::new(Span::styled(m.clone(), style))
-            })
+            .map(|(line, style)| ListItem::new(Span::styled(line.clone(), *style)))
             .collect();
 
         // Título com as duas abas; a ativa em destaque
@@ -1024,7 +1096,7 @@ impl TerminalUi {
             Span::styled(system_label, tab_style(self.active_tab == Tab::System)),
         ];
         if self.chat_scroll > 0 {
-            title.push(Span::raw(format!(" · ↑ {} acima do fim (PgDn volta) ", self.chat_scroll)));
+            title.push(Span::raw(format!(" · ↑ {} linhas acima do fim (PgDn volta) ", self.chat_scroll)));
         }
         let messages_list = List::new(visible_msgs)
             .block(Block::default().borders(Borders::ALL).title(Line::from(title)).title_bottom(" F2 alterna abas "));
@@ -1033,12 +1105,25 @@ impl TerminalUi {
 
     pub fn restore_terminal() {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, crossterm::cursor::Show);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableFocusChange,
+            SetTitle(""),
+            crossterm::cursor::Show
+        );
     }
 
     fn cleanup_terminal(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableFocusChange,
+            SetTitle("")
+        )?;
         terminal.show_cursor()?;
         Ok(())
     }
@@ -1762,5 +1847,76 @@ mod tests {
         let actions = click(&mut ui, |ui| ui.popup_area, 0, false);
         assert_eq!(sent(&actions), vec!["/get bafk9a8b"]);
         assert!(ui.overlay.is_none());
+    }
+
+    /// Issue #31: Quebra de linha (word wrap) com recuo nas linhas de continuação
+    /// e rolagem horizontal no campo de entrada quando o texto excede a largura da tela.
+    #[test]
+    fn test_issue_31_message_word_wrap_and_input_scrolling() {
+        let mut ui = ui_for("Alice");
+
+        // Mensagem longa recebida de Bob
+        let long_text = "Esta é uma mensagem extremamente longa para testar quebra de linha automática na TUI com alinhamento visual perfeito e recuo adequado.";
+        ui.handle_event(UiEvent::ChatMessage {
+            channel: "geral".to_string(),
+            author: "Bob".to_string(),
+            text: long_text.to_string(),
+            timestamp: 1_700_000_000,
+        });
+
+        let screen = render(&mut ui);
+        assert!(screen.contains("[#geral] Bob: Esta é uma mensagem"));
+        assert!(screen.contains("linha automática na TUI"));
+
+        // Digitando mais texto no campo de entrada do que a largura do terminal
+        let long_input = "a".repeat(120);
+        type_text(&mut ui, &long_input);
+        let screen_input = render(&mut ui);
+        assert!(screen_input.contains("aaaaaaaa"));
+    }
+
+    /// Issue #33: Notificação de mensagens não lidas e menções no título do terminal quando desfocado.
+    #[test]
+    fn test_issue_33_terminal_title_and_unread_notifications() {
+        let mut ui = ui_for("Alice");
+        ui.is_focused = false;
+
+        // Bob envia mensagem comum -> unread_messages = 1
+        ui.handle_event(UiEvent::ChatMessage {
+            channel: "geral".to_string(),
+            author: "Bob".to_string(),
+            text: "olá Alice".to_string(),
+            timestamp: 1_700_000_000,
+        });
+        assert_eq!(ui.unread_messages, 1);
+        assert!(!ui.has_mention);
+
+        // Bob envia mensagem mencionando @Alice -> has_mention = true
+        ui.handle_event(UiEvent::ChatMessage {
+            channel: "geral".to_string(),
+            author: "Bob".to_string(),
+            text: "atenção @Alice urgente".to_string(),
+            timestamp: 1_700_000_001,
+        });
+        assert_eq!(ui.unread_messages, 2);
+        assert!(ui.has_mention);
+
+        // Bob envia uma DM direta -> has_mention = true e unread incrementado
+        ui.handle_event(UiEvent::DirectMessage {
+            peer_name: "Bob".to_string(),
+            author: "Bob".to_string(),
+            text: "DM privada".to_string(),
+            timestamp: 1_700_000_002,
+            offline_delivery: false,
+        });
+        assert_eq!(ui.unread_messages, 3);
+        assert!(ui.has_mention);
+
+        // Quando a janela ganha foco novamente (FocusGained), o contador e menção são resetados
+        ui.is_focused = true;
+        ui.unread_messages = 0;
+        ui.has_mention = false;
+        assert_eq!(ui.unread_messages, 0);
+        assert!(!ui.has_mention);
     }
 }

@@ -18,3 +18,4 @@ opus1 = "0.3.0"
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 minifb = "0.29.0"
+unicode-width = "0.2"
