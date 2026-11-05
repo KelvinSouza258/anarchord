@@ -15,8 +15,14 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     /// Conteúdo assinado pelo autor: canal, texto e data, em binário canônico
-    fn signing_payload(channel_id: &str, text: &str, timestamp: u64) -> Vec<u8> {
+    pub fn signing_payload(channel_id: &str, text: &str, timestamp: u64) -> Vec<u8> {
         crate::wire::signing_bytes("chat", &(channel_id, text, timestamp))
+    }
+
+    /// Verifica apenas a assinatura criptográfica Ed25519 sobre o conteúdo da mensagem
+    pub fn verify_signature(&self) -> bool {
+        let payload = Self::signing_payload(&self.channel_id, &self.text, self.timestamp);
+        verify_signature_hex(&self.author_pubkey, &payload, &self.signature)
     }
 
     /// Cria uma mensagem assinada pela identidade do autor

@@ -30,6 +30,7 @@ class Node:
         self.nick = name.capitalize()
         self.events = []  # (instante, evento)
         self.peer_id = None
+        self.pubkey = None
         self.port = None
         self._changed = asyncio.Condition()
         self._readers = []
@@ -54,6 +55,7 @@ class Node:
         self._readers = [asyncio.create_task(self._read_events()), asyncio.create_task(self._read_stderr())]
         started = await self.wait("Started", desc="agente iniciar")
         self.peer_id = started["peer_id"]
+        self.pubkey = started.get("pubkey")
         self.port = started["port"]
         return self
 
@@ -196,6 +198,43 @@ class Node:
     @property
     def downloads(self):
         return "/data/agent/downloads"
+
+    # ------------------------------------------------------------------ sniffer de pacotes brutos
+
+    async def packets(self, kind=None, direction=None):
+        """Lê os pacotes brutos de aplicação capturados em `/data/agent/packets.jsonl` deste nó.
+
+        Cada item contém `raw_hex`, `wire_version`, `kind`, `topic`, `direction` ("TX"/"RX")
+        e o dicionário `crypto` (`sender_pubkey`, `recipient_pubkey`, `ephemeral_x25519_pubkey`,
+        `nonce_hex`, `ciphertext_hex`, `signing_bytes_hex`, `signature_hex`, `signature_valid`).
+        """
+        raw = await self.sh("cat /data/agent/packets.jsonl 2>/dev/null || true")
+        items = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                pkt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if kind is not None and pkt.get("kind") != kind:
+                continue
+            if direction is not None and pkt.get("direction") != direction:
+                continue
+            items.append(pkt)
+        return items
+
+    async def wait_packet(self, kind=None, direction=None, where=None, timeout=DEFAULT_TIMEOUT, desc=None):
+        """Espera um pacote bruto específico aparecer no sniffer (`/data/agent/packets.jsonl`)"""
+        desc = desc or f"pacote {kind or '*'} ({direction or '*'})"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for pkt in await self.packets(kind=kind, direction=direction):
+                if where is None or where(pkt):
+                    return pkt
+            await asyncio.sleep(0.3)
+        raise StepFailed(f"{self.name}: tempo esgotado esperando {desc} no sniffer")
 
     def __repr__(self):
         return f"<Node {self.name} {self.ip}>"

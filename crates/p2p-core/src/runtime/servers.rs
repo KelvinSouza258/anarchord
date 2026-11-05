@@ -38,7 +38,7 @@ impl Runtime {
     /// Publica no tópico de controle do servidor. Falha (sem ninguém no tópico) é normal e ignorada.
     pub(super) fn publish_server_message(&mut self, server_id: &str, message: &ServerMessage) -> bool {
         let topic = IdentTopic::new(server_control_topic(server_id));
-        self.node.swarm.behaviour_mut().gossipsub.publish(topic, crate::wire::encode(message)).is_ok()
+        self.publish_gossip(topic, crate::wire::encode(message)).is_ok()
     }
 
     fn default_channel(&self, server_id: &str) -> String {
@@ -255,7 +255,7 @@ impl Runtime {
                 let name = self.server_name(&id);
                 let invite = ChatMessage::new_signed(&self.identity, "geral", &invite_text(&name, &id), now);
                 let lobby = IdentTopic::new(community::channel_topic(&Space::Lobby, "geral"));
-                let sent = self.node.swarm.behaviour_mut().gossipsub.publish(lobby, crate::wire::encode(&invite)).is_ok();
+                let sent = self.publish_gossip(lobby, crate::wire::encode(&invite)).is_ok();
                 self.notice(if sent { ServerNotice::InviteSent { server: name } } else { ServerNotice::InviteManual { id: id.clone() } });
                 if self.servers.get(&id).is_some_and(|s| s.chain().state().closed) {
                     self.notice(ServerNotice::InviteNeedsAllow);

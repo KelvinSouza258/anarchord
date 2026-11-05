@@ -360,3 +360,211 @@ async def peer_exchange(lab):
     await lab.join_room("sala", alice, bob, carol)
     bob.send({"SendMessage": "achei você pela Alice"})
     await carol.wait("ChatMessage", where=lambda m: m["text"] == "achei você pela Alice")
+
+
+# ---------------------------------------------------------------------- DMs 1:1 E2EE, Mailbox Offline, Firewall Assimétrico e Sniffer
+
+
+@scenario("DMs 1:1 E2EE, Mailbox Offline via Guardião (sem duplicata após restart) e Sniffer")
+async def dm_mailbox_and_sniffer(lab):
+    alice = lab.public("alice")
+    bob = lab.public("bob")
+    carol = lab.public("carol")
+    await lab.up()
+
+    await alice.start("--no-discovery")
+    await bob.start("--no-discovery", "--connect", alice.address)
+    await carol.start("--no-discovery", "--connect", alice.address)
+
+    await alice.wait("PeerIdentified", where=lambda p: p["nick"] == "Bob", desc="Alice ver Bob")
+    await alice.wait("PeerIdentified", where=lambda p: p["nick"] == "Carol", desc="Alice ver Carol")
+
+    lab.step("Alice ↔ Bob são amigos; Alice ↔ Carol são amigos; Bob e Carol NÃO são amigos")
+    alice.send({"AddFriend": {"pubkey": bob.pubkey, "alias": "Bob"}})
+    bob.send({"AddFriend": {"pubkey": alice.pubkey, "alias": "Alice"}})
+    alice.send({"AddFriend": {"pubkey": carol.pubkey, "alias": "Carol"}})
+    carol.send({"AddFriend": {"pubkey": alice.pubkey, "alias": "Alice"}})
+
+    await alice.wait("FriendUpdated", where=lambda f: f["pubkey"] == carol.pubkey and not f["removed"])
+    await carol.wait("FriendUpdated", where=lambda f: f["pubkey"] == alice.pubkey and not f["removed"])
+
+    lab.step("DM 1:1 E2EE online entre Alice e Carol + validação crua no Sniffer")
+    secret_online = "segredo_online_e2ee_alice_para_carol_778899"
+    since_carol = carol.mark()
+    alice.send({"SendDm": {"target": "Carol", "text": secret_online, "suggested_ttl": None}})
+    await carol.wait(
+        "DirectMessage",
+        where=lambda m: m["author"] == "Alice" and m["text"] == secret_online and not m["offline_delivery"],
+        since=since_carol,
+        desc="Carol receber DM online de Alice",
+    )
+
+    # Valida no sniffer de pacotes que houve KeyOffer X25519 e DirectMessage.Message cifrada e assinada
+    key_offer_pkt = await alice.wait_packet(
+        kind="DirectMessage.KeyOffer",
+        direction="TX",
+        where=lambda p: p["crypto"].get("recipient_pubkey") == carol.pubkey,
+        desc="KeyOffer X25519 de Alice para Carol",
+    )
+    if key_offer_pkt["crypto"].get("signature_valid") is not True:
+        raise StepFailed(f"Assinatura Ed25519 inválida no KeyOffer: {key_offer_pkt}")
+    if len(key_offer_pkt["crypto"].get("ephemeral_x25519_pubkey") or "") != 64:
+        raise StepFailed("Chave efêmera X25519 deveria ter 32 bytes (64 hex chars)")
+
+    dm_pkt = await carol.wait_packet(
+        kind="DirectMessage.Message",
+        direction="RX",
+        where=lambda p: p["crypto"].get("sender_pubkey") == alice.pubkey,
+        desc="Pacote bruto DirectMessage.Message recebido por Carol",
+    )
+    if dm_pkt["crypto"].get("signature_valid") is not True:
+        raise StepFailed(f"Assinatura Ed25519 externa inválida no DirectMessage: {dm_pkt}")
+    secret_online_hex = secret_online.encode("utf-8").hex()
+    if secret_online_hex in dm_pkt["raw_hex"] or secret_online in dm_pkt["raw_hex"]:
+        raise StepFailed("VAZAMENTO DE TEXTO CLARO: o segredo da DM apareceu no quadro bruto do fio!")
+
+    lab.step("Carol e Bob ficam offline; Alice envia DM para Carol quando NINGUÉM está online")
+    await carol.stop()
+    await bob.stop()
+    await alice.wait("PeerLeft", where=lambda p: p["nick"] == "Carol", desc="Alice notar saída de Carol")
+    await alice.wait("PeerLeft", where=lambda p: p["nick"] == "Bob", desc="Alice notar saída de Bob")
+
+    secret_offline = "mensagem_offline_exclusiva_alice_carol_112233"
+    alice.send({"SendDm": {"target": "Carol", "text": secret_offline, "suggested_ttl": 7200}})
+    queued = await alice.wait("MailboxQueued", where=lambda q: q["recipient_pubkey"] == carol.pubkey)
+    envelope_id = queued["envelope_id"]
+
+    lab.step("Bob (amigo guardião de Alice) fica online DEPOIS do envio e assume a guarda do envelope")
+    since_bob = bob.mark()
+    await bob.start("--no-discovery", "--connect", alice.address)
+    await bob.wait(
+        "MailboxStoredForFriend",
+        where=lambda s: s["envelope_id"] == envelope_id,
+        since=since_bob,
+        desc="Bob virar guardião do envelope offline que Alice enviou quando ninguém estava online",
+    )
+
+    # Valida no sniffer de Bob que Bob recebeu o Mailbox.Store assinado por Alice, mas sem vazamento do texto claro
+    store_pkt = await bob.wait_packet(
+        kind="Mailbox.Store",
+        direction="RX",
+        where=lambda p: p["crypto"].get("envelope_id") == envelope_id,
+        desc="Pacote bruto Mailbox.Store no sniffer de Bob",
+    )
+    if store_pkt["crypto"].get("signature_valid") is not True:
+        raise StepFailed("Assinatura externa de Mailbox.Store inválida no sniffer de Bob")
+    secret_offline_hex = secret_offline.encode("utf-8").hex()
+    if secret_offline_hex in store_pkt["raw_hex"]:
+        raise StepFailed("VAZAMENTO: o guardião Bob conseguiu ver o texto claro no pacote Mailbox.Store!")
+
+    lab.step("Alice fica offline; Carol volta online conectando APENAS a Bob (que não é amigo de Carol)")
+    await alice.stop()
+    await carol.start("--no-discovery", "--connect", bob.address)
+    await carol.wait(
+        "DirectMessage",
+        where=lambda m: m["author"] == "Alice" and m["text"] == secret_offline and m["offline_delivery"],
+        desc="Carol receber DM offline de Alice entregue pelo guardião Bob",
+    )
+
+    # Confere no sniffer que Bob enviou Mailbox.Deliver e Carol emitiu Mailbox.Ack assinado
+    await bob.wait_packet(
+        kind="Mailbox.Deliver",
+        direction="TX",
+        where=lambda p: p["crypto"].get("envelope_id") == envelope_id and p["crypto"].get("signature_valid") is True,
+        desc="Mailbox.Deliver enviado por Bob",
+    )
+    await carol.wait_packet(
+        kind="Mailbox.Ack",
+        direction="TX",
+        where=lambda p: p["crypto"].get("envelope_id") == envelope_id and p["crypto"].get("signature_valid") is True,
+        desc="Mailbox.Ack assinado por Carol",
+    )
+
+    lab.step("Carol fecha e reabre o programa, Bob fica offline e Alice volta online: Carol NÃO recebe duplicata")
+    await carol.stop()
+    await bob.stop()
+    await alice.start("--no-discovery")
+    await carol.start("--no-discovery", "--connect", alice.address)
+    await carol.wait("PeerIdentified", where=lambda p: p["nick"] == "Alice", desc="Carol reconectar com Alice")
+    since_reconnect = carol.mark()
+    await carol.expect_none(
+        "DirectMessage",
+        where=lambda m: m["text"] == secret_offline,
+        during=5,
+        since=since_reconnect,
+        desc="mensagem offline duplicada após reiniciar Carol e reconectar à Alice",
+    )
+
+
+@scenario("Firewall Assimétrico de DMs: Amigos vs Desconhecidos, Bloqueio Progressivo e Aviso de Cortesia")
+async def dm_asymmetric_firewall(lab):
+    alice = lab.public("alice")
+    carol = lab.public("carol")
+    await lab.up()
+
+    await carol.start("--no-discovery")
+    await alice.start("--no-discovery", "--connect", carol.address)
+    await carol.wait("PeerIdentified", where=lambda p: p["nick"] == "Alice", desc="Carol ver Alice")
+    await alice.wait("PeerIdentified", where=lambda p: p["nick"] == "Carol", desc="Alice ver Carol")
+
+    lab.step("Assimetria: Alice adiciona Carol como amiga, mas Carol NÃO tem Alice na lista de amigos")
+    alice.send({"AddFriend": {"pubkey": carol.pubkey, "alias": "Carol"}})
+    await alice.wait("FriendUpdated", where=lambda f: f["pubkey"] == carol.pubkey and not f["removed"])
+
+    lab.step("Alice envia 4 DMs seguidas para Carol (limite de desconhecidos de Carol = 3 msg/min)")
+    since_carol = carol.mark()
+    since_alice = alice.mark()
+    for i in range(1, 5):
+        alice.send({"SendDm": {"target": "Carol", "text": f"oi carol {i}", "suggested_ttl": None}})
+
+    for i in range(1, 4):
+        await carol.wait(
+            "DirectMessage",
+            where=lambda m, i=i: m["author"] == "Alice" and m["text"] == f"oi carol {i}",
+            since=since_carol,
+            desc=f"Carol receber DM {i}/3 de desconhecida",
+        )
+
+    blocked = await carol.wait(
+        "PeerBlocked",
+        where=lambda b: b["pubkey"] == alice.pubkey and not b["is_friend"] and b["offense_level"] == 1,
+        since=since_carol,
+        desc="Firewall de Carol bloquear Alice na 4ª mensagem",
+    )
+    if blocked["duration_secs"] != 60 or not blocked["courtesy_sent"]:
+        raise StepFailed(f"Bloqueio de nível 1 deveria ser de 60s com aviso de cortesia: {blocked}")
+
+    lab.step("Alice recebe o aviso automático de cortesia (E2EE) do Firewall de Carol")
+    await alice.wait(
+        "DirectMessage",
+        where=lambda m: m["author"] == "Carol" and "Aviso Automático do Firewall de Carol" in m["text"],
+        since=since_alice,
+        desc="Alice receber aviso de cortesia E2EE de Carol",
+    )
+
+    lab.step("Enquanto bloqueada, novas mensagens de Alice são descartadas silenciosamente por Carol")
+    since_blocked = carol.mark()
+    alice.send({"SendDm": {"target": "Carol", "text": "tentando furar bloqueio", "suggested_ttl": None}})
+    await carol.expect_none(
+        "DirectMessage",
+        where=lambda m: m["text"] == "tentando furar bloqueio",
+        during=3,
+        since=since_blocked,
+        desc="DM de par bloqueado",
+    )
+
+    lab.step("Carol adiciona Alice como amiga: Alice é desbloqueada na hora e passa a ter cota de amiga (30 msg/min)")
+    carol.send({"AddFriend": {"pubkey": alice.pubkey, "alias": "Alice"}})
+    await carol.wait("FriendUpdated", where=lambda f: f["pubkey"] == alice.pubkey and not f["removed"])
+
+    since_friend = carol.mark()
+    for i in range(1, 6):
+        alice.send({"SendDm": {"target": "Carol", "text": f"agora somos amigas {i}", "suggested_ttl": None}})
+    for i in range(1, 6):
+        await carol.wait(
+            "DirectMessage",
+            where=lambda m, i=i: m["author"] == "Alice" and m["text"] == f"agora somos amigas {i}",
+            since=since_friend,
+            desc=f"Carol receber DM {i}/5 da amiga Alice sem bloqueio",
+        )
+

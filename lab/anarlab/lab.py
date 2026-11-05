@@ -174,6 +174,64 @@ class Lab:
         await root.start(nick="Root")
         return root
 
+    async def collect_packets(self):
+        """Coleta os pacotes brutos de aplicação (`/data/agent/packets.jsonl`) de todos os nós
+        e consolida em `packets.jsonl` e em um relatório legível `packets.log` na pasta do cenário."""
+        all_packets = []
+        for node in self.nodes.values():
+            try:
+                pkts = await node.packets()
+                all_packets.extend(pkts)
+            except Exception:
+                pass
+        if not all_packets:
+            return []
+        all_packets.sort(key=lambda p: (p.get("timestamp", 0), p.get("node", "")))
+        jsonl_path = self.dir / "packets.jsonl"
+        log_path = self.dir / "packets.log"
+        with open(jsonl_path, "w", encoding="utf-8") as jf, open(log_path, "w", encoding="utf-8") as lf:
+            lf.write("# ANARLAB RAW APPLICATION PACKET SNIFFER\n")
+            lf.write("# Inspeção crua de quadros wire.rs, chaves Ed25519/X25519, nonces, ciphertexts e assinaturas\n\n")
+            for idx, p in enumerate(all_packets, 1):
+                jf.write(json.dumps(p, ensure_ascii=False) + "\n")
+                c = p.get("crypto") or {}
+                sig_status = (
+                    "VALID ✓" if c.get("signature_valid") is True
+                    else ("INVALID ✗" if c.get("signature_valid") is False else "N/A")
+                )
+                lf.write(
+                    f"[{idx:04d}] ts={p.get('timestamp')} node={p.get('node'):<8} {p.get('direction'):<2} "
+                    f"kind={p.get('kind'):<24} len={p.get('raw_len'):<4} sig={sig_status}\n"
+                )
+                lf.write(f"       topic          : {p.get('topic')}\n")
+                if c.get("sender_pubkey"):
+                    lf.write(f"       sender_ed25519 : {c['sender_pubkey']}\n")
+                if c.get("recipient_pubkey"):
+                    lf.write(f"       recip_ed25519  : {c['recipient_pubkey']}\n")
+                if c.get("ephemeral_x25519_pubkey"):
+                    lf.write(
+                        f"       eph_x25519     : {c['ephemeral_x25519_pubkey']} "
+                        f"(session_key={c.get('uses_session_key')})\n"
+                    )
+                if c.get("envelope_id"):
+                    lf.write(f"       envelope_id    : {c['envelope_id']}\n")
+                if c.get("nonce_hex"):
+                    lf.write(f"       nonce (12B)    : {c['nonce_hex']}\n")
+                if c.get("ciphertext_hex"):
+                    ct = c["ciphertext_hex"]
+                    preview = ct if len(ct) <= 96 else f"{ct[:96]}... ({len(ct)//2}B)"
+                    lf.write(f"       ciphertext     : {preview}\n")
+                if c.get("signing_bytes_hex"):
+                    sb = c["signing_bytes_hex"]
+                    preview = sb if len(sb) <= 96 else f"{sb[:96]}... ({len(sb)//2}B)"
+                    lf.write(f"       signing_bytes  : {preview}\n")
+                if c.get("signature_hex"):
+                    lf.write(f"       sig_ed25519    : {c['signature_hex']}\n")
+                raw_hex = p.get("raw_hex", "")
+                raw_preview = raw_hex if len(raw_hex) <= 96 else f"{raw_hex[:96]}... ({p.get('raw_len')}B)"
+                lf.write(f"       raw_wire_hex   : {raw_preview}\n\n")
+        return all_packets
+
     async def down(self, keep=False):
         for node in self.nodes.values():
             if node.running:
@@ -181,6 +239,10 @@ class Lab:
                     await node.stop()
                 except Exception:
                     pass
+        try:
+            await self.collect_packets()
+        except Exception:
+            pass
         # Estado da rede de cada contêiner, para investigar falhas
         if not keep:
             await self._docker("compose", "-f", str(self.dir / "compose.json"), "down", "-v", "--remove-orphans", "-t", "1", check=False)

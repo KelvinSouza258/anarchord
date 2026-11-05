@@ -186,7 +186,7 @@ impl EphemeralKeyOffer {
         }
     }
 
-    fn signing_bytes(
+    pub fn signing_bytes(
         sender_pubkey: &str,
         recipient_pubkey: &str,
         ephemeral_pubkey: &[u8; 32],
@@ -347,7 +347,7 @@ impl DirectMessageEnvelope {
         Ok(payload)
     }
 
-    fn signing_bytes(
+    pub fn signing_bytes(
         sender_pubkey: &str,
         recipient_pubkey: &str,
         ephemeral_pubkey: &[u8; 32],
@@ -366,6 +366,20 @@ impl DirectMessageEnvelope {
             timestamp,
         );
         postcard::to_extend(&tuple, DM_SIGN_DOMAIN.to_vec()).expect("serializável")
+    }
+
+    /// Verifica a assinatura Ed25519 externa do envelope (sem precisar da chave de decifragem)
+    pub fn verify_outer(&self) -> bool {
+        let sig_bytes = Self::signing_bytes(
+            &self.sender_pubkey,
+            &self.recipient_pubkey,
+            &self.ephemeral_pubkey,
+            self.uses_session_key,
+            &self.nonce,
+            &self.ciphertext,
+            self.timestamp,
+        );
+        verify_signature_hex(&self.sender_pubkey, &sig_bytes, &self.signature)
     }
 }
 
@@ -463,7 +477,7 @@ impl ReceiptAck {
         }
     }
 
-    fn signing_bytes(envelope_id: &str, recipient_pubkey: &str, timestamp: u64) -> Vec<u8> {
+    pub fn signing_bytes(envelope_id: &str, recipient_pubkey: &str, timestamp: u64) -> Vec<u8> {
         postcard::to_extend(&(envelope_id, recipient_pubkey, timestamp), b"anarchord-mailbox-ack-v1\0".to_vec())
             .expect("serializável")
     }
@@ -558,7 +572,7 @@ impl StoredEnvelope {
         })
     }
 
-    fn outer_signing_bytes(
+    pub fn outer_signing_bytes(
         envelope_id: &str,
         sender_pubkey: &str,
         recipient_pubkey: &str,
@@ -858,6 +872,13 @@ impl MailboxStore {
             .filter(|e| e.sender_pubkey.eq_ignore_ascii_case(sender_pubkey))
             .map(|e| e.size_bytes() as u64)
             .sum()
+    }
+
+    /// Verifica se o envelope já está armazenado ou já foi entregue/confirmado neste nó
+    pub fn has_envelope_or_ack(&self, envelope_id: &str) -> bool {
+        self.envelopes.contains_key(envelope_id)
+            || self.delivered_ids.contains_key(envelope_id)
+            || self.acks.contains_key(envelope_id)
     }
 
     pub fn envelope_count(&self) -> usize {

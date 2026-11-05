@@ -3,6 +3,7 @@ pub mod config;
 pub mod dm;
 pub mod files;
 pub mod runtime;
+pub mod sniffer;
 pub mod wire;
 pub mod identity;
 pub mod community;

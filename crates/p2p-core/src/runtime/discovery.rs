@@ -206,7 +206,7 @@ impl Runtime {
         }
         let bytes = wire::encode(&PeerList { peers });
         // Sem ninguém no tópico a publicação falha, o que é normal
-        let _ = self.node.swarm.behaviour_mut().gossipsub.publish(IdentTopic::new(PEERS_TOPIC), bytes);
+        let _ = self.publish_gossip(IdentTopic::new(PEERS_TOPIC), bytes);
     }
 
     /// Lista recebida: disca os pares que ainda não conhece. São só dicas: o Identify confirma quem é quem.

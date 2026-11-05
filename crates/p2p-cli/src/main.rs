@@ -286,6 +286,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mdns: true,
         relay_server: false,
         lab: false,
+        sniff_file: std::env::var("ANARCHORD_SNIFF_FILE").ok().map(PathBuf::from),
     };
     let (core, task) = Core::start(config)?;
     let (commands, events) = core.split();
@@ -745,6 +746,10 @@ mod tests {
             (Self { actions, events, seen: Vec::new(), downloads: base.join("downloads"), pubkey }, port)
         }
 
+        fn stop(&self) {
+            let _ = self.actions.send(UiAction::Quit);
+        }
+
         fn start(nick: &str, connect_to: Option<u16>) -> (Self, u16) {
             Self::start_with_identity(UserIdentity::generate_with_nick(nick), connect_to)
         }
@@ -941,6 +946,59 @@ mod tests {
                 carol.wait_log("Carol listar bloqueio ativo", "Pares bloqueados (1)").await;
                 carol.type_line("/firewall unblock Bob");
                 carol.wait_log("Carol desbloquear Bob", "foi desbloqueado").await;
+            })
+            .await;
+    }
+
+    /// Regressão para o cenário onde Alice envia DM para Bob quando NINGUÉM está online
+    /// e a amiga guardiã Carol só entra online DEPOIS do envio:
+    /// Alice delega automaticamente o envelope da outbox assim que Carol se inscreve no tópico da Mailbox!
+    #[tokio::test]
+    async fn test_guardian_coming_online_after_offline_dm_was_sent_with_nobody_online() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let bob_identity = UserIdentity::generate_with_nick("Bob");
+                let bob_pubkey = bob_identity.public_key_hex();
+                let mut carol_identity = UserIdentity::generate_with_nick("Carol");
+                let carol_pubkey = carol_identity.public_key_hex();
+
+                // 1) Alice inicia COMPLETAMENTE SOZINHA (nem Bob nem Carol estão online)
+                let (mut alice, alice_port) = FakeUi::start("Alice", None);
+                alice.type_line(&format!("/friend add {} Bob", bob_pubkey));
+                alice.wait_log("Alice adicionar Bob", "Bob adicionado").await;
+                alice.type_line(&format!("/friend add {} Carol", carol_pubkey));
+                alice.wait_log("Alice adicionar Carol", "Carol adicionado").await;
+
+                // Carol tem Alice na sua lista de amigos antes de entrar online
+                carol_identity.add_friend(&alice.pubkey, Some("Alice")).unwrap();
+
+                // 2) Alice envia a DM para Bob quando NINGUÉM está online
+                alice.type_line("/dm Bob mensagem enviada no deserto --ttl 4h");
+                alice
+                    .wait_log("Alice lacrar DM na outbox local", "Bob está offline: DM assinada e lacrada")
+                    .await;
+
+                // 3) DEPOIS que a mensagem já foi enviada, a amiga Carol entra online e conecta na Alice!
+                let (mut carol, carol_port) = FakeUi::start_with_identity(carol_identity, Some(alice_port));
+                // Carol DEVE receber a delegação do envelope da outbox da Alice e virar guardiã!
+                carol
+                    .wait_log("Carol virar guardiã da mensagem enviada antes de ela entrar online", "Guardando envelope offline de Alice")
+                    .await;
+
+                // 4) Alice fica offline! Agora só a Carol sabe da mensagem.
+                alice.stop();
+
+                // 5) Bob entra online conectando APENAS na Carol e recebe a mensagem de Alice!
+                let (mut bob, _) = FakeUi::start_with_identity(bob_identity, Some(carol_port));
+                bob.wait("Bob receber DM de Alice via Carol (que entrou depois do envio)", |e| {
+                    matches!(
+                        e,
+                        UiEvent::DirectMessage { author, text, offline_delivery: true, .. }
+                        if author == "Alice" && text == "mensagem enviada no deserto"
+                    )
+                })
+                .await;
             })
             .await;
     }

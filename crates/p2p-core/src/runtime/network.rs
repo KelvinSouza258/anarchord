@@ -329,8 +329,11 @@ impl Runtime {
         }
     }
 
-    /// Alguém entrou num tópico: presença, keyframe para quem começou a assistir, cadeia de servidor
+    /// Alguém entrou num tópico: presença, keyframe para quem começou a assistir, cadeia de servidor e mailbox offline
     fn on_subscribed(&mut self, peer_id: PeerId, topic: gossipsub::TopicHash) {
+        if topic.as_str() == crate::dm::MAILBOX_TOPIC {
+            self.on_peer_subscribed_mailbox(peer_id);
+        }
         if topic == self.active.topic.hash() {
             self.publish_channel_members();
         }
@@ -362,23 +365,32 @@ impl Runtime {
     /// (que também autentica quem enviou: quem não está no grupo não produz nada que decifre).
     fn on_gossip_message(&mut self, message: gossipsub::Message) {
         let topic = message.topic.as_str().to_string();
+        let src_str = message.source.as_ref().map(|p| p.to_string());
         if let Some(server_id) = community::parse_server_control_topic(&topic).map(str::to_string) {
+            self.sniff_packet("RX", &topic, src_str, &message.data, None);
             let from = message.source.as_ref().and_then(pubkey_hex_from_peer_id);
             return match wire::decode_as(&message.data) {
                 Ok(server_message) => self.handle_server_network_message(&server_id, server_message, from.as_deref()),
                 Err(e) => tracing::debug!("Mensagem de servidor ilegível: {}", e),
             };
         }
+        let raw_data = message.data.clone();
         let mut data = message.data;
         let mut mls_sender: Option<String> = None;
         if let Some(server_id) = community::parse_server_content_topic(&topic) {
             match self.mls.decrypt(server_id, &data) {
                 Ok(decrypted) => {
+                    self.sniff_packet("RX", &topic, src_str, &raw_data, Some(&decrypted.plaintext));
                     data = decrypted.plaintext;
                     mls_sender = Some(decrypted.sender);
                 }
-                Err(e) => return tracing::debug!("Conteúdo de servidor não decifrado: {}", e),
+                Err(e) => {
+                    self.sniff_packet("RX", &topic, src_str, &raw_data, None);
+                    return tracing::debug!("Conteúdo de servidor não decifrado: {}", e);
+                }
             }
+        } else {
+            self.sniff_packet("RX", &topic, src_str, &raw_data, None);
         }
         // Autor declarado no pacote precisa ser quem o MLS diz que enviou
         let sender_matches = |author: &str| mls_sender.as_deref().is_none_or(|s| s == author);

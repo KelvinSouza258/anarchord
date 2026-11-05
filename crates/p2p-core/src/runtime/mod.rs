@@ -78,6 +78,8 @@ pub struct CoreConfig {
     pub relay_server: bool,
     /// Rede de laboratório: IPs privados valem como públicos e as sondagens são rápidas
     pub lab: bool,
+    /// Arquivo JSONL opcional para gravar os pacotes brutos de aplicação (sniffer de pacotes)
+    pub sniff_file: Option<PathBuf>,
 }
 
 impl CoreConfig {
@@ -104,6 +106,7 @@ impl CoreConfig {
             mdns: true,
             relay_server: false,
             lab: false,
+            sniff_file: None,
         }
     }
 }
@@ -392,14 +395,59 @@ impl Runtime {
         }
     }
 
+    /// Publica um quadro bruto no Gossipsub e, se o sniffer estiver ativo, disseca e grava o pacote TX.
+    pub(super) fn publish_gossip(&mut self, topic: IdentTopic, payload: Vec<u8>) -> Result<(), PublishError> {
+        let topic_name = topic.hash().into_string();
+        self.sniff_packet("TX", &topic_name, None, &payload, None);
+        self.node
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, payload)
+            .map(|_| ())
+            .map_err(|_| PublishError::Network)
+    }
+
+    /// Registra um pacote bruto (TX ou RX) no arquivo de sniffer, caso configurado.
+    pub(super) fn sniff_packet(
+        &self,
+        direction: &str,
+        topic: &str,
+        source_peer_id: Option<String>,
+        raw_bytes: &[u8],
+        mls_decrypted: Option<&[u8]>,
+    ) {
+        if let Some(ref path) = self.config.sniff_file {
+            let pkt = crate::sniffer::SniffedPacket::dissect(
+                now_secs(),
+                &self.nick,
+                direction,
+                topic,
+                source_peer_id,
+                raw_bytes,
+                mls_decrypted,
+            );
+            pkt.append_to_file(path);
+        }
+    }
+
     /// Publica conteúdo (chat, voz, tela, enxame). Em tópicos de servidor, cifra antes com o grupo MLS.
     fn publish_content(&mut self, topic: &IdentTopic, bytes: Vec<u8>) -> Result<(), PublishError> {
         let topic_name = topic.hash().into_string();
-        let payload = match community::parse_server_content_topic(&topic_name) {
-            Some(server_id) => self.mls.encrypt(server_id, &bytes).map_err(|_| PublishError::NoGroupKey)?,
-            None => bytes,
-        };
-        self.node.swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload).map(|_| ()).map_err(|_| PublishError::Network)
+        match community::parse_server_content_topic(&topic_name) {
+            Some(server_id) => {
+                let encrypted = self.mls.encrypt(server_id, &bytes).map_err(|_| PublishError::NoGroupKey)?;
+                self.sniff_packet("TX", &topic_name, None, &encrypted, Some(&bytes));
+                self.node
+                    .swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(topic.clone(), encrypted)
+                    .map(|_| ())
+                    .map_err(|_| PublishError::Network)
+            }
+            None => self.publish_gossip(topic.clone(), bytes),
+        }
     }
 
     /// Nick conhecido de uma pubkey, ou o início dela
@@ -453,6 +501,7 @@ impl Runtime {
                 self.subscribe_dm_with(&pubkey);
                 if self.is_pubkey_online(&pubkey) {
                     self.send_ephemeral_key_offer(&pubkey);
+                    self.delegate_own_pending_mailbox_envelopes();
                 }
                 self.emit(CoreEvent::FriendUpdated { pubkey: pubkey.to_lowercase(), alias, removed: false });
                 self.list_friends();
@@ -530,7 +579,7 @@ impl Runtime {
 }
 
 #[derive(Debug)]
-enum PublishError {
+pub(super) enum PublishError {
     /// Conteúdo de servidor e este nó ainda não tem a chave do grupo
     NoGroupKey,
     Network,

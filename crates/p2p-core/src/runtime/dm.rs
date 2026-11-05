@@ -94,12 +94,7 @@ impl Runtime {
         );
         let msg = DmWireMessage::KeyOffer(offer);
         let bytes = wire::encode(&msg);
-        let _ = self
-            .node
-            .swarm
-            .behaviour_mut()
-            .gossipsub
-            .publish(IdentTopic::new(topic_str), bytes);
+        let _ = self.publish_gossip(IdentTopic::new(topic_str), bytes);
     }
 
     /// Resolve um alvo (pubkey de 64 chars, apelido de amigo ou nick de par conectado) para `(pubkey_hex, display_name)`
@@ -211,12 +206,7 @@ impl Runtime {
                 Ok(envelope) => {
                     let wire_msg = DmWireMessage::Message(envelope);
                     let bytes = wire::encode(&wire_msg);
-                    let _ = self
-                        .node
-                        .swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(IdentTopic::new(topic_str), bytes);
+                    let _ = self.publish_gossip(IdentTopic::new(topic_str), bytes);
                     self.emit(CoreEvent::DirectMessage {
                         peer_pubkey: peer_pk,
                         peer_name,
@@ -245,12 +235,7 @@ impl Runtime {
                         .insert_own(stored.clone(), &self.dm.node_config, now);
                     let msg = MailboxMessage::Store(stored);
                     let bytes = wire::encode(&msg);
-                    let _ = self
-                        .node
-                        .swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(IdentTopic::new(MAILBOX_TOPIC), bytes);
+                    let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
 
                     self.emit(CoreEvent::DirectMessage {
                         peer_pubkey: peer_pk.clone(),
@@ -411,18 +396,21 @@ impl Runtime {
                 let recipient_short = short_id(&envelope.recipient_pubkey).to_string();
                 let env_id = envelope.envelope_id.clone();
                 let recipient_pk = envelope.recipient_pubkey.clone();
+                let already_known = self.dm.mailbox.has_envelope_or_ack(&env_id);
 
                 if let Ok(effective_ttl) =
                     self.dm
                         .mailbox
                         .store_for_friend(envelope, is_friend, &self.dm.node_config, now)
                 {
-                    self.emit(CoreEvent::MailboxStoredForFriend {
-                        sender_name,
-                        recipient_short,
-                        envelope_id: env_id,
-                        effective_ttl_secs: effective_ttl,
-                    });
+                    if !already_known {
+                        self.emit(CoreEvent::MailboxStoredForFriend {
+                            sender_name,
+                            recipient_short,
+                            envelope_id: env_id,
+                            effective_ttl_secs: effective_ttl,
+                        });
+                    }
                     // Se o destinatário já estiver conectado a nós agora, despacha imediatamente
                     if self.is_pubkey_online(&recipient_pk) {
                         self.deliver_pending_for(&recipient_pk);
@@ -547,24 +535,14 @@ impl Runtime {
         ) {
             let wire_msg = DmWireMessage::Message(envelope);
             let bytes = wire::encode(&wire_msg);
-            let _ = self
-                .node
-                .swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(IdentTopic::new(topic_str), bytes);
+            let _ = self.publish_gossip(IdentTopic::new(topic_str), bytes);
         }
     }
 
     fn publish_mailbox_ack(&mut self, ack: ReceiptAck) {
         let msg = MailboxMessage::Ack(ack);
         let bytes = wire::encode(&msg);
-        let _ = self
-            .node
-            .swarm
-            .behaviour_mut()
-            .gossipsub
-            .publish(IdentTopic::new(MAILBOX_TOPIC), bytes);
+        let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
     }
 
     /// Chamado quando um par Anarchord é identificado no Swarm:
@@ -583,19 +561,7 @@ impl Runtime {
 
         if is_friend {
             self.send_ephemeral_key_offer(&clean_pk);
-            // Delega envelopes nossos pendentes para o amigo que acabou de ficar online
-            let my_pk = self.my_pubkey();
-            let my_pending = self.dm.mailbox.pending_from_sender(&my_pk, super::now_secs());
-            for env in my_pending {
-                let msg = MailboxMessage::Store(env);
-                let bytes = wire::encode(&msg);
-                let _ = self
-                    .node
-                    .swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .publish(IdentTopic::new(MAILBOX_TOPIC), bytes);
-            }
+            self.delegate_own_pending_mailbox_envelopes();
             // Propaga ACKs assinados que já recebemos para limpar a outbox/mailbox do amigo que estava offline
             for ack in self.dm.mailbox.known_acks() {
                 self.publish_mailbox_ack(ack);
@@ -606,22 +572,46 @@ impl Runtime {
         self.deliver_pending_for(&clean_pk);
     }
 
+    /// Delega os envelopes ainda não entregues da nossa outbox para os guardiões na malha (`MAILBOX_TOPIC`).
+    /// Chamado quando um par conecta, quando alguém se inscreve em `MAILBOX_TOPIC`, ao adicionar um amigo,
+    /// e periodicamente enquanto ainda houver envelopes na nossa outbox e pares conectados.
+    pub(super) fn delegate_own_pending_mailbox_envelopes(&mut self) {
+        let my_pk = self.my_pubkey();
+        let my_pending = self.dm.mailbox.pending_from_sender(&my_pk, super::now_secs());
+        for env in my_pending {
+            let msg = MailboxMessage::Store(env);
+            let bytes = wire::encode(&msg);
+            let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
+        }
+    }
+
+    /// Chamado quando um par se inscreve no tópico `MAILBOX_TOPIC` do Gossipsub:
+    /// como o `Subscribed` do Gossipsub geralmente chega alguns milissegundos *depois* do `Identify`,
+    /// reanunciamos a nossa outbox pendente, as entregas para esse par e os nossos ACKs!
+    pub(super) fn on_peer_subscribed_mailbox(&mut self, peer_id: libp2p::PeerId) {
+        self.delegate_own_pending_mailbox_envelopes();
+        if let Some((_, pk)) = self.peer_metadata.get(&peer_id).cloned() {
+            self.deliver_pending_for(&pk);
+        } else if let Some(pk) = crate::api::pubkey_hex_from_peer_id(&peer_id) {
+            self.deliver_pending_for(&pk);
+        }
+        for ack in self.dm.mailbox.known_acks() {
+            self.publish_mailbox_ack(ack);
+        }
+    }
+
     pub(super) fn deliver_pending_for(&mut self, recipient_pubkey: &str) {
         let now = super::now_secs();
         let pending = self.dm.mailbox.pending_for_recipient(recipient_pubkey, now);
         for env in pending {
             let msg = MailboxMessage::Deliver(env);
             let bytes = wire::encode(&msg);
-            let _ = self
-                .node
-                .swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(IdentTopic::new(MAILBOX_TOPIC), bytes);
+            let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
         }
     }
 
-    /// Tick periódico da Mailbox: purga envelopes expirados e reanuncia entregas pendentes para destinatários conectados
+    /// Tick periódico da Mailbox: purga envelopes expirados, reanuncia entregas pendentes para destinatários conectados
+    /// e delega nossa outbox para guardiões conectados (caso ninguém estivesse online quando a DM foi enviada!)
     pub(super) fn mailbox_tick(&mut self) {
         let now = super::now_secs();
         self.dm.mailbox.purge_expired(now);
@@ -632,6 +622,10 @@ impl Runtime {
             .filter(|(peer, _)| self.connected_peers.contains(peer))
             .map(|(_, (_, pk))| pk.to_lowercase())
             .collect();
+
+        if !online_pks.is_empty() {
+            self.delegate_own_pending_mailbox_envelopes();
+        }
 
         for pk in online_pks {
             self.deliver_pending_for(&pk);
