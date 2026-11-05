@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
 [![libp2p](https://img.shields.io/badge/Network-libp2p-blue?style=for-the-badge&logo=ipfs)](https://libp2p.io/)
 [![Protocol: Noise](https://img.shields.io/badge/Crypto-Ed25519%20%2B%20Noise-blueviolet?style=for-the-badge)](https://noiseprotocol.org/)
-[![Tests](https://img.shields.io/badge/Tests-11%20Passed-brightgreen?style=for-the-badge)]()
+[![Tests](https://img.shields.io/badge/Tests-190%2B%20Passed%20%7C%2015%20Lab%20Scenarios-brightgreen?style=for-the-badge)]()
 
 **Anarchord** is an open-source, serverless communication ecosystem inspired by Discord.  
 Built in **Rust** from the ground up, it eliminates centralized servers, tracking, and corporate gatekeeping by establishing a decentralized, encrypted mesh between peer nodes using **IPFS Amino DHT**, **BitTorrent Open Trackers**, and **libp2p**.
@@ -23,11 +23,13 @@ Built in **Rust** from the ground up, it eliminates centralized servers, trackin
 * 🌐 **Hybrid Auto-Discovery (Zero-Config):**
   * **Primary:** Global IPFS Amino DHT bootstrap nodes.
   * **Fallback:** Public BitTorrent UDP Trackers (BEP 15) querying deterministic hashes in < 500ms.
-* 💬 **Mesh Text Channels & Terminal UI (TUI):** Built on `libp2p-gossipsub` with end-to-end cryptographic message signing (`Ed25519`) and a reactive, interactive dashboard built with **Ratatui** (featuring dynamic online peers, audio meters, blinking input cursor, and mouse support).
-* 📁 **Direct P2P File Transfer:** Point-to-point chunked file delivery with SHA-256 verification, handshakes (`Offer` / `Accept`), and live progress gauges.
+* 💬 **Mesh Text Channels & Terminal UI (TUI):** Built on `libp2p-gossipsub` with end-to-end cryptographic message signing (`Ed25519`), **MLS** (RFC 9420) encrypted servers, and a reactive, interactive dashboard built with **Ratatui** (featuring dynamic online peers, friends list with presence, audio meters, blinking input cursor, and mouse support).
+* 🔒 **1:1 E2EE Direct Messages & Offline Friend Guardians:** Private direct messages encrypted with **X25519** + **HKDF-SHA256** + **ChaCha20-Poly1305** and **Ephemeral Session Keys** (Forward Secrecy). Offline messages are delivered via **Friend Guardians** using a **Sign-then-Seal** store-and-forward mailbox with event-driven delegation, sovereign TTL negotiation, and restart-safe deduplication (`ReceiptAck`).
+* 🛡️ **Asymmetric DM Application Firewall:** Configurable per-node defense (`config.json` / `/firewall`) distinguishing **Friends** from **Strangers** (since friendship is asymmetric), with progressive rate/size/offline blocking (`1m → 5m → 30m → 24h`) and a single E2EE courtesy block notice.
+* 📁 **Decentralized File Swarm (IPFS CIDv1):** Multi-peer chunked file delivery (`/anarchord/files/1`) with SHA-256 verification, seeder promotion, automatic resume across restarts, and per-chunk encryption inside servers.
 * 🎙️ **Real-Time Voice Architecture (Opus 48kHz):** Full-duplex microphone capture, low-latency Opus audio compression, Jitter Buffering, VAD (Voice Activity Detection), and multi-peer audio mixing.
 * 📺 **P2P Screen Sharing & Real-Time H.264 Video Stream:** Screen and display capture engine via `xcap` with hardware/native **H.264** compression (`openh264` at 30 FPS with periodic SPS/PPS IDR keyframes, <2ms downscaling, and JPEG fallback), live viewer window via `minifb` displaying real-time FPS, bitrate, and transfer metrics.
-* 🐳 **Multi-Stage Docker & 100% Isolated End-to-End Test Suite:** Distributed test lab (`lab/run.py`): every peer is a container behind its own real NAT router (iptables, cone or symmetric), driven over stdin/stdout by a Python orchestrator that synchronizes the nodes and validates the results (hole punching, relay, chat, file swarm, resume, servers, voice/screen, lossy links).
+* 🐳 **Multi-Stage Docker, 15 Isolated Lab Scenarios & Raw Packet Sniffer:** Distributed test lab (`lab/run.py`): every peer is a container behind its own real NAT router (iptables, cone or symmetric), driven over stdin/stdout by a Python orchestrator with a built-in **Raw Application Packet Sniffer** (`sniffer.rs` / `packets.jsonl`) that dissects wire frames, keys, nonces, ciphertexts, and cryptographic signatures.
 * 🚪 **Dynamic OS Ephemeral Ports:** No need to configure or hardcode ports; the OS assigns available ports on boot and announces them automatically.
 * 🤝 **Intelligent Connection Deduplication:** Detects simultaneous handshakes and tears down redundant connections without dropping the primary session.
 * 🛡️ **NAT Traversal & Firewall Punching:** Built-in **DCUtR** (Direct Connection Upgrade through Relay) and **AutoNAT** protocols.
@@ -41,8 +43,10 @@ The repository is organized as a modular Cargo Workspace:
 ```text
 anarchord/
 ├── crates/
-│   ├── p2p-core/      # Core headless P2P engine (Identity, DHT, Trackers, GossipSub, Audio Buffer)
-│   └── p2p-cli/       # Interactive terminal client and background daemon
+│   ├── p2p-core/      # Core headless P2P engine (Identity, DHT, Trackers, GossipSub, MLS, DMs, Mailbox, Sniffer)
+│   ├── p2p-cli/       # Interactive Ratatui terminal client and screen viewer
+│   └── p2p-agent/     # Headless JSON-over-stdio node for bots and distributed lab testing
+├── lab/               # Distributed Docker + real NAT test lab (anarlab) & 15 automated scenarios
 ├── Cargo.toml         # Workspace definition
 └── README.md
 ```
@@ -91,11 +95,19 @@ While inside the chat console, you can use built-in slash commands:
 
 | Command | Action |
 | :--- | :--- |
-| `<message>` + `Enter` | Sends a cryptographically signed message to the active channel. |
+| `<message>` + `Enter` | Sends a cryptographically signed message to the active channel or active `@Friend` DM space. |
 | `/peers` | Displays all currently connected P2P peers and their public Peer IDs. |
-| `/join <channel>` | Dynamically switches chat rooms (e.g., `/join gaming`) without restarting. |
-| `/send <peer> <file>` | Initiates direct P2P file transfer to a target peer with SHA-256 integrity verification. |
-| `/accept <hash>` / `/reject <hash>` | Accepts or denies an incoming P2P file transfer request. |
+| `/join <channel>` / `/lobby` | Dynamically switches chat rooms (e.g., `/join gaming`) or returns to the Lobby. |
+| `/friends` | Lists all friends in `identity.json` with their online/offline presence status. |
+| `/friend add <pubkey\|nick> [alias]` | Adds a peer to your local friends list (authorizing them as a mutual DM guardian). |
+| `/friend remove <pubkey\|nick>` | Removes a peer from your friends list. |
+| `/dm <peer> <msg> [--ttl <duration>]` | Sends a 1:1 E2EE Direct Message (with optional offline guardian TTL override). |
+| `/dm open <peer>` | Opens a dedicated `@Peer` E2EE Direct Message conversation space in the TUI. |
+| `/config` / `/config set <key> <val>` | Views or updates node configuration (`config.json`: mailbox quotas, TTLs, DM firewall limits). |
+| `/firewall` / `/firewall unblock <peer>` | Inspects active DM firewall policies/blocks or manually unblocks a peer. |
+| `/server ...` | Creates and manages decentralized MLS-encrypted servers, invites, channels, roles, and bans. |
+| `/share <file>` / `/send <peer> <file>` | Shares a file in the current space swarm (`CIDv1`) or sends directly to a peer. |
+| `/get <id>` / `/reject <id>` / `/files` | Downloads an offered file, rejects an offer, or lists active/completed transfers. |
 | `/voice join <room>` / `/voice leave` | Joins or leaves real-time P2P voice mesh with Opus audio. |
 | `/mute` | Toggles microphone mute/unmute state. |
 | `/devices` | Lists available audio input (mics) and output (speakers) hardware devices. |
@@ -120,14 +132,12 @@ While inside the chat console, you can use built-in slash commands:
 - [x] Periodic 10s Tracker re-announcement and continuous peer re-discovery.
 - [x] Distributed Docker test lab with real NAT routers (`lab/run.py`).
 
-### Phase 2: Decentralized Text Mesh, TUI & File Transfer ✅ (Completed)
+### Phase 2: Decentralized Text Mesh, TUI & File Swarm ✅ (Completed)
 - [x] GossipSub channel routing (e.g. `p2p-anarchord/channel/<channel>`).
 - [x] Cryptographic verification: All messages signed by author's private key.
 - [x] Interactive Terminal User Interface (**Ratatui**) with dynamic online peers, blinking input cursor, and mouse click interactions.
-- [x] Direct P2P File Transfer subsystem:
-  - [x] Chunked delivery (64KB chunks), GossipSub max transmit size expansion (1MB).
-  - [x] Transmission pacing, handshake negotiations, and SHA-256 verification.
-- [ ] Offline history synchronization (moved to v0.4: [#26](https://github.com/VictorGerin/anarchord/issues/26), [#37](https://github.com/VictorGerin/anarchord/issues/37), [#39](https://github.com/VictorGerin/anarchord/issues/39)).
+- [x] Direct P2P File Swarm subsystem (`CIDv1`, `/anarchord/files/1`, seeder promotion, resume, server encryption).
+- [x] Offline 1:1 DM delivery via Friend Guardians ([#37](https://github.com/VictorGerin/anarchord/issues/37)); channel/server history synchronization tracked in v0.4 ([#26](https://github.com/VictorGerin/anarchord/issues/26), [#39](https://github.com/VictorGerin/anarchord/issues/39)).
 
 ### Phase 3: Real-Time P2P Voice (Opus) ✅ (Completed)
 - [x] `VoicePacket` 20ms protocol specification with VAD energy calculation.
@@ -148,8 +158,15 @@ While inside the chat console, you can use built-in slash commands:
 
 ### Phase 5: Servers, Moderation & End-to-End Encryption ✅ (Completed)
 - [x] Servers with a signed configuration chain (channels, rules, bans, allow-list) and moderator certificates.
-- [x] Server content (chat, voice, screen) end-to-end encrypted with **MLS** (RFC 9420, `openmls`).
-- [x] Friends list with online/offline presence.
+- [x] Server content (chat, voice, screen, file offers) end-to-end encrypted with **MLS** (RFC 9420, `openmls`).
+
+### Phase 6: Friends, 1:1 E2EE Direct Messages, Offline Guardian Mailbox & DM Firewall ✅ (Completed)
+- [x] Friends list in `identity.json` with real-time online/offline presence and TUI context menus ([#34](https://github.com/VictorGerin/anarchord/issues/34), [#35](https://github.com/VictorGerin/anarchord/issues/35)).
+- [x] 1:1 E2EE Direct Messages (`X25519` + `HKDF-SHA256` + `ChaCha20-Poly1305`) with Ephemeral Session Keys (Forward Secrecy) and dedicated `@Friend` TUI spaces ([#36](https://github.com/VictorGerin/anarchord/issues/36)).
+- [x] Decentralized Offline Store-and-Forward Mailbox via Friend Guardians (`Sign-then-Seal` envelopes, 100% event-driven guardian delegation, sovereign TTL negotiation, and persistent `ReceiptAck` deduplication across restarts) ([#37](https://github.com/VictorGerin/anarchord/issues/37)).
+- [x] OS-agnostic configuration system (`config.json` / `/config`) for mailbox quotas, TTLs, and DM policies ([#38](https://github.com/VictorGerin/anarchord/issues/38)).
+- [x] Asymmetric DM Application Firewall (Friends vs. Strangers limits, progressive blocking `1m → 5m → 30m → 24h`, single E2EE courtesy block notice, `/firewall`) ([#48](https://github.com/VictorGerin/anarchord/issues/48)).
+- [x] Raw Application Packet Sniffer (`sniffer.rs`) & cryptographic wire dissector in `anarlab` (`packets.jsonl` / `packets.log`).
 
 ### Upcoming milestones
 Tracked as [GitHub milestones](https://github.com/VictorGerin/anarchord/milestones); every item is an issue with acceptance criteria. Design principles and threat model: [wiki](https://github.com/VictorGerin/anarchord/wiki/Principios-e-Modelo-de-Ameacas).
@@ -159,7 +176,7 @@ Tracked as [GitHub milestones](https://github.com/VictorGerin/anarchord/mileston
 - [ ] Versioned protocol engine with version/capability negotiation [#61](https://github.com/VictorGerin/anarchord/issues/61)
 - [ ] Git-based versioning [#19](https://github.com/VictorGerin/anarchord/issues/19) and signed, verifiable releases [#49](https://github.com/VictorGerin/anarchord/issues/49)
 - [ ] Crypto hardening: keys encrypted at rest, periodic key updates, safety numbers, fuzzing [#45](https://github.com/VictorGerin/anarchord/issues/45)
-- [ ] Application firewall against spam/abuse with progressive blocking [#48](https://github.com/VictorGerin/anarchord/issues/48)
+- [ ] Application firewall against spam/abuse with progressive blocking [#48](https://github.com/VictorGerin/anarchord/issues/48) *(Asymmetric DM Firewall with progressive blocking & courtesy notice completed ✅; channel/global firewall remaining)*
 - [ ] Topic subscriptions only for what is open [#56](https://github.com/VictorGerin/anarchord/issues/56)
 - [ ] Lab performance metrics (bandwidth, latency, CPU per node) [#57](https://github.com/VictorGerin/anarchord/issues/57) and lab in CI [#18](https://github.com/VictorGerin/anarchord/issues/18)
 
@@ -172,8 +189,9 @@ Tracked as [GitHub milestones](https://github.com/VictorGerin/anarchord/mileston
 - [ ] Server discovery: open directory and tag search [#60](https://github.com/VictorGerin/anarchord/issues/60)
 
 **v0.4 Channels, DMs & History**
-- [ ] 1:1 DMs with ephemeral session keys [#36](https://github.com/VictorGerin/anarchord/issues/36) and offline delivery via guardians [#37](https://github.com/VictorGerin/anarchord/issues/37)
-- [ ] Unified history/offline delivery [#26](https://github.com/VictorGerin/anarchord/issues/26), [#39](https://github.com/VictorGerin/anarchord/issues/39), configurable limits [#38](https://github.com/VictorGerin/anarchord/issues/38)
+- [x] 1:1 DMs with ephemeral session keys [#36](https://github.com/VictorGerin/anarchord/issues/36) and offline delivery via guardians [#37](https://github.com/VictorGerin/anarchord/issues/37)
+- [x] Configurable node & mailbox limits (`config.json` / `/config`) [#38](https://github.com/VictorGerin/anarchord/issues/38)
+- [ ] Unified channel/server history & offline delivery [#26](https://github.com/VictorGerin/anarchord/issues/26), [#39](https://github.com/VictorGerin/anarchord/issues/39)
 - [ ] Per-channel encryption: ephemeral MLS groups with elected room leader, private channels [#46](https://github.com/VictorGerin/anarchord/issues/46)
 - [ ] Room presence by join/leave, no polling [#55](https://github.com/VictorGerin/anarchord/issues/55)
 
@@ -187,11 +205,12 @@ Tracked as [GitHub milestones](https://github.com/VictorGerin/anarchord/mileston
 
 ## 🧪 Testing
 
-Anarchord maintains comprehensive automated unit and integration tests across all modules.
+Anarchord maintains comprehensive automated unit, integration, TUI, and distributed NAT container tests across all modules.
 
 To run the complete test suite:
 ```bash
 cargo test --workspace
+python lab/run.py
 ```
 
 ---
