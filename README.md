@@ -96,7 +96,7 @@ While inside the chat console, you can use built-in slash commands:
 | Command | Action |
 | :--- | :--- |
 | `<message>` + `Enter` | Sends a cryptographically signed message to the active channel or active `@Friend` DM space. |
-| `/peers` | Displays all currently connected P2P peers and their public Peer IDs. |
+| `/peers` | Displays all currently connected P2P peers, their public Peer IDs, announced/negotiated protocol versions (`v1-v2`), and active capabilities. |
 | `/join <channel>` / `/lobby` | Dynamically switches chat rooms (e.g., `/join gaming`) or returns to the Lobby. |
 | `/friends` | Lists all friends in `identity.json` with their online/offline presence status. |
 | `/friend add <pubkey\|nick> [alias]` | Adds a peer to your local friends list (authorizing them as a mutual DM guardian). |
@@ -172,8 +172,8 @@ While inside the chat console, you can use built-in slash commands:
 Tracked as [GitHub milestones](https://github.com/VictorGerin/anarchord/milestones); every item is an issue with acceptance criteria. Design principles and threat model: [wiki](https://github.com/VictorGerin/anarchord/wiki/Principios-e-Modelo-de-Ameacas).
 
 **v0.2 Foundation** ⏳
-- [ ] Protocol versioning & cross-version compatibility [#51](https://github.com/VictorGerin/anarchord/issues/51)
-- [ ] Versioned protocol engine with version/capability negotiation [#61](https://github.com/VictorGerin/anarchord/issues/61)
+- [x] Protocol versioning & cross-version compatibility [#51](https://github.com/VictorGerin/anarchord/issues/51)
+- [x] Versioned protocol engine with version/capability negotiation [#61](https://github.com/VictorGerin/anarchord/issues/61)
 - [ ] Git-based versioning [#19](https://github.com/VictorGerin/anarchord/issues/19) and signed, verifiable releases [#49](https://github.com/VictorGerin/anarchord/issues/49)
 - [ ] Crypto hardening: keys encrypted at rest, periodic key updates, safety numbers, fuzzing [#45](https://github.com/VictorGerin/anarchord/issues/45)
 - [ ] Application firewall against spam/abuse with progressive blocking [#48](https://github.com/VictorGerin/anarchord/issues/48) *(Asymmetric DM Firewall with progressive blocking & courtesy notice completed ✅; channel/global firewall remaining)*

@@ -57,9 +57,42 @@ pub fn describe(event: &CoreEvent) -> Vec<String> {
         CoreEvent::Started { .. } => Vec::new(),
         CoreEvent::Network(e) => one(network(e)),
         CoreEvent::PeerIdentified { .. } | CoreEvent::PeerLeft { .. } => Vec::new(),
-        CoreEvent::Peers { anarchord, connections } => {
-            one(format!("Pares Anarchord conectados: {} (conexões totais, incluindo DHT: {})", anarchord, connections))
+        CoreEvent::Peers { anarchord, connections, peers } => {
+            let mut lines = vec![format!(
+                "Pares Anarchord conectados: {} (conexões totais, incluindo DHT: {})",
+                anarchord, connections
+            )];
+            for p in peers {
+                let neg = match p.negotiated_version {
+                    Some(v) => format!("negociado: v{}", v),
+                    None => "incompatível ⚠️".to_string(),
+                };
+                let caps = if p.capabilities.is_empty() {
+                    "nenhuma".to_string()
+                } else {
+                    p.capabilities.join(",")
+                };
+                lines.push(format!(
+                    "   • {} ({}) · protocolo {} ({}) · app {} · caps: [{}]",
+                    p.nick,
+                    short_id(&p.pubkey),
+                    p.announced_versions,
+                    neg,
+                    p.app_version,
+                    caps
+                ));
+            }
+            lines
         }
+        CoreEvent::PeerIncompatible {
+            nick,
+            peer_version,
+            supported_versions,
+            ..
+        } => one(format!(
+            "⚠️ {} usa uma versão incompatível ({}; suportado: {}); atualize",
+            nick, peer_version, supported_versions
+        )),
         CoreEvent::AudioDevices { inputs, outputs } => {
             vec![format!("🎤 Entradas: {}", inputs.join(" | ")), format!("🔊 Saídas: {}", outputs.join(" | "))]
         }

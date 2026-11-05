@@ -6,7 +6,7 @@ use crate::api::pubkey_hex_from_peer_id;
 use crate::bootstrap::OPENTRACKER_SERVERS;
 use crate::community::{self, server_dht_key};
 use crate::files as swarm_files;
-use crate::node::{parse_agent_version, DHT_DISCOVERY_NAMESPACE};
+use crate::node::{parse_agent_info, DHT_DISCOVERY_NAMESPACE};
 use crate::protocol::AppBehaviourEvent;
 use crate::tracker::{make_info_hash, TorrentTrackerClient};
 use crate::wire::{self, Incoming};
@@ -210,7 +210,23 @@ impl Runtime {
                     self.relay_manager.add_candidate(peer_id, &info.listen_addrs);
                     self.request_relay_reservations();
                 }
-                if let Some((nick, pubkey)) = parse_agent_version(&info.agent_version) {
+                if let Some(agent_info) = parse_agent_info(&info.agent_version) {
+                    let (nick, pubkey, peer_caps) = (agent_info.nick, agent_info.pubkey, agent_info.capabilities);
+                    self.peer_protocols.insert(peer_id, peer_caps.clone());
+
+                    // Verifica compatibilidade de versão (política N e N-1 + proteção contra downgrade)
+                    if self.local_capabilities.negotiate_version(&peer_caps).is_none() {
+                        if self.warned_incompatible.insert(peer_id) {
+                            self.emit(CoreEvent::PeerIncompatible {
+                                peer_id: peer_id.to_string(),
+                                nick: nick.clone(),
+                                pubkey: pubkey.clone(),
+                                peer_version: peer_caps.version_range_label(),
+                                supported_versions: self.local_capabilities.version_range_label(),
+                            });
+                        }
+                    }
+
                     // O Identify se repete a cada conexão: só avisa na primeira identificação ou se o nick mudou
                     let changed = self.peer_metadata.insert(peer_id, (nick.clone(), pubkey.clone())) != Some((nick.clone(), pubkey.clone()));
                     let first = self.identified.insert(peer_id);
@@ -371,6 +387,25 @@ impl Runtime {
             let from = message.source.as_ref().and_then(pubkey_hex_from_peer_id);
             return match wire::decode_as(&message.data) {
                 Ok(server_message) => self.handle_server_network_message(&server_id, server_message, from.as_deref()),
+                Err(wire::WireError::Version(ver)) => {
+                    if let Some(peer_id) = message.source {
+                        if self.warned_incompatible.insert(peer_id) {
+                            let (nick, pubkey) = self
+                                .peer_metadata
+                                .get(&peer_id)
+                                .cloned()
+                                .unwrap_or_else(|| (peer_id.to_string(), from.unwrap_or_default()));
+                            self.emit(CoreEvent::PeerIncompatible {
+                                peer_id: peer_id.to_string(),
+                                nick,
+                                pubkey,
+                                peer_version: format!("v{}", ver),
+                                supported_versions: self.local_capabilities.version_range_label(),
+                            });
+                        }
+                    }
+                    tracing::debug!("Mensagem de servidor em versão incompatível (v{}) descartada", ver);
+                }
                 Err(e) => tracing::debug!("Mensagem de servidor ilegível: {}", e),
             };
         }
@@ -396,6 +431,33 @@ impl Runtime {
         let sender_matches = |author: &str| mls_sender.as_deref().is_none_or(|s| s == author);
         let incoming = match wire::decode(&data) {
             Ok(incoming) => incoming,
+            Err(wire::WireError::Version(ver)) => {
+                if let Some(peer_id) = message.source {
+                    if self.warned_incompatible.insert(peer_id) {
+                        let (nick, pubkey) = self
+                            .peer_metadata
+                            .get(&peer_id)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                let pk = pubkey_hex_from_peer_id(&peer_id).unwrap_or_default();
+                                let n = if pk.is_empty() {
+                                    peer_id.to_string()
+                                } else {
+                                    community::short_id(&pk).to_string()
+                                };
+                                (n, pk)
+                            });
+                        self.emit(CoreEvent::PeerIncompatible {
+                            peer_id: peer_id.to_string(),
+                            nick,
+                            pubkey,
+                            peer_version: format!("v{}", ver),
+                            supported_versions: self.local_capabilities.version_range_label(),
+                        });
+                    }
+                }
+                return tracing::debug!("Mensagem descartada em {} (versão v{} incompatível)", topic, ver);
+            }
             Err(e) => return tracing::debug!("Mensagem descartada em {}: {}", topic, e),
         };
         let source = message.source;
@@ -438,6 +500,15 @@ impl Runtime {
             Incoming::Server(_) => tracing::debug!("Mensagem de servidor fora do tópico de controle descartada"),
             Incoming::DirectMessage(dm_msg) => self.on_dm_wire_message(dm_msg),
             Incoming::Mailbox(mb_msg) => self.on_mailbox_message(mb_msg),
+            Incoming::Unknown { version, kind, len } => {
+                tracing::debug!(
+                    "Tipo de mensagem desconhecido ignorado com segurança em {} (v{}, kind={}, {}B)",
+                    topic,
+                    version,
+                    kind,
+                    len
+                );
+            }
         }
     }
 

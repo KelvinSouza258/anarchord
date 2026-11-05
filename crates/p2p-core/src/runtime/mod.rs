@@ -80,6 +80,8 @@ pub struct CoreConfig {
     pub lab: bool,
     /// Arquivo JSONL opcional para gravar os pacotes brutos de aplicação (sniffer de pacotes)
     pub sniff_file: Option<PathBuf>,
+    /// Capacidades de protocolo customizadas anunciadas no Identify (`None` = padrão local `v1..=v2`)
+    pub protocol_capabilities: Option<crate::wire::ProtocolCapabilities>,
 }
 
 impl CoreConfig {
@@ -107,6 +109,7 @@ impl CoreConfig {
             relay_server: false,
             lab: false,
             sniff_file: None,
+            protocol_capabilities: None,
         }
     }
 }
@@ -199,6 +202,12 @@ pub(crate) struct Runtime {
     links: HashMap<PeerId, (String, bool)>,
     /// PeerId -> (nick, pubkey) dos pares Anarchord identificados
     peer_metadata: HashMap<PeerId, (String, String)>,
+    /// PeerId -> capacidades e versões de protocolo anunciadas no Identify
+    peer_protocols: HashMap<PeerId, crate::wire::ProtocolCapabilities>,
+    /// Capacidades locais deste nó (`v1..=v2` por padrão)
+    local_capabilities: crate::wire::ProtocolCapabilities,
+    /// Pares com versão incompatível sobre os quais a TUI já foi avisada (evita avisos repetidos)
+    warned_incompatible: HashSet<PeerId>,
     /// Pares já anunciados na interface desde que conectaram
     identified: HashSet<PeerId>,
     /// Endereços discados com conexão aberta (o tracker repete os mesmos pares)
@@ -230,9 +239,19 @@ impl Runtime {
     fn new(config: CoreConfig, events: UnboundedSender<CoreEvent>) -> Result<Self, CoreStartError> {
         let identity = config.identity.clone();
         let nick = identity.profile.display_name.clone();
+        let local_capabilities = config
+            .protocol_capabilities
+            .clone()
+            .unwrap_or_else(crate::wire::ProtocolCapabilities::local);
         let mut node = P2PNode::with_options(
             identity.clone(),
-            crate::node::NodeOptions { port: config.port, relay_server: config.relay_server, lab: config.lab, mdns: config.mdns },
+            crate::node::NodeOptions {
+                port: config.port,
+                relay_server: config.relay_server,
+                lab: config.lab,
+                mdns: config.mdns,
+                capabilities: Some(local_capabilities.clone()),
+            },
         )?;
         let mut relay_manager = RelayManager::new();
         relay_manager.allow_private(config.lab);
@@ -252,6 +271,9 @@ impl Runtime {
             connected_peers: HashSet::new(),
             links: HashMap::new(),
             peer_metadata: HashMap::new(),
+            peer_protocols: HashMap::new(),
+            local_capabilities,
+            warned_incompatible: HashSet::new(),
             identified: HashSet::new(),
             dialed_open: HashSet::new(),
             tracker_dial_attempts: HashMap::new(),
@@ -353,8 +375,40 @@ impl Runtime {
             CoreCommand::LeaveVoice => self.leave_voice(),
             CoreCommand::ToggleMute => self.toggle_mute(),
             CoreCommand::ListPeers => {
-                let anarchord = self.peer_metadata.keys().filter(|p| self.connected_peers.contains(p)).count();
-                self.emit(CoreEvent::Peers { anarchord, connections: self.connected_peers.len() });
+                let mut peers: Vec<PeerProtocolInfo> = self
+                    .peer_metadata
+                    .iter()
+                    .filter(|(p, _)| self.connected_peers.contains(p))
+                    .map(|(peer_id, (nick, pubkey))| {
+                        let remote_caps = self
+                            .peer_protocols
+                            .get(peer_id)
+                            .cloned()
+                            .unwrap_or_else(crate::wire::ProtocolCapabilities::legacy_v1);
+                        let negotiated_version = self.local_capabilities.negotiate_version(&remote_caps);
+                        let capabilities: Vec<String> = self
+                            .local_capabilities
+                            .negotiate_capabilities(&remote_caps)
+                            .into_iter()
+                            .collect();
+                        PeerProtocolInfo {
+                            peer_id: peer_id.to_string(),
+                            nick: nick.clone(),
+                            pubkey: pubkey.clone(),
+                            announced_versions: remote_caps.version_range_label(),
+                            negotiated_version,
+                            app_version: remote_caps.app_version,
+                            capabilities,
+                        }
+                    })
+                    .collect();
+                peers.sort_by(|a, b| a.nick.cmp(&b.nick).then_with(|| a.peer_id.cmp(&b.peer_id)));
+                let anarchord = peers.len();
+                self.emit(CoreEvent::Peers {
+                    anarchord,
+                    connections: self.connected_peers.len(),
+                    peers,
+                });
             }
             CoreCommand::ListAudioDevices => self.emit(CoreEvent::AudioDevices {
                 inputs: crate::voice::AudioDeviceManager::list_input_devices(),
@@ -395,8 +449,36 @@ impl Runtime {
         }
     }
 
-    /// Publica um quadro bruto no Gossipsub e, se o sniffer estiver ativo, disseca e grava o pacote TX.
+    /// Calcula a versão de envelope `wire` a usar num tópico Gossipsub (menor versão máxima negociada
+    /// entre todos os pares compatíveis atualmente inscritos no tópico).
+    pub(super) fn topic_wire_version(&self, topic: &IdentTopic) -> u8 {
+        let topic_hash = topic.hash();
+        let peer_caps = self
+            .node
+            .swarm
+            .behaviour()
+            .gossipsub
+            .all_peers()
+            .filter(|(_, topics)| topics.contains(&&topic_hash))
+            .filter_map(|(peer, _)| self.peer_protocols.get(peer));
+        self.local_capabilities.room_wire_version(peer_caps)
+    }
+
+    /// Ajusta o byte de versão do envelope `wire` para a versão negociada do tópico, se necessário.
+    fn adapt_envelope_version(&self, topic: &IdentTopic, mut payload: Vec<u8>) -> Vec<u8> {
+        let target_ver = self.topic_wire_version(topic);
+        if let Some(first) = payload.first_mut() {
+            if crate::wire::is_supported_version(*first) && *first != target_ver {
+                *first = target_ver;
+            }
+        }
+        payload
+    }
+
+    /// Publica um quadro bruto no Gossipsub (adaptando o cabeçalho para a versão negociada do tópico)
+    /// e, se o sniffer estiver ativo, disseca e grava o pacote TX.
     pub(super) fn publish_gossip(&mut self, topic: IdentTopic, payload: Vec<u8>) -> Result<(), PublishError> {
+        let payload = self.adapt_envelope_version(&topic, payload);
         let topic_name = topic.hash().into_string();
         self.sniff_packet("TX", &topic_name, None, &payload, None);
         self.node
@@ -433,6 +515,7 @@ impl Runtime {
 
     /// Publica conteúdo (chat, voz, tela, enxame). Em tópicos de servidor, cifra antes com o grupo MLS.
     fn publish_content(&mut self, topic: &IdentTopic, bytes: Vec<u8>) -> Result<(), PublishError> {
+        let bytes = self.adapt_envelope_version(topic, bytes);
         let topic_name = topic.hash().into_string();
         match community::parse_server_content_topic(&topic_name) {
             Some(server_id) => {

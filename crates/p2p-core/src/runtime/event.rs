@@ -17,8 +17,21 @@ pub enum CoreEvent {
     PeerIdentified { peer_id: String, nick: String, pubkey: String },
     /// Par Anarchord desconectou
     PeerLeft { peer_id: String, nick: String },
-    /// Resposta a `ListPeers`
-    Peers { anarchord: usize, connections: usize },
+    /// Resposta a `ListPeers` (`/peers`)
+    Peers {
+        anarchord: usize,
+        connections: usize,
+        #[serde(default)]
+        peers: Vec<PeerProtocolInfo>,
+    },
+    /// Par usa uma versão incompatível do protocolo (emitido uma única vez por par na sessão)
+    PeerIncompatible {
+        peer_id: String,
+        nick: String,
+        pubkey: String,
+        peer_version: String,
+        supported_versions: String,
+    },
     AudioDevices { inputs: Vec<String>, outputs: Vec<String> },
     /// Espaço atual (Lobby ou servidor) e os canais dele
     SpaceChanged { space: SpaceInfo, channels: Vec<ChannelInfo> },
@@ -108,6 +121,22 @@ pub struct FriendStatus {
     pub online: bool,
     pub current_nick: Option<String>,
     pub peer_id: Option<String>,
+}
+
+/// Resumo de versão do protocolo e capacidades de um par Anarchord conectado (`/peers`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerProtocolInfo {
+    pub peer_id: String,
+    pub nick: String,
+    pub pubkey: String,
+    /// Faixa de versões anunciada pelo par (ex.: `"v1-v2"` ou `"v1"`)
+    pub announced_versions: String,
+    /// Versão do envelope negociada com este par (`None` se incompatível)
+    pub negotiated_version: Option<u8>,
+    /// Versão da aplicação anunciada pelo par (ex.: `"0.1.0"`)
+    pub app_version: String,
+    /// Capacidades em comum negociadas com este par
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

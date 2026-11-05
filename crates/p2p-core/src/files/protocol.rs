@@ -12,7 +12,12 @@ use libp2p::StreamProtocol;
 use serde::{Deserialize, Serialize};
 use std::io;
 
-pub const PROTOCOL: StreamProtocol = StreamProtocol::new("/anarchord/files/1");
+pub const PROTOCOL_V1: StreamProtocol = StreamProtocol::new("/anarchord/files/1");
+pub const PROTOCOL_V2: StreamProtocol = StreamProtocol::new("/anarchord/files/2");
+/// Protocolo preferido atual (`/anarchord/files/2`); nós anunciam `[PROTOCOL_V2, PROTOCOL_V1]`
+/// para que o multistream-select negocie automaticamente a maior versão suportada por ambos.
+pub const PROTOCOL: StreamProtocol = PROTOCOL_V2;
+pub const SUPPORTED_PROTOCOLS: [StreamProtocol; 2] = [PROTOCOL_V2, PROTOCOL_V1];
 
 const MAX_REQUEST: usize = 4 * 1024;
 /// Um pedaço (256 KB + tag) ou um manifesto de arquivo grande (~1 MB em 4 GB)

@@ -287,6 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay_server: false,
         lab: false,
         sniff_file: std::env::var("ANARCHORD_SNIFF_FILE").ok().map(PathBuf::from),
+        protocol_capabilities: None,
     };
     let (core, task) = Core::start(config)?;
     let (commands, events) = core.split();
@@ -730,7 +731,11 @@ mod tests {
     }
 
     impl FakeUi {
-        fn start_with_identity(identity: UserIdentity, connect_to: Option<u16>) -> (Self, u16) {
+        fn start_with_identity_and_caps(
+            identity: UserIdentity,
+            connect_to: Option<u16>,
+            protocol_capabilities: Option<p2p_core::ProtocolCapabilities>,
+        ) -> (Self, u16) {
             let nick = identity.profile.display_name.clone();
             let base = std::env::temp_dir().join(format!("anarchord_cli_{}_{}_{}", nick, std::process::id(), PeerId::random()));
             let pubkey = identity.public_key_hex();
@@ -738,6 +743,7 @@ mod tests {
             let mut config = CoreConfig::new(identity, base.join("servers"), base.join("downloads"));
             config.config_path = Some(base.join("config.json"));
             config.sniff_file = Some(sniff_file.clone());
+            config.protocol_capabilities = protocol_capabilities;
             config.connect = connect_to.map(|port| format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap());
             let (core, task) = Core::start(config).unwrap();
             let port = task.listen_port();
@@ -747,6 +753,18 @@ mod tests {
             tokio::task::spawn_local(task.run());
             tokio::task::spawn_local(bridge(core_events, rx_actions, commands, tx_ui, Arc::new(AtomicBool::new(false))));
             (Self { actions, events, seen: Vec::new(), downloads: base.join("downloads"), sniff_file, pubkey }, port)
+        }
+
+        fn start_with_identity(identity: UserIdentity, connect_to: Option<u16>) -> (Self, u16) {
+            Self::start_with_identity_and_caps(identity, connect_to, None)
+        }
+
+        fn start_with_caps(
+            nick: &str,
+            connect_to: Option<u16>,
+            caps: p2p_core::ProtocolCapabilities,
+        ) -> (Self, u16) {
+            Self::start_with_identity_and_caps(UserIdentity::generate_with_nick(nick), connect_to, Some(caps))
         }
 
         fn stop(&self) {
@@ -1093,6 +1111,92 @@ mod tests {
                     )
                 })
                 .await;
+            })
+            .await;
+    }
+
+    /// Testa Issues #51 e #61:
+    /// 1. Par na versão N (`v1-v2`) e par na versão N-1 (`v1`) negociam `v1` automaticamente,
+    ///    conversam na mesma sala e em DMs, e o comando `/peers` exibe a versão anunciada,
+    ///    a versão negociada e as capacidades em comum.
+    /// 2. Par numa versão incompatível (`v99`) gera um ÚNICO aviso na TUI (`"Fulano usa uma versão incompatível..."`),
+    ///    sem repetir erros.
+    #[tokio::test]
+    async fn test_protocol_version_negotiation_n_and_n_minus_1_and_single_incompatible_warning_in_tui() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Alice roda na versão atual N (v1..=v2)
+                let (mut alice, alice_port) = FakeUi::start("Alice", None);
+                // Bob roda na versão N-1 (apenas v1)
+                let (mut bob, _) = FakeUi::start_with_caps(
+                    "Bob",
+                    Some(alice_port),
+                    p2p_core::ProtocolCapabilities::legacy_v1(),
+                );
+
+                let room = format!("ver-room-{}", PeerId::random());
+                alice.type_line(&format!("/join {}", room));
+                bob.type_line(&format!("/join {}", room));
+                let r = room.clone();
+                alice
+                    .wait("Alice ver Bob (v1) na sala", move |e| {
+                        matches!(e, UiEvent::ChannelMembers { channel, members } if *channel == r && members.iter().any(|m| m == "Bob"))
+                    })
+                    .await;
+
+                // Alice (v2) manda mensagem na sala onde Bob (v1) está: o Runtime de Alice
+                // detecta que o menor protocolo da sala é v1 e publica em v1!
+                alice.type_line("oi Bob na v1!");
+                bob.wait("Bob (v1) receber mensagem de Alice (v2)", |e| {
+                    matches!(e, UiEvent::ChatMessage { author, text, .. } if author == "Alice" && text == "oi Bob na v1!")
+                })
+                .await;
+
+                // Bob (v1) responde para Alice (v2): Alice decodifica o envelope v1 normalmente!
+                bob.type_line("oi Alice, v1 funcionando com v2!");
+                alice
+                    .wait("Alice (v2) receber mensagem de Bob (v1)", |e| {
+                        matches!(e, UiEvent::ChatMessage { author, text, .. } if author == "Bob" && text == "oi Alice, v1 funcionando com v2!")
+                    })
+                    .await;
+
+                // Comando /peers em Alice mostra a versão do protocolo de Bob (v1, negociado: v1) e capacidades
+                alice.type_line("/peers");
+                let peer_line = alice
+                    .wait_log("Alice ver versão de Bob no /peers", "Bob (")
+                    .await;
+                assert!(
+                    peer_line.contains("protocolo v1 (negociado: v1)") && peer_line.contains("caps: ["),
+                    "linha /peers inesperada: {}",
+                    peer_line
+                );
+
+                // Agora um par incompatível ("Zorg", v99..=v99) conecta na Alice
+                let (_zorg, _) = FakeUi::start_with_caps(
+                    "Zorg",
+                    Some(alice_port),
+                    p2p_core::ProtocolCapabilities::with_versions(99, 99),
+                );
+                let warn = alice
+                    .wait_log(
+                        "Alice receber aviso único de versão incompatível para Zorg",
+                        "Zorg usa uma versão incompatível (v99; suportado: v1-v2); atualize",
+                    )
+                    .await;
+                assert!(warn.contains("Zorg usa uma versão incompatível"));
+
+                // Dá um pequeno tempo para possíveis re-identificações e garante que o aviso saiu APENAS 1 VEZ!
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                while let Ok(ev) = alice.events.try_recv() {
+                    alice.seen.push(ev);
+                }
+                let warn_count = alice
+                    .seen
+                    .iter()
+                    .filter(|e| matches!(e, UiEvent::SystemLog(t) if t.contains("Zorg usa uma versão incompatível")))
+                    .count();
+                assert_eq!(warn_count, 1, "aviso de versão incompatível deve aparecer uma única vez por par");
             })
             .await;
     }

@@ -24,9 +24,11 @@ pub use api::{peer_id_from_pubkey_hex, ChatMessage};
 pub use runtime::{Core, CoreCommand, CoreConfig, CoreEvent, CoreHandle, CoreTask};
 pub use community::{Channel, ChannelType, ServerMessage, ServerRegistry, Space};
 pub use node::{
-    dht_discovery_key, make_agent_version, parse_agent_version, P2PNode, AGENT_VERSION_PREFIX,
+    dht_discovery_key, make_agent_version, make_agent_version_with_caps, parse_agent_info,
+    parse_agent_version, NodeOptions, P2PNode, PeerAgentInfo, AGENT_VERSION_PREFIX,
     DHT_DISCOVERY_NAMESPACE,
 };
+pub use wire::ProtocolCapabilities;
 pub use bootstrap::{IPFS_BOOTSTRAP_NODES, OPENTRACKER_SERVERS, get_ipfs_bootstrap_multiaddrs};
 pub use tracker::{TorrentTrackerClient, make_info_hash};
 pub use relay::{RelayManager, MAX_RELAY_RESERVATIONS};

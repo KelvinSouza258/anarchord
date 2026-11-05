@@ -319,6 +319,10 @@ fn dissect_incoming(incoming: Incoming) -> (String, SniffedCrypto) {
             (sub.to_string(), SniffedCrypto::default())
         }
         Incoming::Peers(_) => ("Peers".to_string(), SniffedCrypto::default()),
+        Incoming::Unknown { version, kind, .. } => (
+            format!("Unknown(v{},kind={})", version, kind),
+            SniffedCrypto::default(),
+        ),
     }
 }
 
@@ -391,7 +395,7 @@ mod tests {
             None,
         );
         assert_eq!(pkt_offer.kind, "DirectMessage.KeyOffer");
-        assert_eq!(pkt_offer.wire_version, Some(1));
+        assert_eq!(pkt_offer.wire_version, Some(wire::VERSION));
         assert_eq!(pkt_offer.crypto.sender_pubkey.as_deref(), Some(alice.public_key_hex().as_str()));
         assert_eq!(pkt_offer.crypto.recipient_pubkey.as_deref(), Some(carol.public_key_hex().as_str()));
         assert_eq!(pkt_offer.crypto.ephemeral_x25519_pubkey.as_ref().unwrap().len(), 64);

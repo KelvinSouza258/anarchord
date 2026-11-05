@@ -130,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay_server: args.relay_server,
         lab: args.lab,
         sniff_file: args.sniff_file.or_else(|| Some(args.data_dir.join("packets.jsonl"))),
+        protocol_capabilities: None,
     };
     let (core, task) = Core::start(config)?;
     let (commands, mut events) = core.split();

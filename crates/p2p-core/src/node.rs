@@ -42,20 +42,58 @@ pub fn dht_discovery_key() -> kad::RecordKey {
 /// Prefixo do `agent_version` do Identify que marca um nó Anarchord
 pub const AGENT_VERSION_PREFIX: &str = "anarchord:";
 
-/// Monta o `agent_version` anunciado no Identify: `anarchord:<nick>:<pubkey hex>`
-pub fn make_agent_version(nick: &str, pubkey_hex: &str) -> String {
-    format!("{}{}:{}", AGENT_VERSION_PREFIX, nick, pubkey_hex)
+/// Informações extraídas do `agent_version` do Identify de um par Anarchord:
+/// apelido, chave pública Ed25519 (hex) e capacidades/versões de protocolo anunciadas.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAgentInfo {
+    pub nick: String,
+    pub pubkey: String,
+    pub capabilities: crate::wire::ProtocolCapabilities,
 }
 
-/// Extrai (nick, pubkey) do `agent_version` de um nó Anarchord.
-/// A pubkey é o último campo, então nicks contendo ':' continuam funcionando.
-pub fn parse_agent_version(agent_version: &str) -> Option<(String, String)> {
+/// Monta o `agent_version` anunciado no Identify com as capacidades locais:
+/// `anarchord:<nick>:<pubkey hex>:v=1-2;app=0.1.0;caps=...`
+pub fn make_agent_version(nick: &str, pubkey_hex: &str) -> String {
+    make_agent_version_with_caps(nick, pubkey_hex, &crate::wire::ProtocolCapabilities::local())
+}
+
+/// Monta o `agent_version` anunciado no Identify com capacidades explícitas (útil em testes de compatibilidade `N`/`N-1`).
+pub fn make_agent_version_with_caps(
+    nick: &str,
+    pubkey_hex: &str,
+    caps: &crate::wire::ProtocolCapabilities,
+) -> String {
+    format!("{}{}:{}:{}", AGENT_VERSION_PREFIX, nick, pubkey_hex, caps.to_agent_suffix())
+}
+
+/// Extrai `PeerAgentInfo` (`nick`, `pubkey` e `ProtocolCapabilities`) do `agent_version` de um nó Anarchord.
+/// - Se o `agent_version` contiver o sufixo `:v=...`, extrai as versões e capacidades anunciadas.
+/// - Se for de um nó `v1` legado (`anarchord:<nick>:<pubkey>`), assume `ProtocolCapabilities::legacy_v1()` (`v1..=v1`).
+/// - Nicks contendo `:` continuam funcionando normalmente.
+pub fn parse_agent_info(agent_version: &str) -> Option<PeerAgentInfo> {
     let rest = agent_version.strip_prefix(AGENT_VERSION_PREFIX)?;
-    let (nick, pubkey) = rest.rsplit_once(':')?;
+    let (head, tail) = rest.rsplit_once(':')?;
+    let (nick, pubkey, capabilities) = if let Some(caps) = crate::wire::ProtocolCapabilities::parse_agent_suffix(tail) {
+        let (nick, pubkey) = head.rsplit_once(':')?;
+        (nick, pubkey, caps)
+    } else {
+        (head, tail, crate::wire::ProtocolCapabilities::legacy_v1())
+    };
     if nick.is_empty() || pubkey.is_empty() {
         return None;
     }
-    Some((nick.to_string(), pubkey.to_string()))
+    Some(PeerAgentInfo {
+        nick: nick.to_string(),
+        pubkey: pubkey.to_string(),
+        capabilities,
+    })
+}
+
+/// Extrai `(nick, pubkey)` do `agent_version` de um nó Anarchord (tanto `v1` legado quanto `v2` estendido).
+/// Nicks contendo `:` continuam funcionando.
+pub fn parse_agent_version(agent_version: &str) -> Option<(String, String)> {
+    let info = parse_agent_info(agent_version)?;
+    Some((info.nick, info.pubkey))
 }
 
 /// Encontra uma porta livre ao mesmo tempo em TCP e UDP, para que TCP e QUIC
@@ -86,11 +124,19 @@ pub struct NodeOptions {
     pub lab: bool,
     /// Descoberta na rede local (mDNS)
     pub mdns: bool,
+    /// Capacidades e versões de protocolo anunciadas no Identify (None = padrão local `v1..=v2`)
+    pub capabilities: Option<crate::wire::ProtocolCapabilities>,
 }
 
 impl Default for NodeOptions {
     fn default() -> Self {
-        Self { port: 0, relay_server: false, lab: false, mdns: true }
+        Self {
+            port: 0,
+            relay_server: false,
+            lab: false,
+            mdns: true,
+            capabilities: None,
+        }
     }
 }
 
@@ -146,10 +192,18 @@ impl P2PNode {
                 )
                 .expect("GossipSub behaviour válido");
 
-                // 3. Identify com User Agent contendo o Nickname e PubKey
-                let user_agent = make_agent_version(&identity.profile.display_name, &identity.public_key_hex());
+                // 3. Identify com User Agent contendo o Nickname, PubKey, Versões do Protocolo e Capacidades
+                let caps = options
+                    .capabilities
+                    .clone()
+                    .unwrap_or_else(crate::wire::ProtocolCapabilities::local);
+                let user_agent = make_agent_version_with_caps(
+                    &identity.profile.display_name,
+                    &identity.public_key_hex(),
+                    &caps,
+                );
                 let identify_config = identify::Config::new(
-                    "/p2p-anarchord/1.0.0".to_string(),
+                    format!("/p2p-anarchord/{}.0.0", caps.wire_max),
                     key.public(),
                 )
                 .with_agent_version(user_agent)
@@ -201,10 +255,13 @@ impl P2PNode {
                     .into();
                 let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
 
-                // 7. Protocolo de arquivos do enxame (pedaços em bytes crus, um stream por pedido)
+                // 7. Protocolo de arquivos do enxame (pedaços em bytes crus, um stream por pedido,
+                //    versionado via multistream-select: /anarchord/files/2 e /anarchord/files/1)
                 let files = libp2p::request_response::Behaviour::with_codec(
                     crate::files::FileCodec,
-                    [(crate::files::PROTOCOL, libp2p::request_response::ProtocolSupport::Full)],
+                    crate::files::SUPPORTED_PROTOCOLS
+                        .into_iter()
+                        .map(|p| (p, libp2p::request_response::ProtocolSupport::Full)),
                     libp2p::request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
                 );
 
@@ -322,10 +379,23 @@ mod tests {
     fn test_agent_version_roundtrip() {
         let agent = make_agent_version("Bob", "224d73");
         assert_eq!(parse_agent_version(&agent), Some(("Bob".into(), "224d73".into())));
+        let info = parse_agent_info(&agent).expect("info do Identify");
+        assert_eq!(info.nick, "Bob");
+        assert_eq!(info.pubkey, "224d73");
+        assert_eq!(info.capabilities.wire_min, crate::wire::MIN_VERSION);
+        assert_eq!(info.capabilities.wire_max, crate::wire::CURRENT_VERSION);
     }
 
     #[test]
-    fn test_agent_version_nick_with_colon() {
+    fn test_agent_version_legacy_v1_and_nick_with_colon() {
+        // Agente legado v1 (sem sufixo :v=...) deve continuar funcionando 100% e ser identificado como v1..=v1
+        let legacy = "anarchord:Dr: Who:abc123";
+        assert_eq!(parse_agent_version(legacy), Some(("Dr: Who".into(), "abc123".into())));
+        let legacy_info = parse_agent_info(legacy).unwrap();
+        assert_eq!(legacy_info.capabilities.wire_min, 1);
+        assert_eq!(legacy_info.capabilities.wire_max, 1);
+
+        // Agente v2 com nick contendo ':'
         let agent = make_agent_version("Dr: Who", "abc123");
         assert_eq!(parse_agent_version(&agent), Some(("Dr: Who".into(), "abc123".into())));
     }

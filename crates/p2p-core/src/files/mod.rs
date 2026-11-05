@@ -16,7 +16,7 @@ pub use cid::Cid;
 pub use crypto::FileKey;
 pub use engine::{FileAction, FileEngine, FileEvent, FileSummary, FileState, ShareTarget};
 pub use manifest::{Manifest, ManifestError};
-pub use protocol::{FileCodec, FileRequest, FileResponse, PROTOCOL};
+pub use protocol::{FileCodec, FileRequest, FileResponse, PROTOCOL, PROTOCOL_V1, PROTOCOL_V2, SUPPORTED_PROTOCOLS};
 pub use store::{Bitfield, Origin, PieceError, PieceStore};
 
 use serde::{Deserialize, Serialize};
