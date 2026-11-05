@@ -350,6 +350,7 @@ impl Runtime {
         let mut voice_rx = self.voice.outgoing.take();
         let mut screen_rx = self.screen.outgoing.take();
         let mut manifest_rx = self.files.manifests.take();
+        let mut fs_events_rx = self.files.fs_events.take();
 
         loop {
             tokio::select! {
@@ -368,6 +369,7 @@ impl Runtime {
                 Some(packet) = recv(&mut voice_rx) => self.broadcast_voice(packet),
                 Some(packet) = recv(&mut screen_rx) => self.broadcast_screen(packet),
                 Some(job) = recv(&mut manifest_rx) => self.manifest_ready(job),
+                Some(()) = recv(&mut fs_events_rx) => self.on_fs_watch_event(),
             }
         }
 
@@ -676,10 +678,16 @@ pub(super) enum PublishError {
     Network,
 }
 
-/// `recv` de um receptor opcional (pendente para sempre se não houver)
+/// `recv` de um receptor opcional (pendente para sempre se não houver ou se o canal fechar)
 async fn recv<T>(rx: &mut Option<UnboundedReceiver<T>>) -> Option<T> {
     match rx {
-        Some(rx) => rx.recv().await,
+        Some(inner) => match inner.recv().await {
+            Some(val) => Some(val),
+            None => {
+                *rx = None;
+                std::future::pending().await
+            }
+        },
         None => std::future::pending().await,
     }
 }

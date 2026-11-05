@@ -7,8 +7,9 @@ use crate::files::{self as swarm_files, FileAction, FileEngine, FileEvent, FileK
 use crate::identity::UserIdentity;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::PeerId;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -20,21 +21,86 @@ pub(super) struct ManifestJob {
     target: ShareTarget,
 }
 
+fn clean_watch_path(path: &Path) -> PathBuf {
+    let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let s = p.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        p
+    }
+}
+
 pub(super) struct FilesState {
     pub(super) engine: FileEngine,
     requests: HashMap<OutboundRequestId, (PeerId, FileRequest)>,
     /// Salas em que o nó se inscreveu por causa de downloads
-    followed: std::collections::HashSet<String>,
+    followed: HashSet<String>,
     tx: UnboundedSender<ManifestJob>,
     pub(super) manifests: Option<UnboundedReceiver<ManifestJob>>,
+    /// Watcher nativo do SO (`notify`: ReadDirectoryChangesW / inotify / FSEvents) para detectar
+    /// deleção ou movimentação de arquivos sem polling
+    watcher: Option<RecommendedWatcher>,
+    watched_dirs: HashSet<PathBuf>,
+    pub(super) fs_events: Option<UnboundedReceiver<()>>,
 }
 
 impl FilesState {
     pub(super) fn new(identity: &UserIdentity, download_dir: PathBuf) -> Self {
         // Parciais separados por identidade: vários nós na mesma máquina não se misturam
         let partial_dir = download_dir.join(".parcial").join(&identity.public_key_hex()[..8]);
+        let _ = std::fs::create_dir_all(&download_dir);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        Self { engine: FileEngine::new(partial_dir, download_dir), requests: HashMap::new(), followed: Default::default(), tx, manifests: Some(rx) }
+        let (fs_tx, fs_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                // Dispara apenas quando o SO reporta remoção, renomeação ou alteração em arquivo
+                if matches!(
+                    event.kind,
+                    EventKind::Remove(_) | EventKind::Modify(_) | EventKind::Any
+                ) {
+                    let _ = fs_tx.send(());
+                }
+            }
+        })
+        .ok();
+
+        let mut watched_dirs = HashSet::new();
+        let fs_events = if let Some(w) = watcher.as_mut() {
+            let canon = clean_watch_path(&download_dir);
+            if w.watch(&canon, RecursiveMode::NonRecursive).is_ok() {
+                watched_dirs.insert(canon);
+            }
+            Some(fs_rx)
+        } else {
+            None
+        };
+
+        Self {
+            engine: FileEngine::new(partial_dir, download_dir),
+            requests: HashMap::new(),
+            followed: Default::default(),
+            tx,
+            manifests: Some(rx),
+            watcher,
+            watched_dirs,
+            fs_events,
+        }
+    }
+
+    /// Garante que o diretório pai de um arquivo compartilhado/baixado esteja registrado no watcher do SO
+    pub(super) fn watch_file_parent(&mut self, file_path: &Path) {
+        let Some(parent) = file_path.parent() else { return };
+        let canon = clean_watch_path(parent);
+        if self.watched_dirs.contains(&canon) {
+            return;
+        }
+        if let Some(w) = self.watcher.as_mut() {
+            if w.watch(&canon, RecursiveMode::NonRecursive).is_ok() {
+                self.watched_dirs.insert(canon);
+            }
+        }
     }
 }
 
@@ -89,10 +155,20 @@ impl Runtime {
         match job.manifest {
             Ok(manifest) => {
                 let nick = self.nick.clone();
+                self.files.watch_file_parent(&job.path);
                 let (_, actions) = self.files.engine.share(manifest, job.path, job.key, job.target, &nick);
                 self.apply_file_actions(actions);
             }
             Err(e) => self.error(CoreError::Io { context: job.path.display().to_string(), message: e.to_string() }),
+        }
+    }
+
+    /// Chamado imediatamente quando o watcher de arquivos do SO (`notify`) avisa que um arquivo
+    /// monitorado foi deletado/movido no disco (sem polling).
+    pub(super) fn on_fs_watch_event(&mut self) {
+        let actions = self.files.engine.on_fs_change();
+        if !actions.is_empty() {
+            self.apply_file_actions(actions);
         }
     }
 
@@ -178,6 +254,9 @@ impl Runtime {
                 FileAction::Provide(cid) => self.node.dht_provide(swarm_files::dht_key(&cid)),
                 FileAction::FindProviders(cid) => self.node.dht_find(swarm_files::dht_key(&cid)),
                 FileAction::Event(event) => {
+                    if let FileEvent::Completed { path, .. } = &event {
+                        self.files.watch_file_parent(path);
+                    }
                     // Modo de teste: baixa tudo o que for oferecido
                     if let (true, FileEvent::Offered { cid, .. }) = (self.config.test_mode, &event) {
                         if let Ok(more) = self.files.engine.get(&cid.short(), Instant::now()) {

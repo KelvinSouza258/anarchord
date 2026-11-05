@@ -491,6 +491,15 @@ fn ui_events(event: &CoreEvent) -> Vec<UiEvent> {
                 FileEvent::Progress { name, progress: p, .. } => out.push(progress(name, (p * 100.0).min(99.9))),
                 FileEvent::Completed { name, .. } => out.push(progress(name, 100.0)),
                 FileEvent::Failed { name, .. } => out.push(progress(name, -1.0)),
+                FileEvent::LocalFileRemoved { cid, name, from } => {
+                    out.push(UiEvent::FileKnown(FileUiEntry {
+                        id: cid.short(),
+                        name: name.clone(),
+                        size: String::new(),
+                        from: from.clone(),
+                        state: FileUiState::Offered,
+                    }));
+                }
                 _ => {}
             }
         }
@@ -892,6 +901,22 @@ mod tests {
 
                 bob.type_line("/files");
                 bob.wait_log("Bob listar e já estar compartilhando", "notas.txt (586 KB) — compartilhando").await;
+
+                // Issue #64: Se Bob deletar o arquivo do disco, o watcher de eventos do SO (`notify`)
+                // avisa o Runtime imediatamente (sem polling!), atualiza o estado de Bob para Offered
+                // e permite que Bob baixe novamente da Alice com `/get <id>`!
+                std::fs::remove_file(bob.downloads.join("notas.txt")).unwrap();
+                bob.wait_log(
+                    "Watcher do SO detectar remoção de notas.txt em Bob",
+                    "'notas.txt' foi removido do disco local e deixou de ser compartilhado",
+                )
+                .await;
+                bob.seen.clear();
+                bob.type_line(&format!("/get {}", id));
+                bob.wait_log("Bob baixar notas.txt novamente da Alice após deletar do disco", "salvo em")
+                    .await;
+                assert_eq!(std::fs::read(bob.downloads.join("notas.txt")).unwrap(), data);
+
                 alice.type_line("/unshare notas.txt");
                 alice.wait_log("Alice parar de compartilhar", "não está mais sendo compartilhado").await;
                 alice.type_line("/files");

@@ -255,6 +255,12 @@ fn file(event: &FileEvent) -> Option<String> {
         FileEvent::Failed { name, reason, .. } => format!("❌ '{}': {}", name, reason),
         FileEvent::Dismissed { name } => format!("Oferta de '{}' recusada.", name),
         FileEvent::Unshared { name } => format!("📁 '{}' não está mais sendo compartilhado nem baixado.", name),
+        FileEvent::LocalFileRemoved { cid, name, from } => format!(
+            "🗑️ '{}' foi removido do disco local e deixou de ser compartilhado. Ainda disponível de {} com /get {}",
+            name,
+            from,
+            cid.short()
+        ),
     })
 }
 

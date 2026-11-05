@@ -54,6 +54,8 @@ pub enum FileEvent {
     Dismissed { name: String },
     /// Parou de compartilhar ou cancelou o download
     Unshared { name: String },
+    /// O arquivo local foi removido do disco: deixou de semear e voltou a ficar disponível para download (`Offered`)
+    LocalFileRemoved { cid: Cid, name: String, from: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,6 +144,7 @@ struct Entry {
     download: Option<Download>,
     peers: HashMap<PeerId, PeerInfo>,
     last_have_reply: Option<Instant>,
+    is_own_share: bool,
 }
 
 impl Entry {
@@ -189,6 +192,11 @@ impl FileEngine {
         Self { partial_dir, download_dir, files: HashMap::new() }
     }
 
+    /// Diretório onde os downloads completos são salvos (`download_dir`)
+    pub fn download_dir(&self) -> &std::path::Path {
+        &self.download_dir
+    }
+
     /// Retoma os downloads que ficaram pela metade na última execução
     pub fn resume(&mut self, now: Instant) -> Vec<FileAction> {
         let mut actions = Vec::new();
@@ -222,7 +230,7 @@ impl FileEngine {
             actions.push(FileAction::Event(FileEvent::Started { cid, name: offer.name.clone() }));
             self.files.insert(
                 cid,
-                Entry { offer, audience, store: Some(store), download: Some(Download::default()), peers, last_have_reply: None },
+                Entry { offer, audience, store: Some(store), download: Some(Download::default()), peers, last_have_reply: None, is_own_share: false },
             );
         }
         actions.extend(self.tick(now));
@@ -263,7 +271,7 @@ impl FileEngine {
             ShareTarget::Peer(peer) => actions.push(FileAction::Request { peer, request: FileRequest::Offer(offer.clone()) }),
         }
         let store = PieceStore::seed(manifest, path, key);
-        self.files.insert(cid, Entry { offer, audience, store: Some(store), download: None, peers: HashMap::new(), last_have_reply: None });
+        self.files.insert(cid, Entry { offer, audience, store: Some(store), download: None, peers: HashMap::new(), last_have_reply: None, is_own_share: true });
         (cid, actions)
     }
 
@@ -292,7 +300,7 @@ impl FileEngine {
                 peers.insert(source, PeerInfo { full: true, ..Default::default() });
                 self.files.insert(
                     cid,
-                    Entry { offer, audience: Audience::Topic(topic.to_string()), store: None, download: None, peers, last_have_reply: None },
+                    Entry { offer, audience: Audience::Topic(topic.to_string()), store: None, download: None, peers, last_have_reply: None, is_own_share: false },
                 );
                 vec![FileAction::Event(event)]
             }
@@ -360,7 +368,7 @@ impl FileEngine {
         let event = FileEvent::Offered { cid, name: offer.name.clone(), size: offer.size, from: offer.publisher_name.clone(), direct: true };
         let mut peers = HashMap::new();
         peers.insert(source, PeerInfo { full: true, ..Default::default() });
-        self.files.insert(cid, Entry { offer, audience: Audience::Peer(source), store: None, download: None, peers, last_have_reply: None });
+        self.files.insert(cid, Entry { offer, audience: Audience::Peer(source), store: None, download: None, peers, last_have_reply: None, is_own_share: false });
         vec![FileAction::Event(event)]
     }
 
@@ -372,11 +380,21 @@ impl FileEngine {
         if entry.download.is_some() {
             return Err(format!("'{}' já está sendo baixado", entry.offer.name));
         }
+        // Se tínhamos um store completo mas o arquivo foi deletado do disco antes do evento do watcher chegar,
+        // limpamos o store obsoleto para permitir baixar novamente na hora!
+        if entry.store.as_ref().is_some_and(|s| s.is_complete() && !s.path().exists()) {
+            entry.store = None;
+        }
         if entry.store.as_ref().is_some_and(|s| s.is_complete()) {
             return Err(format!("você já tem '{}'", entry.offer.name));
         }
         if entry.store.is_none() {
             entry.store = PieceStore::open(&partial_dir, &cid).ok();
+        }
+        for p in entry.peers.values_mut() {
+            p.asked_bitfield = false;
+            p.strikes = 0;
+            p.paused_until = None;
         }
         entry.download = Some(Download { last_want: Some(now), ..Default::default() });
         let mut actions = vec![FileAction::Event(FileEvent::Started { cid, name: entry.offer.name.clone() })];
@@ -397,14 +415,69 @@ impl FileEngine {
         Ok(self.files.remove(&cid).map(|e| e.offer.name).unwrap_or_default())
     }
 
-    /// Para de semear ou cancela o download (apagando o parcial). Retorna o nome.
+    /// Para de semear ou cancela o download (apagando o parcial).
+    /// - Se o arquivo foi publicado originalmente por nós mesmos (`is_own_share`), remove da lista completamente.
+    /// - Se o arquivo foi oferecido por outro par (ex.: Alice mandou para Bob e Bob baixou ou estava baixando),
+    ///   descarta apenas o `store`/`download` local de Bob e mantém a oferta (`Offered`) para que Bob possa
+    ///   baixar novamente da Alice quando quiser com `/get <id>`!
     pub fn unshare(&mut self, query: &str) -> Result<String, String> {
         let cid = self.find(query)?;
-        let entry = self.files.remove(&cid).expect("achado acima");
-        if let Some(store) = entry.store.filter(|s| !s.is_complete()) {
-            store.discard();
+        let entry = self.files.get(&cid).expect("achado acima");
+        if entry.is_own_share {
+            let entry = self.files.remove(&cid).expect("achado acima");
+            if let Some(store) = entry.store.filter(|s| !s.is_complete()) {
+                store.discard();
+            }
+            Ok(entry.offer.name)
+        } else {
+            let entry = self.files.get_mut(&cid).expect("achado acima");
+            entry.download = None;
+            if let Some(store) = entry.store.take() {
+                if !store.is_complete() {
+                    store.discard();
+                }
+            }
+            Ok(entry.offer.name.clone())
         }
-        Ok(entry.offer.name)
+    }
+
+    /// Orientado a eventos do SO (`notify`): chamado imediatamente quando o sistema operacional
+    /// notifica que arquivos foram removidos ou movidos no diretório de downloads/compartilhamento.
+    /// Sem precisar de polling, verifica quais arquivos semeados (`store.is_some()`) não existem mais
+    /// no disco, atualiza o estado interno, avisa a sala (bitfield vazio) e emite evento para a UI!
+    pub fn on_fs_change(&mut self) -> Vec<FileAction> {
+        let mut actions = Vec::new();
+        let mut remove_cids = Vec::new();
+        for (&cid, entry) in self.files.iter_mut() {
+            let Some(store) = &entry.store else { continue };
+            if store.is_complete() && !store.path().exists() {
+                let piece_count = store.manifest().piece_count();
+                let name = entry.offer.name.clone();
+                let from = entry.offer.publisher_name.clone();
+                let is_own_share = entry.is_own_share;
+                entry.store = None;
+                entry.download = None;
+                if let Some(topic) = entry.topic() {
+                    actions.push(FileAction::Publish {
+                        topic: topic.to_string(),
+                        message: SwarmMessage::Have {
+                            manifest: cid,
+                            have: super::store::Bitfield::new(piece_count),
+                        },
+                    });
+                }
+                if is_own_share {
+                    remove_cids.push(cid);
+                    actions.push(FileAction::Event(FileEvent::Unshared { name }));
+                } else {
+                    actions.push(FileAction::Event(FileEvent::LocalFileRemoved { cid, name, from }));
+                }
+            }
+        }
+        for cid in remove_cids {
+            self.files.remove(&cid);
+        }
+        actions
     }
 
     pub fn list(&self, now: Instant) -> Vec<FileSummary> {
@@ -421,7 +494,13 @@ impl FileEngine {
                         progress: store.as_ref().map_or(0.0, |s| s.progress()),
                         peers: entry.known_peers(now),
                     },
-                    (None, Some(_)) => FileState::Seeding,
+                    (None, Some(store)) => {
+                        if store.is_complete() && !store.path().exists() {
+                            FileState::Offered
+                        } else {
+                            FileState::Seeding
+                        }
+                    }
                     (None, None) => FileState::Offered,
                 },
             })
@@ -1021,5 +1100,49 @@ mod tests {
         assert!(engine.list(Instant::now()).is_empty());
         assert_eq!(net.nodes[0].engine.unshare(&cid.short()).unwrap(), "filme.mkv");
         assert!(net.nodes[0].engine.list(Instant::now()).is_empty());
+    }
+
+    /// Issue #64: Quando Bob baixa um arquivo da Alice (e passa a semear), se Bob deletar o arquivo
+    /// do disco (notificado por `on_fs_change`) ou executar `/unshare <id>`, a oferta original da Alice
+    /// continua preservada como `Offered` e Bob pode baixar novamente da Alice com `/get <id>`.
+    #[test]
+    fn test_redownload_after_deleting_file_on_disk_or_unsharing() {
+        let mut net = Net::new(2);
+        let (cid, data) = net.share(0, 3, None, ShareTarget::Topic(TOPIC.into()));
+
+        // 1) Bob baixa o arquivo da Alice pela 1ª vez -> vira Seeding
+        net.get(1, &cid);
+        net.settle(|n| n.completed(1).is_some());
+        let first_path = net.completed(1).unwrap();
+        assert_eq!(std::fs::read(&first_path).unwrap(), data);
+        assert_eq!(net.nodes[1].engine.list(net.now)[0].state, FileState::Seeding);
+
+        // 2) Bob deleta o arquivo no disco e o watcher do SO dispara `on_fs_change`:
+        // o estado em Bob muda imediatamente para `Offered` (emite `LocalFileRemoved` + `Have` zerado)
+        std::fs::remove_file(&first_path).unwrap();
+        let fs_actions = net.nodes[1].engine.on_fs_change();
+        assert!(
+            fs_actions.iter().any(|a| matches!(a, FileAction::Event(FileEvent::LocalFileRemoved { name, .. }) if name == "filme.mkv")),
+            "deveria emitir LocalFileRemoved ao detectar remoção no disco"
+        );
+        net.run(1, fs_actions);
+        assert_eq!(net.nodes[1].engine.list(net.now)[0].state, FileState::Offered);
+
+        // 3) Como Alice continua compartilhando, Bob pode fazer `/get` de novo e baixar o arquivo completo!
+        net.nodes[1].events.clear();
+        net.get(1, &cid);
+        net.settle(|n| n.completed(1).is_some());
+        let second_path = net.completed(1).unwrap();
+        assert_eq!(std::fs::read(&second_path).unwrap(), data);
+        assert_eq!(net.nodes[1].engine.list(net.now)[0].state, FileState::Seeding);
+
+        // 4) E se Bob rodar `/unshare <id>`, ele para de semear mas preserva a oferta da Alice (`Offered`),
+        // podendo baixar uma 3ª vez quando quiser!
+        assert_eq!(net.nodes[1].engine.unshare(&cid.short()).unwrap(), "filme.mkv");
+        assert_eq!(net.nodes[1].engine.list(net.now)[0].state, FileState::Offered);
+        net.nodes[1].events.clear();
+        net.get(1, &cid);
+        net.settle(|n| n.completed(1).is_some());
+        assert_eq!(std::fs::read(net.completed(1).unwrap()).unwrap(), data);
     }
 }
