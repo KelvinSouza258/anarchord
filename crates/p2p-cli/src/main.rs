@@ -439,18 +439,24 @@ fn ui_events(event: &CoreEvent) -> Vec<UiEvent> {
         CoreEvent::DmOpened { peer_name, channel, .. } => {
             out.push(UiEvent::DmOpened { peer_name: peer_name.clone(), channel: channel.clone() })
         }
-        CoreEvent::DirectMessage { peer_name, author, text, offline_delivery, .. } => out.push(UiEvent::DirectMessage {
+        CoreEvent::DirectMessage { peer_name, author, text, timestamp, offline_delivery, .. } => out.push(UiEvent::DirectMessage {
             peer_name: peer_name.clone(),
             author: author.clone(),
             text: text.clone(),
+            timestamp: *timestamp,
             offline_delivery: *offline_delivery,
         }),
         CoreEvent::ChannelEntered { channel, .. } => out.push(UiEvent::ChannelChanged(channel.clone())),
         CoreEvent::ChannelMembers { channel, members } => {
             out.push(UiEvent::ChannelMembers { channel: channel.clone(), members: members.clone() })
         }
-        CoreEvent::ChatMessage { channel, author, text, .. } => {
-            out.push(UiEvent::ChatMessage { channel: channel.clone(), author: author.clone(), text: text.clone() })
+        CoreEvent::ChatMessage { channel, author, text, timestamp, .. } => {
+            out.push(UiEvent::ChatMessage {
+                channel: channel.clone(),
+                author: author.clone(),
+                text: text.clone(),
+                timestamp: *timestamp,
+            })
         }
         CoreEvent::Voice(VoiceEvent::Joined(room)) => out.push(UiEvent::VoiceChannelChanged(Some(room.clone()))),
         CoreEvent::Voice(VoiceEvent::Left(_)) => out.push(UiEvent::VoiceChannelChanged(None)),

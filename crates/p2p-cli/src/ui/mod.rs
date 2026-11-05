@@ -29,11 +29,12 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 /// Eventos enviados pelo backend P2P para atualizar a TUI
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    /// Mensagem de chat recebida
+    /// Mensagem de chat recebida (com timestamp cronológico de envio em segundos Unix)
     ChatMessage {
         channel: String,
         author: String,
         text: String,
+        timestamp: u64,
     },
     /// Log ou notificação do sistema
     SystemLog(String),
@@ -56,11 +57,12 @@ pub enum UiEvent {
     ServersChanged(Vec<ServerEntry>),
     /// Amigos conhecidos e seu status online/offline
     FriendsChanged(Vec<FriendUiEntry>),
-    /// Conversa direta (DM) recebida ou enviada
+    /// Conversa direta (DM) recebida ou enviada (com timestamp cronológico de envio em segundos Unix)
     DirectMessage {
         peer_name: String,
         author: String,
         text: String,
+        timestamp: u64,
         offline_delivery: bool,
     },
     /// Conversa direta (DM) aberta como canal ativo (`@Nome`)
@@ -107,8 +109,12 @@ pub struct TerminalUi {
     current_voice_channel: Option<String>,
     /// Barra de entrada (cursor, histórico, Tab)
     editor: LineEditor,
-    /// Aba Chat: só conversas
+    /// Aba Chat: só conversas (mantidas em ordem cronológica por `chat_entries`)
     messages: Vec<String>,
+    /// Chaves de ordenação `(timestamp, seq)` paralelas a `messages`
+    chat_entries: Vec<(u64, u64)>,
+    /// Contador monotônico de chegada para desempate estável no mesmo segundo
+    next_message_seq: u64,
     /// Aba Sistema: notificações do core (conexões, DHT, sincronização, avisos)
     system_messages: Vec<String>,
     active_tab: Tab,
@@ -162,6 +168,8 @@ impl TerminalUi {
                 "🚀 Bem-vindo ao Anarchord P2P (100% Descentralizado)!".to_string(),
                 "💡 F1 abre o menu · clique num membro ou canal para ver as opções · /help lista os comandos".to_string(),
             ],
+            chat_entries: vec![(0, 0), (0, 1)],
+            next_message_seq: 2,
             system_messages: Vec::new(),
             active_tab: Tab::Chat,
             system_unread: 0,
@@ -240,11 +248,22 @@ impl TerminalUi {
         }
     }
 
+    /// Insere uma mensagem de chat ou DM mantendo a lista `messages` ordenada
+    /// cronologicamente pelo `timestamp` de envio (e pela ordem de chegada `seq` em caso de empate).
+    fn push_chat_message(&mut self, timestamp: u64, text: String) {
+        let seq = self.next_message_seq;
+        self.next_message_seq += 1;
+        let key = (timestamp, seq);
+        let idx = self.chat_entries.partition_point(|&k| k <= key);
+        self.chat_entries.insert(idx, key);
+        self.messages.insert(idx, text);
+    }
+
     /// Aplica um evento da malha P2P ao estado da UI (separado do loop para ser testável)
     fn handle_event(&mut self, evt: UiEvent) {
         match evt {
-            UiEvent::ChatMessage { channel, author, text } => {
-                self.messages.push(format!("[#{}] {}: {}", channel, author, text));
+            UiEvent::ChatMessage { channel, author, text, timestamp } => {
+                self.push_chat_message(timestamp, format!("[#{}] {}: {}", channel, author, text));
                 self.channel_members.entry(channel.clone()).or_default().insert(author);
             }
             UiEvent::ChannelChanged(new_channel) => {
@@ -283,10 +302,10 @@ impl TerminalUi {
             UiEvent::FriendsChanged(friends) => {
                 self.friends = friends;
             }
-            UiEvent::DirectMessage { peer_name, author, text, offline_delivery } => {
+            UiEvent::DirectMessage { peer_name, author, text, timestamp, offline_delivery } => {
                 let dm_chan = format!("@{}", peer_name);
                 let tag = if offline_delivery { " [📬 Offline E2EE]" } else { " [🔒 E2EE]" };
-                self.messages.push(format!("[{}{}] {}: {}", dm_chan, tag, author, text));
+                self.push_chat_message(timestamp, format!("[{}{}] {}: {}", dm_chan, tag, author, text));
                 let set = self.channel_members.entry(dm_chan).or_default();
                 set.insert(self.my_nick.clone());
                 set.insert(peer_name);
@@ -552,7 +571,11 @@ impl TerminalUi {
             text => {
                 // Em canais normais fazemos eco imediato; em DMs (@Amigo), o Core emite DirectMessage de volta
                 if !self.current_channel.starts_with('@') {
-                    self.messages.push(format!("[#{}] {}: {}", self.current_channel, self.my_nick, text));
+                    let now_ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    self.push_chat_message(now_ts, format!("[#{}] {}: {}", self.current_channel, self.my_nick, text));
                 }
                 vec![UiAction::SendMessage(text.to_string())]
             }
@@ -1159,6 +1182,7 @@ mod tests {
             channel: "geral".to_string(),
             author: "Bob".to_string(),
             text: "olá mesh".to_string(),
+            timestamp: 1_700_000_000,
         });
 
         let screen = render(&mut ui);
@@ -1408,6 +1432,7 @@ mod tests {
             peer_name: "Bobby".into(),
             author: "Bobby".into(),
             text: "oi da mailbox!".into(),
+            timestamp: 1_700_000_000,
             offline_delivery: true,
         });
         let screen = render(&mut ui);
@@ -1490,7 +1515,12 @@ mod tests {
     fn test_chat_scrolls_with_page_up_and_title_shows_channel() {
         let mut ui = ui_for("Alice");
         for i in 0..100 {
-            ui.handle_event(UiEvent::ChatMessage { channel: "geral".into(), author: "Bob".into(), text: format!("mensagem {}", i) });
+            ui.handle_event(UiEvent::ChatMessage {
+                channel: "geral".into(),
+                author: "Bob".into(),
+                text: format!("mensagem {}", i),
+                timestamp: 1_700_000_000 + i as u64,
+            });
         }
         let screen = render(&mut ui);
         assert!(screen.contains("mensagem 99") && !screen.contains("mensagem 10 "), "{}", screen);
@@ -1510,7 +1540,12 @@ mod tests {
         let mut ui = ui_for("Alice");
         ui.handle_event(UiEvent::SystemLog("Endereço de escuta: /ip4/1.2.3.4".into()));
         ui.handle_event(UiEvent::SystemLog("📜 Rust Guild sincronizado".into()));
-        ui.handle_event(UiEvent::ChatMessage { channel: "geral".into(), author: "Bob".into(), text: "oi".into() });
+        ui.handle_event(UiEvent::ChatMessage {
+            channel: "geral".into(),
+            author: "Bob".into(),
+            text: "oi".into(),
+            timestamp: 1_700_000_000,
+        });
 
         let screen = render(&mut ui);
         assert!(screen.contains("Bob: oi"), "{}", screen);
@@ -1567,5 +1602,61 @@ mod tests {
         assert!(render(&mut ui).contains("evento do core"));
         click_at(&mut ui, x + 3);
         assert_eq!(ui.active_tab, Tab::Chat);
+    }
+
+    /// Issue #62: Mensagens de chat e DMs que chegam fora de ordem (por latência do Gossipsub
+    /// ou entrega tardia via Guardião da Mailbox Offline) são reordenadas automaticamente na TUI
+    /// pela ordem cronológica de envio (`timestamp`), mantendo estabilidade (`seq`) no mesmo segundo.
+    #[test]
+    fn test_messages_reordered_chronologically_by_send_timestamp() {
+        let mut ui = ui_for("Alice");
+
+        // 1) Chega primeiro uma mensagem mais recente enviada em t = 100
+        ui.handle_event(UiEvent::ChatMessage {
+            channel: "geral".into(),
+            author: "Bob".into(),
+            text: "terceira (enviada em t=100, chegou primeiro)".into(),
+            timestamp: 1_700_000_100,
+        });
+
+        // 2) Depois chega uma DM da Mailbox Offline que havia sido enviada antes, em t = 80
+        ui.handle_event(UiEvent::DirectMessage {
+            peer_name: "Carol".into(),
+            author: "Carol".into(),
+            text: "primeira (enviada em t=80 via guardião, chegou atrasada)".into(),
+            timestamp: 1_700_000_080,
+            offline_delivery: true,
+        });
+
+        // 3) Depois chegam duas mensagens enviadas no mesmo segundo intermediário t = 90
+        ui.handle_event(UiEvent::ChatMessage {
+            channel: "geral".into(),
+            author: "Dave".into(),
+            text: "segunda A (enviada em t=90, 1a no mesmo segundo)".into(),
+            timestamp: 1_700_000_090,
+        });
+        ui.handle_event(UiEvent::DirectMessage {
+            peer_name: "Bob".into(),
+            author: "Bob".into(),
+            text: "segunda B (enviada em t=90, 2a no mesmo segundo)".into(),
+            timestamp: 1_700_000_090,
+            offline_delivery: false,
+        });
+
+        // O banner inicial (timestamp = 0) permanece no topo (índices 0 e 1),
+        // seguido pelas mensagens em ordem cronológica estrita: t=80 -> t=90 (A) -> t=90 (B) -> t=100
+        assert!(ui.messages[0].contains("Bem-vindo ao Anarchord"));
+        assert!(ui.messages[2].contains("primeira (enviada em t=80"));
+        assert!(ui.messages[3].contains("segunda A (enviada em t=90, 1a"));
+        assert!(ui.messages[4].contains("segunda B (enviada em t=90, 2a"));
+        assert!(ui.messages[5].contains("terceira (enviada em t=100"));
+
+        // Verifica também na tela renderizada que a posição vertical (linha) respeita a ordem de envio
+        let screen = render(&mut ui);
+        let pos_t80 = screen.find("primeira (enviada em t=80").expect("t=80 na tela");
+        let pos_t90_a = screen.find("segunda A (enviada em t=90").expect("t=90 A na tela");
+        let pos_t90_b = screen.find("segunda B (enviada em t=90").expect("t=90 B na tela");
+        let pos_t100 = screen.find("terceira (enviada em t=100").expect("t=100 na tela");
+        assert!(pos_t80 < pos_t90_a && pos_t90_a < pos_t90_b && pos_t90_b < pos_t100, "tela fora de ordem:\n{}", screen);
     }
 }
