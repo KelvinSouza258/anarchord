@@ -88,6 +88,8 @@ pub enum ChatAction {
     SendDm { target: String, text: String, suggested_ttl: Option<u64> },
     ShowConfig,
     SetConfig { key: String, value: String },
+    ListFirewall,
+    UnblockPeer(String),
     ScreenStart { monitor_idx: usize, quality: u32 },
     ScreenStop,
     ScreenWatch(String),
@@ -240,6 +242,12 @@ pub fn parse_user_input(input: &str) -> ChatAction {
                 return ChatAction::SetConfig { key: key.to_string(), value: value.to_string() };
             }
         }
+    }
+    if trimmed == "/firewall" || trimmed == "/firewall list" {
+        return ChatAction::ListFirewall;
+    }
+    if let Some(target) = trimmed.strip_prefix("/firewall unblock ").map(str::trim).filter(|t| !t.is_empty()) {
+        return ChatAction::UnblockPeer(target.to_string());
     }
     ChatAction::SendTextMessage(trimmed.to_string())
 }
@@ -491,6 +499,8 @@ impl ChatAction {
             ChatAction::SendDm { target, text, suggested_ttl } => CoreCommand::SendDm { target, text, suggested_ttl },
             ChatAction::ShowConfig => CoreCommand::ShowConfig,
             ChatAction::SetConfig { key, value } => CoreCommand::SetConfig { key, value },
+            ChatAction::ListFirewall => CoreCommand::ListFirewall,
+            ChatAction::UnblockPeer(target) => CoreCommand::UnblockPeer { target },
             ChatAction::ScreenStart { monitor_idx, quality } => CoreCommand::StartScreenShare { monitor: monitor_idx, quality },
             ChatAction::ScreenStop => CoreCommand::StopScreenShare,
             ChatAction::ScreenList => CoreCommand::ListScreens,
@@ -597,6 +607,8 @@ mod tests {
             parse_user_input("/config set mailbox.max_ttl_days 14"),
             ChatAction::SetConfig { key: "mailbox.max_ttl_days".into(), value: "14".into() }
         );
+        assert_eq!(parse_user_input("/firewall"), ChatAction::ListFirewall);
+        assert_eq!(parse_user_input("/firewall unblock Alice"), ChatAction::UnblockPeer("Alice".into()));
     }
 
     /// Amigo adicionado pela TUI aparece offline e passa a online quando o par conecta
@@ -905,6 +917,30 @@ mod tests {
                     )
                 })
                 .await;
+
+                // 4) Teste do Firewall Assimétrico + Mensagem de Cortesia:
+                // Bob NÃO está na lista de amigos da Carol. Se Bob tentar inundar Carol (> 3 msg/min para desconhecido),
+                // Carol bloqueia Bob na 4ª mensagem e envia 1 aviso automático de cortesia para o Bob!
+                for i in 1..=4 {
+                    bob.type_line(&format!("/dm Carol oi spam {}", i));
+                }
+                carol
+                    .wait_log("Carol registrar bloqueio de Bob no Firewall", "Firewall: Bob")
+                    .await;
+                bob.wait("Bob receber mensagem de cortesia do Firewall da Carol", |e| {
+                    matches!(
+                        e,
+                        UiEvent::DirectMessage { author, text, .. }
+                        if author == "Carol" && text.contains("Aviso Automático do Firewall de Carol")
+                    )
+                })
+                .await;
+
+                // Carol pode listar no /firewall e desbloquear o Bob
+                carol.type_line("/firewall");
+                carol.wait_log("Carol listar bloqueio ativo", "Pares bloqueados (1)").await;
+                carol.type_line("/firewall unblock Bob");
+                carol.wait_log("Carol desbloquear Bob", "foi desbloqueado").await;
             })
             .await;
     }

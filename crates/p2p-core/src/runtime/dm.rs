@@ -1,11 +1,11 @@
 //! Runtime de Mensagens Diretas (DM 1:1 E2EE), Sessões Efêmeras e Mailbox Offline.
 
 use super::{CoreError, CoreEvent, Runtime};
-use crate::community::short_id;
+use crate::community::{format_duration, short_id};
 use crate::config::NodeConfig;
 use crate::dm::{
-    dm_topic, DirectMessageEnvelope, DmPeerSession, DmWireMessage, EphemeralKeyOffer,
-    MailboxMessage, MailboxStore, ReceiptAck, StoredEnvelope, MAILBOX_TOPIC,
+    dm_topic, DirectMessageEnvelope, DmFirewall, DmFirewallVerdict, DmPeerSession, DmWireMessage,
+    EphemeralKeyOffer, MailboxMessage, MailboxStore, ReceiptAck, StoredEnvelope, MAILBOX_TOPIC,
 };
 use crate::wire;
 use libp2p::gossipsub::IdentTopic;
@@ -22,6 +22,8 @@ pub(super) struct DmState {
     pub subscribed_topics: HashSet<String>,
     /// Se o usuário está com uma conversa DM aberta como canal ativo: pubkey (hex lowercase) do amigo
     pub active_dm_peer: Option<String>,
+    /// Firewall de aplicação local para DMs (políticas diferenciadas para Amigos vs Desconhecidos)
+    pub firewall: DmFirewall,
 }
 
 impl DmState {
@@ -35,6 +37,7 @@ impl DmState {
             sessions: HashMap::new(),
             subscribed_topics: HashSet::new(),
             active_dm_peer: None,
+            firewall: DmFirewall::new(),
         }
     }
 }
@@ -301,6 +304,12 @@ impl Runtime {
                     return;
                 }
                 let sender_pk = envelope.sender_pubkey.to_lowercase();
+                let now = super::now_secs();
+                let is_my_friend = self
+                    .identity
+                    .get_friends()
+                    .iter()
+                    .any(|f| f.public_key.eq_ignore_ascii_case(&sender_pk));
                 let session_key = self
                     .dm
                     .sessions
@@ -318,15 +327,52 @@ impl Runtime {
                             .find(|f| f.public_key.eq_ignore_ascii_case(&sender_pk))
                             .and_then(|f| f.alias.clone())
                             .unwrap_or_else(|| payload.sender_nick.clone());
-                        self.emit(CoreEvent::DirectMessage {
-                            peer_pubkey: sender_pk,
-                            peer_name,
-                            author: payload.sender_nick,
-                            author_pubkey: payload.sender_pubkey,
-                            text: payload.text,
-                            timestamp: payload.timestamp,
-                            offline_delivery: false,
-                        });
+
+                        // Verifica no Firewall de DMs (política assimétrica: Carol decide se Alice é amiga DELA)
+                        match self.dm.firewall.check_incoming_dm(
+                            &sender_pk,
+                            is_my_friend,
+                            payload.text.len(),
+                            false,
+                            &self.dm.node_config.dm,
+                            now,
+                        ) {
+                            DmFirewallVerdict::Allowed => {
+                                self.emit(CoreEvent::DirectMessage {
+                                    peer_pubkey: sender_pk,
+                                    peer_name,
+                                    author: payload.sender_nick,
+                                    author_pubkey: payload.sender_pubkey,
+                                    text: payload.text,
+                                    timestamp: payload.timestamp,
+                                    offline_delivery: false,
+                                });
+                            }
+                            DmFirewallVerdict::DroppedSilently { .. } => {
+                                tracing::debug!("DM de {} descartada silenciosamente pelo firewall", short_id(&sender_pk));
+                            }
+                            DmFirewallVerdict::NewlyBlocked {
+                                reason,
+                                duration_secs,
+                                blocked_until,
+                                offense_level,
+                                send_courtesy,
+                            } => {
+                                self.emit(CoreEvent::PeerBlocked {
+                                    pubkey: sender_pk.clone(),
+                                    peer_name,
+                                    is_friend: is_my_friend,
+                                    reason: reason.clone(),
+                                    duration_secs,
+                                    blocked_until,
+                                    offense_level,
+                                    courtesy_sent: send_courtesy,
+                                });
+                                if send_courtesy {
+                                    self.send_courtesy_block_notice(&sender_pk, &reason, duration_secs, now);
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::debug!("DM E2EE descartada de {}: {}", short_id(&sender_pk), e);
@@ -414,6 +460,11 @@ impl Runtime {
         match envelope.unseal_and_verify(&self.identity) {
             Ok(payload) => {
                 let sender_pk = payload.sender_pubkey.to_lowercase();
+                let is_my_friend = self
+                    .identity
+                    .get_friends()
+                    .iter()
+                    .any(|f| f.public_key.eq_ignore_ascii_case(&sender_pk));
                 let peer_name = self
                     .identity
                     .get_friends()
@@ -421,20 +472,87 @@ impl Runtime {
                     .find(|f| f.public_key.eq_ignore_ascii_case(&sender_pk))
                     .and_then(|f| f.alias.clone())
                     .unwrap_or_else(|| payload.sender_nick.clone());
-                self.emit(CoreEvent::DirectMessage {
-                    peer_pubkey: sender_pk,
-                    peer_name,
-                    author: payload.sender_nick,
-                    author_pubkey: payload.sender_pubkey,
-                    text: payload.text,
-                    timestamp: payload.timestamp,
-                    offline_delivery: true,
-                });
+
+                // Aplica o Firewall também para envelopes offline (evita que desconhecidos inundem a Carol via guardiões)
+                match self.dm.firewall.check_incoming_dm(
+                    &sender_pk,
+                    is_my_friend,
+                    payload.text.len(),
+                    true,
+                    &self.dm.node_config.dm,
+                    now,
+                ) {
+                    DmFirewallVerdict::Allowed => {
+                        self.emit(CoreEvent::DirectMessage {
+                            peer_pubkey: sender_pk,
+                            peer_name,
+                            author: payload.sender_nick,
+                            author_pubkey: payload.sender_pubkey,
+                            text: payload.text,
+                            timestamp: payload.timestamp,
+                            offline_delivery: true,
+                        });
+                    }
+                    DmFirewallVerdict::DroppedSilently { .. } => {
+                        tracing::debug!("Envelope offline de {} descartado pelo firewall", short_id(&sender_pk));
+                    }
+                    DmFirewallVerdict::NewlyBlocked {
+                        reason,
+                        duration_secs,
+                        blocked_until,
+                        offense_level,
+                        send_courtesy,
+                    } => {
+                        self.emit(CoreEvent::PeerBlocked {
+                            pubkey: sender_pk.clone(),
+                            peer_name,
+                            is_friend: is_my_friend,
+                            reason: reason.clone(),
+                            duration_secs,
+                            blocked_until,
+                            offense_level,
+                            courtesy_sent: send_courtesy,
+                        });
+                        if send_courtesy && self.is_pubkey_online(&sender_pk) {
+                            self.send_courtesy_block_notice(&sender_pk, &reason, duration_secs, now);
+                        }
+                    }
+                }
+                // Mesmo se bloqueado, envia ACK para que os guardiões limpem o envelope do disco deles
                 self.publish_mailbox_ack(ack);
             }
             Err(e) => {
                 tracing::debug!("Envelope offline inválido descartado: {}", e);
             }
+        }
+    }
+
+    /// Envia 1 única mensagem de cortesia E2EE avisando o remetente de que ele foi bloqueado temporariamente pelo firewall local
+    fn send_courtesy_block_notice(&mut self, recipient_pubkey: &str, reason: &str, duration_secs: u64, now: u64) {
+        let topic_str = self.subscribe_dm_with(recipient_pubkey);
+        let courtesy_text = format!(
+            "🛡️ [Aviso Automático do Firewall de {}]: Suas mensagens diretas foram temporariamente limitadas por {} ({}). Caso seja um engano, aguarde ou peça para {} te adicionar aos amigos.",
+            self.nick,
+            format_duration(Some(duration_secs)),
+            reason,
+            self.nick
+        );
+        // Usa Sealed Box direto (None para session_key) para que mesmo um desconhecido sem handshake de sessão completo decifre na hora!
+        if let Ok(envelope) = DirectMessageEnvelope::seal(
+            &self.identity,
+            recipient_pubkey,
+            &courtesy_text,
+            now,
+            None,
+        ) {
+            let wire_msg = DmWireMessage::Message(envelope);
+            let bytes = wire::encode(&wire_msg);
+            let _ = self
+                .node
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(IdentTopic::new(topic_str), bytes);
         }
     }
 
@@ -541,6 +659,26 @@ impl Runtime {
                 self.show_config();
             }
             Err(e) => self.error(CoreError::Config(e.to_string())),
+        }
+    }
+
+    /// Lista os bloqueios ativos no Firewall local (`/firewall`)
+    pub(super) fn list_firewall(&self) {
+        let blocks = self.dm.firewall.active_blocks(super::now_secs());
+        self.emit(CoreEvent::FirewallStatus(blocks));
+    }
+
+    /// Desbloqueia manualmente um par no Firewall local (`/firewall unblock <par>`)
+    pub(super) fn unblock_peer(&mut self, target: &str) {
+        let pubkey = self
+            .resolve_dm_target(target)
+            .map(|(pk, _)| pk)
+            .unwrap_or_else(|| target.trim().to_lowercase());
+        let peer_name = self.friendly_name(&pubkey);
+        if self.dm.firewall.unblock(&pubkey) {
+            self.emit(CoreEvent::PeerUnblocked { pubkey, peer_name });
+        } else {
+            self.error(CoreError::Friend(format!("'{}' não está bloqueado no firewall", target)));
         }
     }
 }

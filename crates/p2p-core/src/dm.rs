@@ -2,7 +2,7 @@
 //! (X25519 + HKDF-SHA256 + ChaCha20-Poly1305), Sessões Efêmeras (Forward Secrecy)
 //! e Mailbox Offline Descentralizada (Store-and-Forward via Guardiões Amigos).
 
-use crate::config::NodeConfig;
+use crate::config::{DmPolicyConfig, NodeConfig};
 use crate::identity::{hex_decode_32, verify_signature_hex, UserIdentity};
 use crate::wire;
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -865,6 +865,252 @@ impl MailboxStore {
     }
 }
 
+// ============================================================================
+// FIREWALL ASSIMÉTRICO DE DMs (AMIGOS vs DESCONHECIDOS) COM BLOQUEIO PROGRESSIVO
+// ============================================================================
+
+/// Estado de um remetente monitorado pelo Firewall de DMs
+#[derive(Clone, Debug, Default)]
+struct SenderRateState {
+    /// Timestamps UNIX de DMs online recebidas nos últimos 60s
+    online_timestamps: Vec<u64>,
+    /// Timestamps UNIX de DMs offline (Mailbox) abertas na última 1h (3600s)
+    offline_timestamps: Vec<u64>,
+    /// Nível de reincidência de infrações (1 = 60s, 2 = 300s, 3 = 1800s, 4+ = 86400s)
+    offense_level: u32,
+    /// Timestamp UNIX da última infração (para decaimento por bom comportamento)
+    last_offense_at: u64,
+    /// Se estiver bloqueado, até qual timestamp UNIX o bloqueio vale
+    blocked_until: Option<u64>,
+    /// Motivo do bloqueio atual
+    block_reason: String,
+    /// Se já enviamos aviso de cortesia para o bloqueio atual (evita ping-pong / amplificação)
+    courtesy_sent_for_current_block: bool,
+}
+
+/// Entrada resumida de um par bloqueado pelo Firewall
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FirewallBlockEntry {
+    pub pubkey: String,
+    pub reason: String,
+    pub blocked_until: u64,
+    pub offense_level: u32,
+}
+
+/// Resultado da inspeção de uma DM pelo Firewall local da Carol
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DmFirewallVerdict {
+    /// Mensagem permitida
+    Allowed,
+    /// Remetente já estava bloqueado ou o modo `allow_strangers = false` recusou silenciosamente
+    DroppedSilently { reason: String },
+    /// Remetente acabou de violar um limite e entrou em bloqueio progressivo!
+    /// `send_courtesy`: true se devemos enviar 1 única mensagem de cortesia avisando do bloqueio.
+    NewlyBlocked {
+        reason: String,
+        duration_secs: u64,
+        blocked_until: u64,
+        offense_level: u32,
+        send_courtesy: bool,
+    },
+}
+
+/// Firewall local de DMs: aplica políticas distintas para Amigos (na sua lista local) vs Desconhecidos
+#[derive(Default)]
+pub struct DmFirewall {
+    peers: HashMap<String, SenderRateState>,
+}
+
+impl DmFirewall {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Calcula a duração do bloqueio progressivo segundo o nível de reincidência:
+    /// Nível 1 = 1 min (60s), Nível 2 = 5 min (300s), Nível 3 = 30 min (1800s), Nível 4+ = 24h (86400s)
+    pub fn block_duration_for_level(level: u32) -> u64 {
+        match level {
+            0 | 1 => 60,
+            2 => 300,
+            3 => 1_800,
+            _ => 86_400,
+        }
+    }
+
+    /// Verifica se uma DM (online ou offline) vinda de `sender_pubkey` deve ser aceita ou bloqueada.
+    /// Importante: `is_my_friend` indica se **este nó (Carol)** tem `sender_pubkey` (Alice) na sua lista de amigos!
+    pub fn check_incoming_dm(
+        &mut self,
+        sender_pubkey: &str,
+        is_my_friend: bool,
+        message_len_bytes: usize,
+        is_offline_envelope: bool,
+        policy: &DmPolicyConfig,
+        now: u64,
+    ) -> DmFirewallVerdict {
+        let pk = sender_pubkey.trim().to_lowercase();
+        let state = self.peers.entry(pk).or_default();
+
+        // 1. Verifica se já está bloqueado ativamente
+        if let Some(until) = state.blocked_until {
+            if now < until {
+                return DmFirewallVerdict::DroppedSilently {
+                    reason: state.block_reason.clone(),
+                };
+            } else {
+                // Bloqueio expirou! Limpa janelas e libera
+                state.blocked_until = None;
+                state.courtesy_sent_for_current_block = false;
+                state.online_timestamps.clear();
+                state.offline_timestamps.clear();
+            }
+        }
+
+        // Decaimento por bom comportamento: se passou mais de 1h sem infração, reduz o nível de reincidência
+        if state.offense_level > 0 && now.saturating_sub(state.last_offense_at) >= 3_600 {
+            let hours_clean = (now.saturating_sub(state.last_offense_at) / 3_600) as u32;
+            state.offense_level = state.offense_level.saturating_sub(hours_clean);
+        }
+
+        // 2. Se não é amigo nosso e `allow_strangers == false`, recusa
+        if !is_my_friend && !policy.allow_strangers {
+            return Self::trigger_block(
+                state,
+                "DMs de desconhecidos desativadas (apenas amigos)".to_string(),
+                policy.send_courtesy_notice,
+                now,
+            );
+        }
+
+        // 3. Limite de tamanho da mensagem (diferenciado entre Amigo e Desconhecido)
+        let max_bytes = if is_my_friend {
+            policy.friend_max_message_bytes
+        } else {
+            policy.stranger_max_message_bytes
+        };
+        if message_len_bytes > max_bytes {
+            let role = if is_my_friend { "amigo" } else { "desconhecido" };
+            return Self::trigger_block(
+                state,
+                format!("mensagem excedeu tamanho máximo para {} ({} > {} bytes)", role, message_len_bytes, max_bytes),
+                policy.send_courtesy_notice,
+                now,
+            );
+        }
+
+        // 4. Limite de taxa em janela deslizante
+        if is_offline_envelope && !is_my_friend {
+            // Janela de 1 hora (3600s) para envelopes offline de desconhecidos
+            state.offline_timestamps.retain(|&t| now.saturating_sub(t) < 3_600);
+            if state.offline_timestamps.len() as u32 >= policy.stranger_offline_limit_per_hour {
+                return Self::trigger_block(
+                    state,
+                    format!(
+                        "limite de DMs offline de desconhecido excedido ({}/h)",
+                        policy.stranger_offline_limit_per_hour
+                    ),
+                    policy.send_courtesy_notice,
+                    now,
+                );
+            }
+            state.offline_timestamps.push(now);
+        } else {
+            // Janela de 60 segundos para DMs
+            state.online_timestamps.retain(|&t| now.saturating_sub(t) < 60);
+            let max_per_min = if is_my_friend {
+                policy.friend_rate_limit_per_min
+            } else {
+                policy.stranger_rate_limit_per_min
+            };
+            if state.online_timestamps.len() as u32 >= max_per_min {
+                let role = if is_my_friend { "amigo" } else { "desconhecido" };
+                return Self::trigger_block(
+                    state,
+                    format!("limite de taxa para {} excedido ({} msg/min)", role, max_per_min),
+                    policy.send_courtesy_notice,
+                    now,
+                );
+            }
+            state.online_timestamps.push(now);
+        }
+
+        DmFirewallVerdict::Allowed
+    }
+
+    /// Registra uma infração de pacote inválido/assinatura corrompida (bloqueia rapidamente)
+    pub fn record_invalid_packet(&mut self, sender_pubkey: &str, now: u64) -> Option<(u64, u64, u32)> {
+        let pk = sender_pubkey.trim().to_lowercase();
+        let state = self.peers.entry(pk).or_default();
+        if let DmFirewallVerdict::NewlyBlocked { duration_secs, blocked_until, offense_level, .. } =
+            Self::trigger_block(state, "assinatura ou pacote DM inválido".to_string(), false, now)
+        {
+            Some((duration_secs, blocked_until, offense_level))
+        } else {
+            None
+        }
+    }
+
+    fn trigger_block(
+        state: &mut SenderRateState,
+        reason: String,
+        allow_courtesy: bool,
+        now: u64,
+    ) -> DmFirewallVerdict {
+        state.offense_level = state.offense_level.saturating_add(1);
+        state.last_offense_at = now;
+        let duration_secs = Self::block_duration_for_level(state.offense_level);
+        let blocked_until = now.saturating_add(duration_secs);
+        state.blocked_until = Some(blocked_until);
+        state.block_reason = reason.clone();
+        let send_courtesy = allow_courtesy && !state.courtesy_sent_for_current_block;
+        if send_courtesy {
+            state.courtesy_sent_for_current_block = true;
+        }
+        DmFirewallVerdict::NewlyBlocked {
+            reason,
+            duration_secs,
+            blocked_until,
+            offense_level: state.offense_level,
+            send_courtesy,
+        }
+    }
+
+    /// Desbloqueia manualmente um par (ou automaticamente quando Carol adiciona como amigo!)
+    pub fn unblock(&mut self, pubkey: &str) -> bool {
+        let pk = pubkey.trim().to_lowercase();
+        if let Some(state) = self.peers.get_mut(&pk) {
+            let was_blocked = state.blocked_until.is_some();
+            state.blocked_until = None;
+            state.offense_level = 0;
+            state.courtesy_sent_for_current_block = false;
+            state.online_timestamps.clear();
+            state.offline_timestamps.clear();
+            was_blocked
+        } else {
+            false
+        }
+    }
+
+    /// Lista todos os pares atualmente bloqueados
+    pub fn active_blocks(&self, now: u64) -> Vec<FirewallBlockEntry> {
+        let mut out: Vec<FirewallBlockEntry> = self
+            .peers
+            .iter()
+            .filter_map(|(pk, s)| {
+                let until = s.blocked_until?;
+                (until > now).then(|| FirewallBlockEntry {
+                    pubkey: pk.clone(),
+                    reason: s.block_reason.clone(),
+                    blocked_until: until,
+                    offense_level: s.offense_level,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1098,5 +1344,68 @@ mod tests {
         assert_eq!(alice_store.envelope_count(), 0);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_dm_firewall_asymmetric_friend_vs_stranger_limits_and_progressive_block() {
+        let alice = UserIdentity::generate_with_nick("Alice");
+        let bob = UserIdentity::generate_with_nick("Bob");
+        let mut fw = DmFirewall::new();
+        let policy = DmPolicyConfig::default(); // stranger = 3 msg/min (1024B), friend = 30 msg/min (8192B)
+
+        // Alice adicionou Carol como amiga, mas Carol NÃO tem Alice nos amigos (is_my_friend = false para Carol!)
+        // As 3 primeiras mensagens de Alice (desconhecida para Carol) passam:
+        for i in 0..3 {
+            assert_eq!(
+                fw.check_incoming_dm(&alice.public_key_hex(), false, 100, false, &policy, 1000 + i),
+                DmFirewallVerdict::Allowed
+            );
+        }
+
+        // A 4ª mensagem no mesmo minuto excede o limite de desconhecido (3/min) -> Bloqueio Nível 1 (60s) + aviso de cortesia!
+        let v4 = fw.check_incoming_dm(&alice.public_key_hex(), false, 100, false, &policy, 1005);
+        assert_eq!(
+            v4,
+            DmFirewallVerdict::NewlyBlocked {
+                reason: "limite de taxa para desconhecido excedido (3 msg/min)".to_string(),
+                duration_secs: 60,
+                blocked_until: 1065,
+                offense_level: 1,
+                send_courtesy: true,
+            }
+        );
+
+        // Enquanto bloqueada (t = 1020), novas tentativas são descartadas silenciosamente sem reenviar cortesia
+        let v5 = fw.check_incoming_dm(&alice.public_key_hex(), false, 100, false, &policy, 1020);
+        assert!(matches!(v5, DmFirewallVerdict::DroppedSilently { .. }));
+
+        // Enquanto isso, Bob (que É amigo de Carol: is_my_friend = true) manda 10 mensagens grandes (2000B) e todas passam!
+        for i in 0..10 {
+            assert_eq!(
+                fw.check_incoming_dm(&bob.public_key_hex(), true, 2000, false, &policy, 1010 + i),
+                DmFirewallVerdict::Allowed
+            );
+        }
+
+        // Após expirar o 1º bloqueio de Alice (t = 1070), se ela reincidir enviando mensagem > 1024B para desconhecido,
+        // o bloqueio sobe para Nível 2 = 300s (5 min)!
+        let v_reoffend = fw.check_incoming_dm(&alice.public_key_hex(), false, 2048, false, &policy, 1070);
+        assert_eq!(
+            v_reoffend,
+            DmFirewallVerdict::NewlyBlocked {
+                reason: "mensagem excedeu tamanho máximo para desconhecido (2048 > 1024 bytes)".to_string(),
+                duration_secs: 300,
+                blocked_until: 1370,
+                offense_level: 2,
+                send_courtesy: true,
+            }
+        );
+
+        // Se Carol decidir adicionar Alice como amiga (ou rodar /firewall unblock), o bloqueio é removido imediatamente
+        assert!(fw.unblock(&alice.public_key_hex()));
+        assert_eq!(
+            fw.check_incoming_dm(&alice.public_key_hex(), true, 2048, false, &policy, 1075),
+            DmFirewallVerdict::Allowed
+        );
     }
 }

@@ -3,6 +3,7 @@
 
 use p2p_core::community::{format_duration, short_id, ModKind};
 use p2p_core::config::NodeConfig;
+use p2p_core::dm::FirewallBlockEntry;
 use p2p_core::files::{FileEvent, FileState, FileSummary};
 use p2p_core::runtime::{
     CoreError, CoreEvent, FriendStatus, NetworkEvent, Role, ScreenEvent, ServerChange, ServerInfo, ServerNotice, SpaceInfo, VoiceEvent,
@@ -104,6 +105,30 @@ pub fn describe(event: &CoreEvent) -> Vec<String> {
             config_status(config, *mailbox_used_bytes, *mailbox_envelope_count)
         }
         CoreEvent::ConfigUpdated { key, value } => one(format!("⚙️ Configuração '{}' atualizada para '{}'.", key, value)),
+        CoreEvent::PeerBlocked { pubkey, peer_name, is_friend, reason, duration_secs, offense_level, courtesy_sent, .. } => {
+            let role = if *is_friend { "amigo" } else { "desconhecido" };
+            let courtesy = if *courtesy_sent { " · aviso de cortesia enviado" } else { "" };
+            let tip = if *is_friend {
+                format!("Use /firewall unblock {}", peer_name)
+            } else {
+                format!("Use /friend add {} ou /firewall unblock {}", short_id(pubkey), peer_name)
+            };
+            one(format!(
+                "🛡️ Firewall: {} ({}, {}) bloqueado por {} [nível {}]{}: {}. ({})",
+                peer_name,
+                short_id(pubkey),
+                role,
+                format_duration(Some(*duration_secs)),
+                offense_level,
+                courtesy,
+                reason,
+                tip
+            ))
+        }
+        CoreEvent::PeerUnblocked { pubkey, peer_name } => {
+            one(format!("🕊️ Firewall: {} ({}) foi desbloqueado.", peer_name, short_id(pubkey)))
+        }
+        CoreEvent::FirewallStatus(blocks) => firewall_status(blocks),
         CoreEvent::FilePreparing { name } => one(format!("📁 Preparando '{}' para compartilhar...", name)),
         CoreEvent::Server(notice) => server(notice),
         CoreEvent::Error(e) => one(error(e)),
@@ -405,6 +430,7 @@ fn friends(list: &[FriendStatus]) -> Vec<String> {
 fn config_status(cfg: &NodeConfig, used_bytes: u64, envelope_count: usize) -> Vec<String> {
     let mb = &cfg.mailbox;
     let net = &cfg.network;
+    let dm = &cfg.dm;
     vec![
         "⚙️ Configuração do Nó (/config set <chave> <valor>):".to_string(),
         format!(
@@ -419,10 +445,36 @@ fn config_status(cfg: &NodeConfig, used_bytes: u64, envelope_count: usize) -> Ve
             mb.max_storage_per_friend_mb
         ),
         format!(
+            "   dm.allow_strangers = {} | dm.send_courtesy_notice = {} | dm.friend_rate_limit_per_min = {} | dm.stranger_rate_limit_per_min = {}",
+            dm.allow_strangers, dm.send_courtesy_notice, dm.friend_rate_limit_per_min, dm.stranger_rate_limit_per_min
+        ),
+        format!(
+            "   dm.friend_max_message_bytes = {} | dm.stranger_max_message_bytes = {} | dm.stranger_offline_limit_per_hour = {}",
+            dm.friend_max_message_bytes, dm.stranger_max_message_bytes, dm.stranger_offline_limit_per_hour
+        ),
+        format!(
             "   network.default_channel = {} | network.auto_bootstrap = {} | network.max_peers = {} | network.listen_port = {}",
             net.default_channel, net.auto_bootstrap, net.max_peers, net.listen_port
         ),
     ]
+}
+
+fn firewall_status(blocks: &[FirewallBlockEntry]) -> Vec<String> {
+    if blocks.is_empty() {
+        return vec!["🛡️ Firewall: nenhum par bloqueado no momento.".to_string()];
+    }
+    let mut lines = vec![format!("🛡️ Firewall — Pares bloqueados ({}):", blocks.len())];
+    for b in blocks {
+        lines.push(format!(
+            "   ⛔ {} · nível {} · até {} — {} (/firewall unblock {})",
+            short_id(&b.pubkey),
+            b.offense_level,
+            fmt_utc(b.blocked_until),
+            b.reason,
+            short_id(&b.pubkey)
+        ));
+    }
+    lines
 }
 
 fn error(error: &CoreError) -> String {

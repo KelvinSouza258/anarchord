@@ -241,6 +241,7 @@ pub const HELP_LINES: &[&str] = &[
     "  /friend add <pk|nick> [apelido]   /friend remove <pk|apelido>    /friends",
     "  /dm open <par>           /dm <par> <mensagem> [--ttl 2h|7d]",
     "  /config show             /config set <chave> <valor>",
+    "  /firewall                /firewall unblock <par>",
     "  /share <arquivo>         compartilha na sala atual (quem quiser baixa com /get)",
     "  /send <par> <arquivo>    /get <id>      /reject <id>      /files      /unshare <id>",
     "  /screen start [monitor] [720|1080]   /screen stop   /screen watch <par>",

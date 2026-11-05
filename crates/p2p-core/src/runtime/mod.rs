@@ -385,6 +385,8 @@ impl Runtime {
             CoreCommand::SendDm { target, text, suggested_ttl } => self.send_dm(&target, &text, suggested_ttl),
             CoreCommand::ShowConfig => self.show_config(),
             CoreCommand::SetConfig { key, value } => self.set_config(&key, &value),
+            CoreCommand::ListFirewall => self.list_firewall(),
+            CoreCommand::UnblockPeer { target } => self.unblock_peer(&target),
             CoreCommand::Server(command) => self.run_server_command(command),
             CoreCommand::Shutdown => {}
         }
@@ -446,6 +448,8 @@ impl Runtime {
         match self.identity.add_friend(&pubkey, alias.as_deref()) {
             Ok(_) => {
                 self.persist_identity();
+                // Se estava bloqueado como desconhecido no firewall, ao virar amigo é desbloqueado na hora!
+                self.dm.firewall.unblock(&pubkey);
                 self.subscribe_dm_with(&pubkey);
                 if self.is_pubkey_online(&pubkey) {
                     self.send_ephemeral_key_offer(&pubkey);

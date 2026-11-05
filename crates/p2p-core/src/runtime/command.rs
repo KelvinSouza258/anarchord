@@ -51,6 +51,9 @@ pub enum CoreCommand {
     /// Configuração do nó e da Mailbox
     ShowConfig,
     SetConfig { key: String, value: String },
+    /// Firewall local de proteção contra spam/abuso
+    ListFirewall,
+    UnblockPeer { target: String },
     Server(ServerCommand),
     /// Encerra o nó (desanuncia nos trackers e emite `CoreEvent::Stopped`)
     Shutdown,

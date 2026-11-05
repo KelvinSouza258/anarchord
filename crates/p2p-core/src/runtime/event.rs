@@ -3,6 +3,7 @@
 
 use crate::community::{HistoryEntry, ModKind, UtcSecs};
 use crate::config::NodeConfig;
+use crate::dm::FirewallBlockEntry;
 use crate::files::{FileEvent, FileSummary};
 use crate::screen::ScreenInfo;
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,24 @@ pub enum CoreEvent {
     },
     /// Parâmetro de configuração alterado
     ConfigUpdated { key: String, value: String },
+    /// Um par foi bloqueado temporariamente pelo Firewall local (aviso único por bloqueio)
+    PeerBlocked {
+        pubkey: String,
+        peer_name: String,
+        is_friend: bool,
+        reason: String,
+        duration_secs: u64,
+        blocked_until: u64,
+        offense_level: u32,
+        courtesy_sent: bool,
+    },
+    /// Um par foi desbloqueado no Firewall local
+    PeerUnblocked {
+        pubkey: String,
+        peer_name: String,
+    },
+    /// Lista de bloqueios ativos no Firewall (`/firewall`)
+    FirewallStatus(Vec<FirewallBlockEntry>),
     /// Lendo o arquivo para montar o manifesto
     FilePreparing { name: String },
     Server(ServerNotice),

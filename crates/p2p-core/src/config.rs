@@ -70,6 +70,40 @@ impl Default for NetworkConfig {
     }
 }
 
+/// Configuração de políticas de Mensagens Diretas (DM) e Firewall de proteção diferenciada (Amigos vs Desconhecidos)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct DmPolicyConfig {
+    /// Permitir receber DMs de quem não está na sua lista local de amigos
+    pub allow_strangers: bool,
+    /// Enviar 1 mensagem de cortesia E2EE avisando o remetente quando for bloqueado pelo firewall
+    pub send_courtesy_notice: bool,
+    /// Limite de DMs por minuto vindas de um amigo (na sua lista local)
+    pub friend_rate_limit_per_min: u32,
+    /// Limite de DMs por minuto vindas de um desconhecido (fora da sua lista local)
+    pub stranger_rate_limit_per_min: u32,
+    /// Tamanho máximo do texto de DM vindo de um amigo (em bytes)
+    pub friend_max_message_bytes: usize,
+    /// Tamanho máximo do texto de DM vindo de um desconhecido (em bytes)
+    pub stranger_max_message_bytes: usize,
+    /// Limite de mensagens offline (vindas da Mailbox) que aceita abrir de um mesmo desconhecido por hora
+    pub stranger_offline_limit_per_hour: u32,
+}
+
+impl Default for DmPolicyConfig {
+    fn default() -> Self {
+        Self {
+            allow_strangers: true,
+            send_courtesy_notice: true,
+            friend_rate_limit_per_min: 30,
+            stranger_rate_limit_per_min: 3,
+            friend_max_message_bytes: 8192,
+            stranger_max_message_bytes: 1024,
+            stranger_offline_limit_per_hour: 3,
+        }
+    }
+}
+
 /// Configuração completa do nó Anarchord
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
@@ -77,6 +111,7 @@ pub struct NodeConfig {
     pub version: u32,
     pub network: NetworkConfig,
     pub mailbox: MailboxConfig,
+    pub dm: DmPolicyConfig,
 }
 
 impl Default for NodeConfig {
@@ -85,6 +120,7 @@ impl Default for NodeConfig {
             version: 1,
             network: NetworkConfig::default(),
             mailbox: MailboxConfig::default(),
+            dm: DmPolicyConfig::default(),
         }
     }
 }
@@ -232,9 +268,58 @@ impl NodeConfig {
                 let n: u16 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
                 self.network.listen_port = n;
             }
+            "dm.allow_strangers" => {
+                self.dm.allow_strangers = match val {
+                    "true" | "1" | "on" | "sim" => true,
+                    "false" | "0" | "off" | "nao" | "não" => false,
+                    _ => return Err(ConfigError::InvalidSetting(format!("booleano inválido: {}", val))),
+                };
+            }
+            "dm.send_courtesy_notice" => {
+                self.dm.send_courtesy_notice = match val {
+                    "true" | "1" | "on" | "sim" => true,
+                    "false" | "0" | "off" | "nao" | "não" => false,
+                    _ => return Err(ConfigError::InvalidSetting(format!("booleano inválido: {}", val))),
+                };
+            }
+            "dm.friend_rate_limit_per_min" => {
+                let n: u32 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("friend_rate_limit_per_min deve ser > 0".into()));
+                }
+                self.dm.friend_rate_limit_per_min = n;
+            }
+            "dm.stranger_rate_limit_per_min" => {
+                let n: u32 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("stranger_rate_limit_per_min deve ser > 0".into()));
+                }
+                self.dm.stranger_rate_limit_per_min = n;
+            }
+            "dm.friend_max_message_bytes" => {
+                let n: usize = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("friend_max_message_bytes deve ser > 0".into()));
+                }
+                self.dm.friend_max_message_bytes = n;
+            }
+            "dm.stranger_max_message_bytes" => {
+                let n: usize = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("stranger_max_message_bytes deve ser > 0".into()));
+                }
+                self.dm.stranger_max_message_bytes = n;
+            }
+            "dm.stranger_offline_limit_per_hour" => {
+                let n: u32 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("stranger_offline_limit_per_hour deve ser > 0".into()));
+                }
+                self.dm.stranger_offline_limit_per_hour = n;
+            }
             other => {
                 return Err(ConfigError::InvalidSetting(format!(
-                    "chave desconhecida '{}'. Chaves válidas: mailbox.enabled, mailbox.max_storage_mb, mailbox.max_storage_per_friend_mb, mailbox.max_ttl_days, mailbox.max_envelope_size_kb, network.default_channel, network.max_peers, network.listen_port",
+                    "chave desconhecida '{}'. Chaves válidas: mailbox.*, network.*, dm.allow_strangers, dm.send_courtesy_notice, dm.friend_rate_limit_per_min, dm.stranger_rate_limit_per_min, dm.friend_max_message_bytes, dm.stranger_max_message_bytes, dm.stranger_offline_limit_per_hour",
                     other
                 )));
             }
