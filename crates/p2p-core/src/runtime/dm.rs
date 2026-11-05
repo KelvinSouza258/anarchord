@@ -235,7 +235,28 @@ impl Runtime {
                         .insert_own(stored.clone(), &self.dm.node_config, now);
                     let msg = MailboxMessage::Store(stored);
                     let bytes = wire::encode(&msg);
-                    let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
+                    if self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes).is_ok() {
+                        // Marca apenas os amigos conectados que já estão inscritos em MAILBOX_TOPIC agora
+                        let mailbox_hash = IdentTopic::new(MAILBOX_TOPIC).hash();
+                        let subscribed_friends: Vec<String> = self
+                            .node
+                            .swarm
+                            .behaviour()
+                            .gossipsub
+                            .all_peers()
+                            .filter(|(_, topics)| topics.contains(&&mailbox_hash))
+                            .filter_map(|(peer, _)| self.peer_metadata.get(peer).map(|(_, pk)| pk.to_lowercase()))
+                            .filter(|pk| {
+                                self.identity
+                                    .get_friends()
+                                    .iter()
+                                    .any(|f| f.public_key.eq_ignore_ascii_case(pk))
+                            })
+                            .collect();
+                        for friend_pk in subscribed_friends {
+                            self.dm.mailbox.mark_delegated_to_guardian(&env_id, &friend_pk);
+                        }
+                    }
 
                     self.emit(CoreEvent::DirectMessage {
                         peer_pubkey: peer_pk.clone(),
@@ -561,7 +582,7 @@ impl Runtime {
 
         if is_friend {
             self.send_ephemeral_key_offer(&clean_pk);
-            self.delegate_own_pending_mailbox_envelopes();
+            self.delegate_pending_to_friend(&clean_pk);
             // Propaga ACKs assinados que já recebemos para limpar a outbox/mailbox do amigo que estava offline
             for ack in self.dm.mailbox.known_acks() {
                 self.publish_mailbox_ack(ack);
@@ -572,27 +593,70 @@ impl Runtime {
         self.deliver_pending_for(&clean_pk);
     }
 
-    /// Delega os envelopes ainda não entregues da nossa outbox para os guardiões na malha (`MAILBOX_TOPIC`).
-    /// Chamado quando um par conecta, quando alguém se inscreve em `MAILBOX_TOPIC`, ao adicionar um amigo,
-    /// e periodicamente enquanto ainda houver envelopes na nossa outbox e pares conectados.
-    pub(super) fn delegate_own_pending_mailbox_envelopes(&mut self) {
+    /// Verifica se o par `pubkey` está conectado E já anunciou inscrição no tópico `MAILBOX_TOPIC` do Gossipsub
+    fn is_peer_subscribed_to_mailbox(&self, pubkey: &str) -> bool {
+        let mailbox_hash = IdentTopic::new(MAILBOX_TOPIC).hash();
+        self.node
+            .swarm
+            .behaviour()
+            .gossipsub
+            .all_peers()
+            .filter(|(_, topics)| topics.contains(&&mailbox_hash))
+            .any(|(peer, _)| {
+                self.peer_metadata
+                    .get(peer)
+                    .map(|(_, pk)| pk.eq_ignore_ascii_case(pubkey))
+                    .or_else(|| {
+                        crate::api::pubkey_hex_from_peer_id(peer)
+                            .map(|pk| pk.eq_ignore_ascii_case(pubkey))
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Orientado a eventos: quando um amigo `friend_pubkey` fica online (e está inscrito em `MAILBOX_TOPIC`),
+    /// Alice verifica quais envelopes da sua outbox ainda NÃO foram pedidos para esse amigo guardar,
+    /// publica `MailboxMessage::Store` uma única vez e registra que já pediu para esse amigo!
+    pub(super) fn delegate_pending_to_friend(&mut self, friend_pubkey: &str) {
+        let clean_friend = friend_pubkey.trim().to_lowercase();
+        let is_friend = self
+            .identity
+            .get_friends()
+            .iter()
+            .any(|f| f.public_key.eq_ignore_ascii_case(&clean_friend));
+        if !is_friend || !self.is_peer_subscribed_to_mailbox(&clean_friend) {
+            return;
+        }
         let my_pk = self.my_pubkey();
-        let my_pending = self.dm.mailbox.pending_from_sender(&my_pk, super::now_secs());
-        for env in my_pending {
+        let undelegated = self.dm.mailbox.undelegated_for_guardian(
+            &my_pk,
+            &clean_friend,
+            super::now_secs(),
+        );
+        for env in undelegated {
+            let env_id = env.envelope_id.clone();
             let msg = MailboxMessage::Store(env);
             let bytes = wire::encode(&msg);
-            let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
+            if self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes).is_ok() {
+                self.dm
+                    .mailbox
+                    .mark_delegated_to_guardian(&env_id, &clean_friend);
+            }
         }
     }
 
     /// Chamado quando um par se inscreve no tópico `MAILBOX_TOPIC` do Gossipsub:
     /// como o `Subscribed` do Gossipsub geralmente chega alguns milissegundos *depois* do `Identify`,
-    /// reanunciamos a nossa outbox pendente, as entregas para esse par e os nossos ACKs!
+    /// decidimos de forma orientada a eventos se esse par é nosso amigo (e ainda não recebeu a delegação)
+    /// ou se é o destinatário de algum envelope que estamos guardando!
     pub(super) fn on_peer_subscribed_mailbox(&mut self, peer_id: libp2p::PeerId) {
-        self.delegate_own_pending_mailbox_envelopes();
-        if let Some((_, pk)) = self.peer_metadata.get(&peer_id).cloned() {
-            self.deliver_pending_for(&pk);
-        } else if let Some(pk) = crate::api::pubkey_hex_from_peer_id(&peer_id) {
+        let peer_pk = self
+            .peer_metadata
+            .get(&peer_id)
+            .map(|(_, pk)| pk.clone())
+            .or_else(|| crate::api::pubkey_hex_from_peer_id(&peer_id));
+        if let Some(pk) = peer_pk {
+            self.delegate_pending_to_friend(&pk);
             self.deliver_pending_for(&pk);
         }
         for ack in self.dm.mailbox.known_acks() {
@@ -601,6 +665,9 @@ impl Runtime {
     }
 
     pub(super) fn deliver_pending_for(&mut self, recipient_pubkey: &str) {
+        if !self.is_peer_subscribed_to_mailbox(recipient_pubkey) {
+            return;
+        }
         let now = super::now_secs();
         let pending = self.dm.mailbox.pending_for_recipient(recipient_pubkey, now);
         for env in pending {
@@ -610,26 +677,10 @@ impl Runtime {
         }
     }
 
-    /// Tick periódico da Mailbox: purga envelopes expirados, reanuncia entregas pendentes para destinatários conectados
-    /// e delega nossa outbox para guardiões conectados (caso ninguém estivesse online quando a DM foi enviada!)
+    /// Tick periódico da Mailbox: apenas purga envelopes expirados do disco (sem inundar a rede com republicações!)
     pub(super) fn mailbox_tick(&mut self) {
         let now = super::now_secs();
         self.dm.mailbox.purge_expired(now);
-
-        let online_pks: Vec<String> = self
-            .peer_metadata
-            .iter()
-            .filter(|(peer, _)| self.connected_peers.contains(peer))
-            .map(|(_, (_, pk))| pk.to_lowercase())
-            .collect();
-
-        if !online_pks.is_empty() {
-            self.delegate_own_pending_mailbox_envelopes();
-        }
-
-        for pk in online_pks {
-            self.deliver_pending_for(&pk);
-        }
     }
 
     /// Exibe a configuração atual e o uso da mailbox

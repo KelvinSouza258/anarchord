@@ -501,7 +501,7 @@ impl Runtime {
                 self.subscribe_dm_with(&pubkey);
                 if self.is_pubkey_online(&pubkey) {
                     self.send_ephemeral_key_offer(&pubkey);
-                    self.delegate_own_pending_mailbox_envelopes();
+                    self.delegate_pending_to_friend(&pubkey);
                 }
                 self.emit(CoreEvent::FriendUpdated { pubkey: pubkey.to_lowercase(), alias, removed: false });
                 self.list_friends();

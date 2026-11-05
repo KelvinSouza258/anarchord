@@ -12,7 +12,7 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -656,6 +656,8 @@ struct PersistedMailbox {
     delivered_ids: HashMap<String, u64>,
     /// ACKs assinados pelos destinatários (`envelope_id` -> `ReceiptAck`) para sincronizar outros guardiões
     acks: HashMap<String, ReceiptAck>,
+    /// Quais amigos guardiões já receberam o pedido de guarda de cada envelope da outbox (`envelope_id` -> conjunto de `guardian_pubkey`)
+    delegated_guardians: HashMap<String, HashSet<String>>,
 }
 
 /// Armazenamento local do Guardião (Carol/Bob) e Outbox do Remetente (Alice)
@@ -669,6 +671,8 @@ pub struct MailboxStore {
     /// ACKs assinados conhecidos por este nó: envelope_id -> ReceiptAck
     /// (permite que o destinatário ou um guardião informe ao remetente/outros guardiões que já foi entregue)
     acks: HashMap<String, ReceiptAck>,
+    /// Controle orientado a eventos da Outbox: `envelope_id` -> `HashSet<guardian_pubkey>` para os quais já pedimos guarda
+    delegated_guardians: HashMap<String, HashSet<String>>,
 }
 
 impl MailboxStore {
@@ -676,6 +680,7 @@ impl MailboxStore {
         let mut envelopes = HashMap::new();
         let mut delivered_ids = HashMap::new();
         let mut acks = HashMap::new();
+        let mut delegated_guardians = HashMap::new();
         if let Some(ref path) = storage_path {
             if let Ok(bytes) = fs::read(path) {
                 if let Ok(persisted) = serde_json::from_slice::<PersistedMailbox>(&bytes) {
@@ -694,6 +699,14 @@ impl MailboxStore {
                             acks.insert(id, ack);
                         }
                     }
+                    for (id, guardians) in persisted.delegated_guardians {
+                        if envelopes.contains_key(&id) {
+                            delegated_guardians.insert(
+                                id,
+                                guardians.into_iter().map(|pk| pk.to_lowercase()).collect(),
+                            );
+                        }
+                    }
                 } else if let Ok(legacy_list) = serde_json::from_slice::<Vec<StoredEnvelope>>(&bytes) {
                     for env in legacy_list {
                         if env.expires_at > now {
@@ -708,6 +721,7 @@ impl MailboxStore {
             envelopes,
             delivered_ids,
             acks,
+            delegated_guardians,
         }
     }
 
@@ -722,6 +736,7 @@ impl MailboxStore {
                 envelopes: self.envelopes.values().cloned().collect(),
                 delivered_ids: self.delivered_ids.clone(),
                 acks: self.acks.clone(),
+                delegated_guardians: self.delegated_guardians.clone(),
             };
             if let Ok(json) = serde_json::to_string_pretty(&data) {
                 let _ = fs::write(path, json);
@@ -808,10 +823,46 @@ impl MailboxStore {
             .collect()
     }
 
+    /// Retorna apenas os envelopes enviados por `sender_pubkey` que AINDA NÃO foram delegados ao amigo `guardian_pubkey`
+    pub fn undelegated_for_guardian(
+        &self,
+        sender_pubkey: &str,
+        guardian_pubkey: &str,
+        now: u64,
+    ) -> Vec<StoredEnvelope> {
+        let g_clean = guardian_pubkey.trim().to_lowercase();
+        self.envelopes
+            .values()
+            .filter(|e| {
+                e.expires_at > now
+                    && e.sender_pubkey.eq_ignore_ascii_case(sender_pubkey)
+                    && !e.recipient_pubkey.eq_ignore_ascii_case(&g_clean)
+                    && !self
+                        .delegated_guardians
+                        .get(&e.envelope_id)
+                        .is_some_and(|set| set.contains(&g_clean))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Registra que o envelope `envelope_id` já foi delegado para o amigo guardião `guardian_pubkey`
+    pub fn mark_delegated_to_guardian(&mut self, envelope_id: &str, guardian_pubkey: &str) {
+        let g_clean = guardian_pubkey.trim().to_lowercase();
+        let entry = self
+            .delegated_guardians
+            .entry(envelope_id.to_string())
+            .or_default();
+        if entry.insert(g_clean) {
+            self.persist();
+        }
+    }
+
     /// Marca um envelope como recebido pelo destinatário local e guarda o ACK assinado;
     /// retorna `true` se é inédito (não duplicado), mesmo após reiniciar o app!
     pub fn mark_delivered_to_me(&mut self, envelope_id: &str, expires_at: u64, ack: ReceiptAck) -> bool {
         self.envelopes.remove(envelope_id);
+        self.delegated_guardians.remove(envelope_id);
         self.acks.insert(envelope_id.to_string(), ack);
         let is_new = !self.delivered_ids.contains_key(envelope_id);
         self.delivered_ids.insert(envelope_id.to_string(), expires_at);
@@ -838,6 +889,7 @@ impl MailboxStore {
         self.delivered_ids.entry(ack.envelope_id.clone()).or_insert(exp);
         let is_new_ack = !self.acks.contains_key(&ack.envelope_id);
         self.acks.insert(ack.envelope_id.clone(), ack.clone());
+        self.delegated_guardians.remove(&ack.envelope_id);
         let removed = self.envelopes.remove(&ack.envelope_id).is_some();
         if removed || is_new_ack {
             self.persist();
@@ -849,6 +901,8 @@ impl MailboxStore {
     pub fn purge_expired(&mut self, now: u64) -> usize {
         let before = self.envelopes.len();
         self.envelopes.retain(|_, env| env.expires_at > now);
+        self.delegated_guardians
+            .retain(|id, _| self.envelopes.contains_key(id));
         self.delivered_ids.retain(|_, &mut exp| exp > now);
         let removed = before.saturating_sub(self.envelopes.len());
         if removed > 0 {
@@ -1428,5 +1482,53 @@ mod tests {
             fw.check_incoming_dm(&alice.public_key_hex(), true, 2048, false, &policy, 1075),
             DmFirewallVerdict::Allowed
         );
+    }
+
+    #[test]
+    fn test_event_driven_guardian_delegation_tracking() {
+        let alice = UserIdentity::generate_with_nick("Alice");
+        let bob = UserIdentity::generate_with_nick("Bob");
+        let carol = UserIdentity::generate_with_nick("Carol");
+        let dave = UserIdentity::generate_with_nick("Dave");
+
+        let cfg = NodeConfig::default();
+        let mut alice_store = MailboxStore::load(None, 3000);
+        let env = StoredEnvelope::create_signed_and_sealed(
+            &alice,
+            &bob.public_key_hex(),
+            "Oi Bob!",
+            3000,
+            Some(3600),
+        )
+        .unwrap();
+        let env_id = env.envelope_id.clone();
+        alice_store.insert_own(env, &cfg, 3000);
+
+        // Quando Carol fica online pela 1ª vez, Alice ainda não pediu para Carol ser guardiã:
+        let for_carol = alice_store.undelegated_for_guardian(
+            &alice.public_key_hex(),
+            &carol.public_key_hex(),
+            3010,
+        );
+        assert_eq!(for_carol.len(), 1);
+
+        // Alice publica Store para Carol e marca que Carol já recebeu o pedido:
+        alice_store.mark_delegated_to_guardian(&env_id, &carol.public_key_hex());
+
+        // Se Carol oscilar ou outro evento chegar, Alice sabe que JÁ pediu para Carol e não reenvia:
+        let for_carol_again = alice_store.undelegated_for_guardian(
+            &alice.public_key_hex(),
+            &carol.public_key_hex(),
+            3020,
+        );
+        assert!(for_carol_again.is_empty());
+
+        // Porém, quando um segundo amigo (Dave) entra online depois, Alice sabe que AINDA NÃO pediu para Dave!
+        let for_dave = alice_store.undelegated_for_guardian(
+            &alice.public_key_hex(),
+            &dave.public_key_hex(),
+            3025,
+        );
+        assert_eq!(for_dave.len(), 1);
     }
 }
