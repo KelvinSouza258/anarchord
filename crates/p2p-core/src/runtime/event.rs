@@ -2,6 +2,7 @@
 //! escolhido pela interface (cada uma no seu idioma e estilo).
 
 use crate::community::{HistoryEntry, ModKind, UtcSecs};
+use crate::config::NodeConfig;
 use crate::files::{FileEvent, FileSummary};
 use crate::screen::ScreenInfo;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,40 @@ pub enum CoreEvent {
     FriendPresence { public_key: String, alias: Option<String>, online: bool },
     /// Amigo adicionado ou removido com sucesso
     FriendUpdated { pubkey: String, alias: Option<String>, removed: bool },
+    /// Canal de DM privado aberto na TUI (`@Amigo`)
+    DmOpened { peer_pubkey: String, peer_name: String, channel: String },
+    /// Mensagem Direta (DM 1:1 E2EE) enviada ou recebida (online ou entregue via Mailbox offline)
+    DirectMessage {
+        peer_pubkey: String,
+        peer_name: String,
+        author: String,
+        author_pubkey: String,
+        text: String,
+        timestamp: u64,
+        offline_delivery: bool,
+    },
+    /// Envelope de DM enfileirado para entrega offline via guardiões amigos
+    MailboxQueued {
+        recipient_pubkey: String,
+        recipient_name: String,
+        envelope_id: String,
+        suggested_ttl: Option<u64>,
+    },
+    /// Este nó guardião aceitou armazenar um envelope offline para um amigo
+    MailboxStoredForFriend {
+        sender_name: String,
+        recipient_short: String,
+        envelope_id: String,
+        effective_ttl_secs: u64,
+    },
+    /// Status da configuração local e uso de disco da Mailbox
+    ConfigStatus {
+        config: NodeConfig,
+        mailbox_used_bytes: u64,
+        mailbox_envelope_count: usize,
+    },
+    /// Parâmetro de configuração alterado
+    ConfigUpdated { key: String, value: String },
     /// Lendo o arquivo para montar o manifesto
     FilePreparing { name: String },
     Server(ServerNotice),
@@ -232,6 +267,7 @@ pub enum CoreError {
     Server(String),
     File(String),
     Friend(String),
+    Config(String),
     Io { context: String, message: String },
     Network(String),
 }

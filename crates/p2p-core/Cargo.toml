@@ -26,8 +26,11 @@ libp2p = { version = "0.54", features = [
     "request-response"
 ] }
 
-# Criptografia e Identidade (Ed25519)
+# Criptografia e Identidade (Ed25519 + X25519 + HKDF)
 ed25519-dalek = { version = "2.1", features = ["rand_core", "pkcs8", "pem"] }
+curve25519-dalek = "4.1"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+hkdf = "0.12"
 rand = "0.8"
 sha2 = "0.10"
 

@@ -2,6 +2,14 @@
 //! Cada item gera um comando de texto igual ao que o usuário digitaria, então o backend não
 //! precisa saber de menus.
 
+/// Amigo exibido nos menus e painel lateral (enviado pelo backend em `UiEvent::FriendsChanged`)
+#[derive(Debug, Clone, PartialEq)]
+pub struct FriendUiEntry {
+    pub public_key: String,
+    pub display_name: String,
+    pub online: bool,
+}
+
 /// Servidor exibido nos menus (enviado pelo backend em `UiEvent::ServersChanged`)
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerEntry {
@@ -74,6 +82,7 @@ pub struct MenuContext<'a> {
     pub in_server: bool,
     pub in_voice: bool,
     pub servers: &'a [ServerEntry],
+    pub friends: &'a [FriendUiEntry],
 }
 
 /// Menu principal (F1)
@@ -82,6 +91,7 @@ pub fn main_menu(ctx: &MenuContext) -> Menu {
         ask("🏰 Criar servidor…", "Nome do novo servidor", "/server create {}"),
         run("📨 Aceitar último convite", "/server accept"),
         MenuItem { label: "🔀 Trocar de espaço ▸".into(), action: MenuAction::Submenu(spaces_menu(ctx.servers)) },
+        MenuItem { label: "👥 Amigos e DMs ▸".into(), action: MenuAction::Submenu(friends_menu(ctx.friends)) },
         ask("🔗 Entrar em servidor pelo id…", "Id do servidor (64 caracteres)", "/server join {}"),
     ];
     if ctx.in_server {
@@ -137,9 +147,35 @@ pub fn spaces_menu(servers: &[ServerEntry]) -> Menu {
     Menu::new(" Trocar de espaço ", items)
 }
 
+/// Submenu de Amigos e Mensagens Diretas (DMs)
+pub fn friends_menu(friends: &[FriendUiEntry]) -> Menu {
+    let mut items = vec![
+        ask("➕ Adicionar amigo…", "Pubkey (64 hex) ou nick conectado [apelido opcional]", "/friend add {}"),
+        ask("💬 Enviar DM rápida…", "Destinatário e mensagem (ex.: Bob olá!)", "/dm {}"),
+        run("📋 Listar amigos no log (/friends)", "/friends"),
+    ];
+    for f in friends {
+        let icon = if f.online { "🟢" } else { "⚪" };
+        let short_pk = if f.public_key.len() >= 8 { &f.public_key[..8] } else { &f.public_key };
+        let label = format!("{} {} ({}) ▸", icon, f.display_name, short_pk);
+        let sub = Menu::new(
+            format!(" {} ", f.display_name),
+            vec![
+                run("💬 Abrir conversa direta (DM)", format!("/dm open {}", f.display_name)),
+                ask("📨 Enviar mensagem direta…", format!("Mensagem para {}", f.display_name), format!("/dm {} {{}}", f.display_name)),
+                run("💔 Remover dos amigos", format!("/friend remove {}", f.public_key)),
+            ],
+        );
+        items.push(MenuItem { label, action: MenuAction::Submenu(sub) });
+    }
+    Menu::new(" Amigos e DMs ", items)
+}
+
 /// Menu de contexto de um membro da sala
 pub fn member_menu(nick: &str, in_server: bool) -> Menu {
     let mut items = vec![
+        run("💬 Abrir conversa direta (DM)", format!("/dm open {}", nick)),
+        ask("📨 Enviar mensagem direta…", format!("Mensagem privada para {}", nick), format!("/dm {} {{}}", nick)),
         ask("📁 Enviar arquivo…", format!("Caminho do arquivo para {}", nick), format!("/send {} \"{{}}\"", nick)),
         run("📺 Assistir tela", format!("/screen watch {}", nick)),
         run("💚 Adicionar aos amigos", format!("/friend add {}", nick)),
@@ -191,8 +227,8 @@ pub fn channel_command(name: &str, is_voice: bool) -> String {
 /// Texto da tela de ajuda
 pub const HELP_LINES: &[&str] = &[
     "ATALHOS",
-    "  F1 ou Ctrl+K     abre o menu principal",
-    "  Clique           membro: ações (arquivo, tela, moderação) · canal: entrar",
+    "  F1 ou Ctrl+K     abre o menu principal (Servidores, Amigos, DMs, Voz)",
+    "  Clique           membro/amigo: ações (DM, arquivo, tela, amigo) · canal: entrar",
     "  ↑ / ↓            histórico do que você digitou",
     "  ← → Home End     move o cursor · Delete apaga à frente",
     "  Tab              completa comandos e nicks",
@@ -202,6 +238,9 @@ pub const HELP_LINES: &[&str] = &[
     "",
     "COMANDOS",
     "  /join <canal>            /voice join <sala>     /voice leave     /mute",
+    "  /friend add <pk|nick> [apelido]   /friend remove <pk|apelido>    /friends",
+    "  /dm open <par>           /dm <par> <mensagem> [--ttl 2h|7d]",
+    "  /config show             /config set <chave> <valor>",
     "  /share <arquivo>         compartilha na sala atual (quem quiser baixa com /get)",
     "  /send <par> <arquivo>    /get <id>      /reject <id>      /files      /unshare <id>",
     "  /screen start [monitor] [720|1080]   /screen stop   /screen watch <par>",
@@ -221,12 +260,13 @@ mod tests {
 
     #[test]
     fn test_main_menu_depends_on_context() {
-        let lobby = main_menu(&MenuContext { in_server: false, in_voice: false, servers: &[] });
+        let lobby = main_menu(&MenuContext { in_server: false, in_voice: false, servers: &[], friends: &[] });
         assert!(lobby.find("Criar servidor").is_some());
+        assert!(lobby.find("Amigos e DMs").is_some());
         assert!(lobby.find("Convidar").is_none(), "no Lobby não há servidor para convidar");
         assert!(lobby.find("Entrar em sala de voz").is_some());
 
-        let server = main_menu(&MenuContext { in_server: true, in_voice: true, servers: &[] });
+        let server = main_menu(&MenuContext { in_server: true, in_voice: true, servers: &[], friends: &[] });
         assert!(server.find("Convidar").is_some());
         assert!(server.find("Criar canal de texto").is_some());
         assert!(server.find("Sair da sala de voz").is_some());

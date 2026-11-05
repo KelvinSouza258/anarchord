@@ -2,6 +2,7 @@
 //! palavras (e dos emojis) é da interface.
 
 use p2p_core::community::{format_duration, short_id, ModKind};
+use p2p_core::config::NodeConfig;
 use p2p_core::files::{FileEvent, FileState, FileSummary};
 use p2p_core::runtime::{
     CoreError, CoreEvent, FriendStatus, NetworkEvent, Role, ScreenEvent, ServerChange, ServerInfo, ServerNotice, SpaceInfo, VoiceEvent,
@@ -79,6 +80,30 @@ pub fn describe(event: &CoreEvent) -> Vec<String> {
             let name = alias.clone().unwrap_or_else(|| short_id(pubkey).to_string());
             one(if *removed { format!("💔 Amigo {} removido", name) } else { format!("💚 Amigo {} adicionado", name) })
         }
+        CoreEvent::DmOpened { peer_name, channel, .. } => {
+            one(format!("💬 Conversa direta aberta com {} ({}). Suas mensagens vão cifradas de ponta a ponta.", peer_name, channel))
+        }
+        CoreEvent::DirectMessage { .. } => Vec::new(),
+        CoreEvent::MailboxQueued { recipient_name, envelope_id, suggested_ttl, .. } => {
+            let ttl_str = suggested_ttl.map(|s| format_duration(Some(s))).unwrap_or_else(|| "padrão".to_string());
+            one(format!(
+                "📬 {} está offline: DM assinada e lacrada na mailbox dos amigos guardiões (id {}, validade {}).",
+                recipient_name,
+                short_id(envelope_id),
+                ttl_str
+            ))
+        }
+        CoreEvent::MailboxStoredForFriend { sender_name, recipient_short, envelope_id, effective_ttl_secs } => one(format!(
+            "🛡️ Guardando envelope offline de {} para {} (id {}, retido por {}).",
+            sender_name,
+            recipient_short,
+            short_id(envelope_id),
+            format_duration(Some(*effective_ttl_secs))
+        )),
+        CoreEvent::ConfigStatus { config, mailbox_used_bytes, mailbox_envelope_count } => {
+            config_status(config, *mailbox_used_bytes, *mailbox_envelope_count)
+        }
+        CoreEvent::ConfigUpdated { key, value } => one(format!("⚙️ Configuração '{}' atualizada para '{}'.", key, value)),
         CoreEvent::FilePreparing { name } => one(format!("📁 Preparando '{}' para compartilhar...", name)),
         CoreEvent::Server(notice) => server(notice),
         CoreEvent::Error(e) => one(error(e)),
@@ -377,9 +402,33 @@ fn friends(list: &[FriendStatus]) -> Vec<String> {
     lines
 }
 
+fn config_status(cfg: &NodeConfig, used_bytes: u64, envelope_count: usize) -> Vec<String> {
+    let mb = &cfg.mailbox;
+    let net = &cfg.network;
+    vec![
+        "⚙️ Configuração do Nó (/config set <chave> <valor>):".to_string(),
+        format!(
+            "   mailbox.enabled = {} | mailbox.max_message_ttl_days = {} | mailbox.max_envelope_size_kb = {}",
+            mb.enabled, mb.max_message_ttl_days, mb.max_envelope_size_kb
+        ),
+        format!(
+            "   mailbox.max_storage_mb = {} ({} em uso, {} envelope(s)) | mailbox.max_storage_per_friend_mb = {}",
+            mb.max_storage_mb,
+            human_size(used_bytes),
+            envelope_count,
+            mb.max_storage_per_friend_mb
+        ),
+        format!(
+            "   network.default_channel = {} | network.auto_bootstrap = {} | network.max_peers = {} | network.listen_port = {}",
+            net.default_channel, net.auto_bootstrap, net.max_peers, net.listen_port
+        ),
+    ]
+}
+
 fn error(error: &CoreError) -> String {
     match error {
         CoreError::Friend(message) => format!("❌ Amigos: {}", message),
+        CoreError::Config(message) => format!("❌ Configuração: {}", message),
         CoreError::PeerNotFound(query) => format!("❌ Par '{}' não encontrado. Use o nick de alguém conectado ou a pubkey completa.", query),
         CoreError::NoStream(query) => format!("⚠️ Nenhuma tela ativa encontrada para '{}'. Verifique os pares ou aguarde.", query),
         CoreError::AlreadyStreaming => "Você já está transmitindo sua tela. Use /screen stop para parar.".to_string(),

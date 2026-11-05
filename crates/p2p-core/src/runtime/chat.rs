@@ -55,6 +55,9 @@ pub fn channel_members(gossipsub: &gossipsub::Behaviour, peer_metadata: &HashMap
 
 impl Runtime {
     pub(super) fn send_chat(&mut self, text: &str) {
+        if let Some(peer_pk) = self.dm.active_dm_peer.clone() {
+            return self.send_dm(&peer_pk, text, None);
+        }
         if let Some(server) = self.active.server_id().and_then(|id| self.servers.get(id)) {
             let me = self.my_pubkey();
             if server.is_banned(&me, super::now_secs()) {
@@ -84,6 +87,7 @@ impl Runtime {
 
     /// Entra num canal de texto de um espaço (Lobby ou servidor)
     pub(super) fn enter_channel(&mut self, space: Space, channel: String) {
+        self.dm.active_dm_peer = None;
         if let Err(e) = self.active.switch(&mut self.node.swarm.behaviour_mut().gossipsub, space, channel) {
             return self.error(CoreError::Network(format!("{:?}", e)));
         }

@@ -1,4 +1,6 @@
 pub mod b64;
+pub mod config;
+pub mod dm;
 pub mod files;
 pub mod runtime;
 pub mod wire;
@@ -15,6 +17,8 @@ pub mod file_transfer;
 pub mod screen;
 
 pub use identity::UserIdentity;
+pub use config::NodeConfig;
+pub use dm::{dm_topic, DirectMessageEnvelope, DmWireMessage, MailboxMessage, StoredEnvelope};
 pub use api::{peer_id_from_pubkey_hex, ChatMessage};
 pub use runtime::{Core, CoreCommand, CoreConfig, CoreEvent, CoreHandle, CoreTask};
 pub use community::{Channel, ChannelType, ServerMessage, ServerRegistry, Space};

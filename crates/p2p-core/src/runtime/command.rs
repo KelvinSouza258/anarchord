@@ -44,6 +44,13 @@ pub enum CoreCommand {
     AddFriend { pubkey: String, alias: Option<String> },
     RemoveFriend { pubkey: String },
     ListFriends,
+    /// Abre uma conversa privada de DM como canal ativo (`@Nome`)
+    OpenDm { target: String },
+    /// Envia uma Mensagem Direta (E2EE online ou Store-and-Forward offline com TTL opcional)
+    SendDm { target: String, text: String, suggested_ttl: Option<u64> },
+    /// Configuração do nó e da Mailbox
+    ShowConfig,
+    SetConfig { key: String, value: String },
     Server(ServerCommand),
     /// Encerra o nó (desanuncia nos trackers e emite `CoreEvent::Stopped`)
     Shutdown,

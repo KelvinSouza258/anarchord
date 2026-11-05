@@ -19,7 +19,7 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 use editor::LineEditor;
-use menu::{channel_command, channel_menu, main_menu, member_menu, spaces_menu, Menu, MenuAction, MenuContext, ServerEntry, HELP_LINES};
+use menu::{channel_command, channel_menu, main_menu, member_menu, spaces_menu, FriendUiEntry, Menu, MenuAction, MenuContext, ServerEntry, HELP_LINES};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,6 +54,20 @@ pub enum UiEvent {
     },
     /// Servidores conhecidos (para o menu "Trocar de espaço")
     ServersChanged(Vec<ServerEntry>),
+    /// Amigos conhecidos e seu status online/offline
+    FriendsChanged(Vec<FriendUiEntry>),
+    /// Conversa direta (DM) recebida ou enviada
+    DirectMessage {
+        peer_name: String,
+        author: String,
+        text: String,
+        offline_delivery: bool,
+    },
+    /// Conversa direta (DM) aberta como canal ativo (`@Nome`)
+    DmOpened {
+        peer_name: String,
+        channel: String,
+    },
     /// Pares inscritos no tópico de um canal de texto (presença na sala)
     ChannelMembers {
         channel: String,
@@ -105,6 +119,7 @@ pub struct TerminalUi {
     /// Menu, diálogo ou ajuda aberto por cima da tela
     overlay: Option<Overlay>,
     servers: Vec<ServerEntry>,
+    friends: Vec<FriendUiEntry>,
     in_server: bool,
     chat_area: Rect,
     /// Largura do rótulo da aba Chat no título (para saber em qual aba o clique caiu)
@@ -153,6 +168,7 @@ impl TerminalUi {
             chat_scroll: 0,
             overlay: None,
             servers: Vec::new(),
+            friends: Vec::new(),
             in_server: false,
             chat_area: Rect::default(),
             tab_split: 0,
@@ -263,6 +279,23 @@ impl TerminalUi {
             }
             UiEvent::ServersChanged(servers) => {
                 self.servers = servers;
+            }
+            UiEvent::FriendsChanged(friends) => {
+                self.friends = friends;
+            }
+            UiEvent::DirectMessage { peer_name, author, text, offline_delivery } => {
+                let dm_chan = format!("@{}", peer_name);
+                let tag = if offline_delivery { " [📬 Offline E2EE]" } else { " [🔒 E2EE]" };
+                self.messages.push(format!("[{}{}] {}: {}", dm_chan, tag, author, text));
+                let set = self.channel_members.entry(dm_chan).or_default();
+                set.insert(self.my_nick.clone());
+                set.insert(peer_name);
+            }
+            UiEvent::DmOpened { peer_name, channel } => {
+                self.current_channel = channel.clone();
+                let set = self.channel_members.entry(channel).or_default();
+                set.insert(self.my_nick.clone());
+                set.insert(peer_name);
             }
             UiEvent::ChannelMembers { channel, members } => {
                 let set = self.channel_members.entry(channel).or_default();
@@ -474,6 +507,7 @@ impl TerminalUi {
             in_server: self.in_server,
             in_voice: self.current_voice_channel.is_some(),
             servers: &self.servers,
+            friends: &self.friends,
         };
         self.overlay = Some(Overlay::Menu(vec![main_menu(&ctx)]));
     }
@@ -516,15 +550,19 @@ impl TerminalUi {
             }
             command if command.starts_with('/') => vec![UiAction::SendMessage(command.to_string())],
             text => {
-                self.messages.push(format!("[#{}] {}: {}", self.current_channel, self.my_nick, text));
+                // Em canais normais fazemos eco imediato; em DMs (@Amigo), o Core emite DirectMessage de volta
+                if !self.current_channel.starts_with('@') {
+                    self.messages.push(format!("[#{}] {}: {}", self.current_channel, self.my_nick, text));
+                }
                 vec![UiAction::SendMessage(text.to_string())]
             }
         }
     }
 
-    /// Palavras para completar com Tab: nicks conhecidos e canais do espaço
+    /// Palavras para completar com Tab: nicks conhecidos, amigos e canais do espaço
     fn completion_words(&self) -> Vec<String> {
         let mut words: Vec<String> = self.peers.iter().map(|(_, nick, _)| nick.clone()).collect();
+        words.extend(self.friends.iter().map(|f| f.display_name.clone()));
         words.extend(self.channel_members.values().flatten().cloned());
         words.extend(self.space_channels.iter().map(|(name, _)| name.clone()));
         words.retain(|w| *w != self.my_nick);
@@ -653,11 +691,12 @@ impl TerminalUi {
             "🎙️  [MIC ATIVO]"
         };
 
+        let chan_prefix = if self.current_channel.starts_with('@') { "" } else { "#" };
         let spans = vec![
             Span::styled("⚡ ANARCHORD P2P ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(format!("| Usuário: {} ", self.my_nick), Style::default().fg(Color::Cyan)),
             Span::styled(format!("| Chave: {}... ", &self.my_pubkey[..8]), Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("| {} #{} ", self.space_name, self.current_channel), Style::default().fg(Color::Green)),
+            Span::styled(format!("| {} {}{} ", self.space_name, chan_prefix, self.current_channel), Style::default().fg(Color::Green)),
             Span::styled(format!("| {}", muted_str), Style::default().fg(Color::Magenta)),
         ];
         // Guarda onde ficaram o espaço (abre a troca Lobby/servidores) e o MIC (liga/desliga)
@@ -721,8 +760,9 @@ impl TerminalUi {
         // 0. Canais do espaço atual (Lobby ou servidor)
         let mut channel_items: Vec<ListItem> = Vec::new();
         if self.space_channels.is_empty() {
+            let chan_prefix = if self.current_channel.starts_with('@') { "💬" } else { "#" };
             channel_items.push(ListItem::new(Line::from(Span::styled(
-                format!("▶ # {}", self.current_channel),
+                format!("▶ {} {}", chan_prefix, self.current_channel),
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             ))));
             channel_items.push(ListItem::new(Line::from(Span::styled(
@@ -774,18 +814,43 @@ impl TerminalUi {
                         .find(|(_, n, _)| n == nick)
                         .map(|(_, _, pk)| if pk.len() >= 6 { format!(" ({})", &pk[..6]) } else { format!(" ({})", pk) })
                         .unwrap_or_default();
+                    let is_friend = self.friends.iter().any(|f| f.display_name.eq_ignore_ascii_case(nick));
+                    let friend_badge = if is_friend { " 💚" } else { "" };
 
                     room_members_items.push(ListItem::new(Line::from(vec![
                         Span::styled("🟢 ", Style::default().fg(Color::Green)),
-                        Span::styled(nick.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("{}{}", nick, friend_badge), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                         Span::styled(short_pk, Style::default().fg(Color::DarkGray)),
                     ])));
                 }
             }
         }
 
+        // Amigos (online fora da sala ou offline) também aparecem clicáveis na lista
+        for f in &self.friends {
+            if seen_nicks.insert(f.display_name.clone()) {
+                self.member_rows.push(f.display_name.clone());
+                let short_pk = if f.public_key.len() >= 6 {
+                    format!(" ({})", &f.public_key[..6])
+                } else {
+                    format!(" ({})", f.public_key)
+                };
+                let (dot, style) = if f.online {
+                    ("🟢 ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                } else {
+                    ("⚪ ", Style::default().fg(Color::Gray))
+                };
+                room_members_items.push(ListItem::new(Line::from(vec![
+                    Span::styled(dot, if f.online { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) }),
+                    Span::styled(format!("{} 💚", f.display_name), style),
+                    Span::styled(short_pk, Style::default().fg(Color::DarkGray)),
+                ])));
+            }
+        }
+
         // Título com membros da sala e total no Swarm P2P
-        let room_members_title = format!(" Membros #{} [Swarm: {}] ", self.current_channel, self.peers.len());
+        let room_prefix = if self.current_channel.starts_with('@') { "" } else { "#" };
+        let room_members_title = format!(" Membros {}{} [Swarm: {}] ", room_prefix, self.current_channel, self.peers.len());
         let peers_list = List::new(room_members_items).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -884,7 +949,8 @@ impl TerminalUi {
             .collect();
 
         // Título com as duas abas; a ativa em destaque
-        let chat_label = format!(" 💬 Chat #{} ", self.current_channel);
+        let chat_prefix = if self.current_channel.starts_with('@') { "" } else { "#" };
+        let chat_label = format!(" 💬 Chat {}{} ", chat_prefix, self.current_channel);
         let system_label = if self.system_unread > 0 {
             format!(" ⚙️ Sistema ({}) ", self.system_unread)
         } else {
@@ -1006,6 +1072,9 @@ mod tests {
             .replace("🌐  ", "🌐 ")
             .replace("🏰  ", "🏰 ")
             .replace("🔊  ", "🔊 ")
+            .replace("💚  ", "💚 ")
+            .replace("📬  ", "📬 ")
+            .replace("🔒  ", "🔒 ")
     }
 
     fn bob_connected() -> UiEvent {
@@ -1305,6 +1374,45 @@ mod tests {
         let mut ui = ui_for("Alice");
         ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false)]));
         assert_eq!(sent(&select(&mut ui, "Adicionar aos amigos")), vec!["/friend add Bob"]);
+    }
+
+    #[test]
+    fn test_friends_presence_and_dm_channel_in_tui() {
+        let mut ui = ui_for("Alice");
+        ui.handle_event(UiEvent::FriendsChanged(vec![
+            FriendUiEntry {
+                public_key: "1111222233334444".into(),
+                display_name: "Bobby".into(),
+                online: false,
+            },
+            FriendUiEntry {
+                public_key: "aaaabbbbccccdddd".into(),
+                display_name: "Carol".into(),
+                online: true,
+            },
+        ]));
+        let screen = render(&mut ui);
+        assert!(screen.contains("Bobby 💚 (111122)"), "amigo offline visível na lista:\n{}", screen);
+        assert!(screen.contains("Carol 💚 (aaaabb)"), "amiga online visível na lista:\n{}", screen);
+
+        // Abre menu principal (F1) -> Amigos e DMs -> Bobby -> Abrir conversa direta (DM)
+        ui.handle_key(key(KeyCode::F(1)));
+        select(&mut ui, "Amigos e DMs");
+        assert!(render(&mut ui).contains("Bobby (11112222)"));
+        select(&mut ui, "Bobby");
+        assert_eq!(sent(&select(&mut ui, "Abrir conversa direta")), vec!["/dm open Bobby"]);
+
+        // Simula resposta do Core abrindo o canal @Bobby e recebendo uma DM offline e online
+        ui.handle_event(UiEvent::DmOpened { peer_name: "Bobby".into(), channel: "@Bobby".into() });
+        ui.handle_event(UiEvent::DirectMessage {
+            peer_name: "Bobby".into(),
+            author: "Bobby".into(),
+            text: "oi da mailbox!".into(),
+            offline_delivery: true,
+        });
+        let screen = render(&mut ui);
+        assert!(screen.contains("Chat @Bobby"), "título mostra @Bobby sem #:\n{}", screen);
+        assert!(screen.contains("[@Bobby [📬 Offline E2EE]] Bobby: oi da mailbox!"), "{}", screen);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
-use ui::menu::ServerEntry;
+use ui::menu::{FriendUiEntry, ServerEntry};
 use ui::{TerminalUi, UiAction, UiEvent};
 
 #[derive(Parser, Debug, PartialEq)]
@@ -53,6 +53,10 @@ pub struct Args {
     /// Gravar logs de telemetria e diagnóstico em arquivo (ex: anarchord.log)
     #[arg(long)]
     pub log_file: Option<PathBuf>,
+
+    /// Caminho customizado para o arquivo de configuração `config.json` (opcional)
+    #[arg(long)]
+    pub config: Option<PathBuf>,
 }
 
 /// Quadros de vídeo aguardando a janela do viewer. Fila curta: se a janela atrasar, os quadros
@@ -80,6 +84,10 @@ pub enum ChatAction {
     AddFriend { pubkey: String, alias: Option<String> },
     RemoveFriend(String),
     ListFriends,
+    OpenDm(String),
+    SendDm { target: String, text: String, suggested_ttl: Option<u64> },
+    ShowConfig,
+    SetConfig { key: String, value: String },
     ScreenStart { monitor_idx: usize, quality: u32 },
     ScreenStop,
     ScreenWatch(String),
@@ -199,6 +207,40 @@ pub fn parse_user_input(input: &str) -> ChatAction {
             }
         }
     }
+    if let Some(rest) = trimmed.strip_prefix("/dm ").map(str::trim) {
+        if let Some(open_target) = rest.strip_prefix("open ").map(str::trim).filter(|t| !t.is_empty()) {
+            return ChatAction::OpenDm(open_target.to_string());
+        }
+        if let Some((target, mut msg_part)) = rest.split_once(char::is_whitespace) {
+            let target = target.trim();
+            msg_part = msg_part.trim();
+            let mut suggested_ttl = None;
+            if let Some((before_ttl, ttl_str)) = msg_part.rsplit_once("--ttl ") {
+                if let Some(secs) = p2p_core::config::parse_ttl_arg(ttl_str.trim()) {
+                    suggested_ttl = Some(secs);
+                    msg_part = before_ttl.trim();
+                }
+            }
+            if !target.is_empty() && !msg_part.is_empty() {
+                return ChatAction::SendDm {
+                    target: target.to_string(),
+                    text: msg_part.to_string(),
+                    suggested_ttl,
+                };
+            }
+        }
+    }
+    if trimmed == "/config" || trimmed == "/config show" {
+        return ChatAction::ShowConfig;
+    }
+    if let Some(rest) = trimmed.strip_prefix("/config set ").map(str::trim) {
+        if let Some((key, value)) = rest.split_once(char::is_whitespace) {
+            let (key, value) = (key.trim(), value.trim());
+            if !key.is_empty() && !value.is_empty() {
+                return ChatAction::SetConfig { key: key.to_string(), value: value.to_string() };
+            }
+        }
+    }
     ChatAction::SendTextMessage(trimmed.to_string())
 }
 
@@ -216,6 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = CoreConfig {
         identity_path: Some(args.identity_file.clone()),
+        config_path: args.config.clone(),
         identity: identity.clone(),
         port: args.port,
         servers_dir: servers_dir_for(&args.identity_file),
@@ -367,6 +410,31 @@ fn ui_events(event: &CoreEvent) -> Vec<UiEvent> {
                 .map(|s| ServerEntry { name: s.name.clone(), id: s.id.clone(), current: s.current, owner: s.owner, pending: s.pending })
                 .collect(),
         )),
+        CoreEvent::Friends(list) => out.push(UiEvent::FriendsChanged(
+            list.iter()
+                .map(|f| {
+                    let display_name = f
+                        .alias
+                        .clone()
+                        .or_else(|| f.current_nick.clone())
+                        .unwrap_or_else(|| p2p_core::community::short_id(&f.public_key).to_string());
+                    FriendUiEntry {
+                        public_key: f.public_key.clone(),
+                        display_name,
+                        online: f.online,
+                    }
+                })
+                .collect(),
+        )),
+        CoreEvent::DmOpened { peer_name, channel, .. } => {
+            out.push(UiEvent::DmOpened { peer_name: peer_name.clone(), channel: channel.clone() })
+        }
+        CoreEvent::DirectMessage { peer_name, author, text, offline_delivery, .. } => out.push(UiEvent::DirectMessage {
+            peer_name: peer_name.clone(),
+            author: author.clone(),
+            text: text.clone(),
+            offline_delivery: *offline_delivery,
+        }),
         CoreEvent::ChannelEntered { channel, .. } => out.push(UiEvent::ChannelChanged(channel.clone())),
         CoreEvent::ChannelMembers { channel, members } => {
             out.push(UiEvent::ChannelMembers { channel: channel.clone(), members: members.clone() })
@@ -419,6 +487,10 @@ impl ChatAction {
             ChatAction::AddFriend { pubkey, alias } => CoreCommand::AddFriend { pubkey, alias },
             ChatAction::RemoveFriend(pubkey) => CoreCommand::RemoveFriend { pubkey },
             ChatAction::ListFriends => CoreCommand::ListFriends,
+            ChatAction::OpenDm(target) => CoreCommand::OpenDm { target },
+            ChatAction::SendDm { target, text, suggested_ttl } => CoreCommand::SendDm { target, text, suggested_ttl },
+            ChatAction::ShowConfig => CoreCommand::ShowConfig,
+            ChatAction::SetConfig { key, value } => CoreCommand::SetConfig { key, value },
             ChatAction::ScreenStart { monitor_idx, quality } => CoreCommand::StartScreenShare { monitor: monitor_idx, quality },
             ChatAction::ScreenStop => CoreCommand::StopScreenShare,
             ChatAction::ScreenList => CoreCommand::ListScreens,
@@ -498,6 +570,33 @@ mod tests {
         );
         assert_eq!(parse_user_input(&format!("/friend add {}", pk)), ChatAction::AddFriend { pubkey: pk.clone(), alias: None });
         assert_eq!(parse_user_input(&format!("/friend remove {}", pk)), ChatAction::RemoveFriend(pk));
+    }
+
+    #[test]
+    fn test_parse_dm_and_config_commands() {
+        assert_eq!(parse_user_input("/dm open Bob"), ChatAction::OpenDm("Bob".into()));
+        assert_eq!(
+            parse_user_input("/dm Bob olá mundo privado!"),
+            ChatAction::SendDm {
+                target: "Bob".into(),
+                text: "olá mundo privado!".into(),
+                suggested_ttl: None,
+            }
+        );
+        assert_eq!(
+            parse_user_input("/dm Bob urgente --ttl 2h"),
+            ChatAction::SendDm {
+                target: "Bob".into(),
+                text: "urgente".into(),
+                suggested_ttl: Some(7200),
+            }
+        );
+        assert_eq!(parse_user_input("/config"), ChatAction::ShowConfig);
+        assert_eq!(parse_user_input("/config show"), ChatAction::ShowConfig);
+        assert_eq!(
+            parse_user_input("/config set mailbox.max_ttl_days 14"),
+            ChatAction::SetConfig { key: "mailbox.max_ttl_days".into(), value: "14".into() }
+        );
     }
 
     /// Amigo adicionado pela TUI aparece offline e passa a online quando o par conecta
@@ -617,11 +716,12 @@ mod tests {
     }
 
     impl FakeUi {
-        fn start(nick: &str, connect_to: Option<u16>) -> (Self, u16) {
+        fn start_with_identity(identity: UserIdentity, connect_to: Option<u16>) -> (Self, u16) {
+            let nick = identity.profile.display_name.clone();
             let base = std::env::temp_dir().join(format!("anarchord_cli_{}_{}_{}", nick, std::process::id(), PeerId::random()));
-            let identity = UserIdentity::generate_with_nick(nick);
             let pubkey = identity.public_key_hex();
             let mut config = CoreConfig::new(identity, base.join("servers"), base.join("downloads"));
+            config.config_path = Some(base.join("config.json"));
             config.connect = connect_to.map(|port| format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap());
             let (core, task) = Core::start(config).unwrap();
             let port = task.listen_port();
@@ -631,6 +731,10 @@ mod tests {
             tokio::task::spawn_local(task.run());
             tokio::task::spawn_local(bridge(core_events, rx_actions, commands, tx_ui, Arc::new(AtomicBool::new(false))));
             (Self { actions, events, seen: Vec::new(), downloads: base.join("downloads"), pubkey }, port)
+        }
+
+        fn start(nick: &str, connect_to: Option<u16>) -> (Self, u16) {
+            Self::start_with_identity(UserIdentity::generate_with_nick(nick), connect_to)
         }
 
         /// Digita uma linha na caixa de texto
@@ -731,6 +835,76 @@ mod tests {
                 let mut app = app;
                 let log = app.wait_log("resposta ao comando /peers após tempo de espera", "Pares Anarchord conectados").await;
                 assert!(log.contains("Pares Anarchord conectados"));
+            })
+            .await;
+    }
+
+    /// Testa DMs 1:1 E2EE online (/dm e /dm open @Amigo), entrega offline via guardiã Carol
+    /// (mesmo sem Bob conhecer Carol) e comandos /config show e /config set.
+    #[tokio::test]
+    async fn test_dm_online_and_offline_via_guardian_and_config_in_the_tui() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Prepara a identidade do Bob de antemão (mas ele ainda NÃO está online!)
+                let bob_identity = UserIdentity::generate_with_nick("Bob");
+                let bob_pubkey = bob_identity.public_key_hex();
+
+                // Alice e sua amiga Carol ficam online
+                let (mut alice, alice_port) = FakeUi::start("Alice", None);
+                let (mut carol, carol_port) = FakeUi::start("Carol", Some(alice_port));
+
+                let alice_pk = alice.pubkey.clone();
+                let carol_pk = carol.pubkey.clone();
+                alice
+                    .wait("Alice identificar Carol", move |e| matches!(e, UiEvent::PeerConnected { pubkey, .. } if *pubkey == carol_pk))
+                    .await;
+                carol
+                    .wait("Carol identificar Alice", move |e| matches!(e, UiEvent::PeerConnected { pubkey, .. } if *pubkey == alice_pk))
+                    .await;
+
+                // Carol adiciona Alice como amiga (para atuar como guardiã da mailbox de Alice)
+                carol.type_line(&format!("/friend add {} Alice", alice.pubkey));
+                carol.wait_log("Carol adicionar Alice", "Alice adicionado").await;
+
+                // Alice adiciona Carol e Bob (que ainda está offline!) aos amigos
+                alice.type_line(&format!("/friend add {} Carol", carol.pubkey));
+                alice.wait_log("Alice adicionar Carol", "Carol adicionado").await;
+                alice.type_line(&format!("/friend add {} Bobby", bob_pubkey));
+                alice.wait_log("Alice adicionar Bobby offline", "Bobby adicionado").await;
+
+                // Testa /config show e /config set na Carol
+                carol.type_line("/config set mailbox.max_message_ttl_days 10");
+                carol.wait_log("Carol atualizar config", "mailbox.max_message_ttl_days").await;
+                carol.wait_log("Carol exibir status da config", "mailbox.max_message_ttl_days = 10").await;
+
+                // 1) DM Online E2EE entre Alice e Carol (usando /dm open Carol + mensagem direta)
+                alice.type_line("/dm open Carol");
+                alice
+                    .wait("Alice abrir canal @Carol", |e| matches!(e, UiEvent::DmOpened { channel, .. } if channel == "@Carol"))
+                    .await;
+                alice.type_line("segredo online para Carol");
+                carol
+                    .wait("Carol receber DM E2EE online de Alice", |e| {
+                        matches!(e, UiEvent::DirectMessage { author, text, offline_delivery: false, .. } if author == "Alice" && text == "segredo online para Carol")
+                    })
+                    .await;
+
+                // 2) DM Offline (Sign-then-Seal): Alice envia DM para Bobby enquanto Bob está OFFLINE!
+                alice.type_line("/dm Bobby mensagem guardada na malha --ttl 2h");
+                alice.wait_log("Alice enfileirar DM offline", "Bobby está offline: DM assinada e lacrada").await;
+                carol.wait_log("Carol guardar envelope para a amiga Alice", "Guardando envelope offline de Alice").await;
+
+                // 3) Agora Bob entra online conectando APENAS na Carol (Bob nem tem Carol nos amigos!)
+                let (mut bob, _) = FakeUi::start_with_identity(bob_identity, Some(carol_port));
+                bob.wait("Bob receber DM offline assinada por Alice via Carol", |e| {
+                    matches!(
+                        e,
+                        UiEvent::DirectMessage { author, text, offline_delivery: true, .. }
+                        if author == "Alice" && text == "mensagem guardada na malha"
+                    )
+                })
+                .await;
             })
             .await;
     }

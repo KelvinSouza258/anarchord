@@ -10,6 +10,7 @@
 
 use crate::api::ChatMessage;
 use crate::community::ServerMessage;
+use crate::dm::{DmWireMessage, MailboxMessage};
 use crate::files::SwarmMessage;
 use crate::runtime::discovery::PeerList;
 use crate::screen::{ScreenAnnounce, ScreenPacket};
@@ -30,6 +31,8 @@ pub enum Kind {
     ScreenAnnounce = 5,
     Server = 6,
     Peers = 7,
+    DirectMessage = 8,
+    Mailbox = 9,
 }
 
 impl Kind {
@@ -42,6 +45,8 @@ impl Kind {
             5 => Kind::ScreenAnnounce,
             6 => Kind::Server,
             7 => Kind::Peers,
+            8 => Kind::DirectMessage,
+            9 => Kind::Mailbox,
             _ => return None,
         })
     }
@@ -81,6 +86,8 @@ pub enum Incoming {
     ScreenAnnounce(ScreenAnnounce),
     Server(ServerMessage),
     Peers(PeerList),
+    DirectMessage(DmWireMessage),
+    Mailbox(MailboxMessage),
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -122,6 +129,8 @@ pub fn decode(bytes: &[u8]) -> Result<Incoming, WireError> {
         Kind::ScreenAnnounce => Incoming::ScreenAnnounce(read(body)?),
         Kind::Server => Incoming::Server(read(body)?),
         Kind::Peers => Incoming::Peers(read(body)?),
+        Kind::DirectMessage => Incoming::DirectMessage(read(body)?),
+        Kind::Mailbox => Incoming::Mailbox(read(body)?),
     })
 }
 

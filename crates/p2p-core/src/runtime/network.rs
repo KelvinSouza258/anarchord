@@ -233,6 +233,7 @@ impl Runtime {
                         self.publish_channel_members();
                         if first {
                             self.friend_presence(&friend_pubkey, true);
+                            self.on_peer_identified_dm_and_mailbox(&friend_pubkey);
                         }
                     }
                 }
@@ -423,6 +424,8 @@ impl Runtime {
             }
             Incoming::Peers(list) => self.on_peer_list(source, list),
             Incoming::Server(_) => tracing::debug!("Mensagem de servidor fora do tópico de controle descartada"),
+            Incoming::DirectMessage(dm_msg) => self.on_dm_wire_message(dm_msg),
+            Incoming::Mailbox(mb_msg) => self.on_mailbox_message(mb_msg),
         }
     }
 

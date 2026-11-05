@@ -10,6 +10,7 @@
 mod chat;
 pub mod discovery;
 pub mod command;
+mod dm;
 pub mod event;
 mod files;
 mod network;
@@ -39,6 +40,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 pub struct CoreConfig {
     /// Caminho do arquivo de identidade no disco (para persistir amigos e perfil)
     pub identity_path: Option<PathBuf>,
+    /// Caminho do arquivo de configuração `config.json` (None = padrão agnóstico ao SO)
+    pub config_path: Option<PathBuf>,
     pub identity: UserIdentity,
     /// Porta TCP + QUIC (0 = escolhe uma livre)
     pub port: u16,
@@ -82,6 +85,7 @@ impl CoreConfig {
     pub fn new(identity: UserIdentity, servers_dir: PathBuf, download_dir: PathBuf) -> Self {
         Self {
             identity_path: None,
+            config_path: None,
             identity,
             port: 0,
             servers_dir,
@@ -216,6 +220,7 @@ pub(crate) struct Runtime {
     voice: voice::VoiceState,
     screen: screen::ScreenState,
     files: files::FilesState,
+    dm: dm::DmState,
 }
 
 impl Runtime {
@@ -228,8 +233,10 @@ impl Runtime {
         )?;
         let mut relay_manager = RelayManager::new();
         relay_manager.allow_private(config.lab);
-        let servers = ServerRegistry::load(config.servers_dir.clone(), now_secs())?;
+        let now = now_secs();
+        let servers = ServerRegistry::load(config.servers_dir.clone(), now)?;
         let mls = ServerGroups::new(&identity, Some(config.servers_dir.join("mls-state.json")));
+        let dm = dm::DmState::new(config.config_path.clone(), Some(config.servers_dir.join("mailbox.json")), now);
         let active = ActiveChannel::new(Space::Lobby, config.channel.clone());
         node.swarm.behaviour_mut().gossipsub.subscribe(&active.topic).map_err(|e| CoreStartError::Subscribe(format!("{:?}", e)))?;
         let screen = screen::ScreenState::new(&mut node);
@@ -259,6 +266,7 @@ impl Runtime {
             voice: voice::VoiceState::default(),
             screen,
             files,
+            dm,
             config,
         })
     }
@@ -292,6 +300,7 @@ impl Runtime {
             }
         }
         self.subscribe_peer_exchange();
+        self.init_dm_and_mailbox();
         self.start_discovery();
         self.start_voice();
         self.start_synthetic_video();
@@ -300,6 +309,7 @@ impl Runtime {
 
         let mut discovery_tick = tokio::time::interval(Duration::from_secs(1));
         let mut server_sync = tokio::time::interval(Duration::from_secs(5));
+        let mut mailbox_tick = tokio::time::interval(Duration::from_secs(3));
         let mut screen_announce = tokio::time::interval(Duration::from_secs(2));
         let mut speaker_check = tokio::time::interval(Duration::from_millis(200));
         let mut files_tick = tokio::time::interval(Duration::from_secs(1));
@@ -317,6 +327,7 @@ impl Runtime {
                 event = self.node.swarm.next_event() => self.handle_swarm_event(event),
                 _ = discovery_tick.tick() => self.discovery_tick(),
                 _ = server_sync.tick() => self.server_sync_tick(),
+                _ = mailbox_tick.tick() => self.mailbox_tick(),
                 _ = screen_announce.tick() => self.screen_tick(),
                 _ = speaker_check.tick() => self.speaker_tick(),
                 _ = files_tick.tick() => self.files_tick(),
@@ -370,6 +381,10 @@ impl Runtime {
             CoreCommand::AddFriend { pubkey, alias } => self.add_friend(&pubkey, alias.as_deref()),
             CoreCommand::RemoveFriend { pubkey } => self.remove_friend(&pubkey),
             CoreCommand::ListFriends => self.list_friends(),
+            CoreCommand::OpenDm { target } => self.open_dm(&target),
+            CoreCommand::SendDm { target, text, suggested_ttl } => self.send_dm(&target, &text, suggested_ttl),
+            CoreCommand::ShowConfig => self.show_config(),
+            CoreCommand::SetConfig { key, value } => self.set_config(&key, &value),
             CoreCommand::Server(command) => self.run_server_command(command),
             CoreCommand::Shutdown => {}
         }
@@ -386,7 +401,7 @@ impl Runtime {
     }
 
     /// Nick conhecido de uma pubkey, ou o início dela
-    fn nick_for(&self, pubkey: &str) -> String {
+    pub(super) fn nick_for(&self, pubkey: &str) -> String {
         if pubkey == self.my_pubkey() {
             return self.nick.clone();
         }
@@ -395,6 +410,10 @@ impl Runtime {
             .find(|(_, pk)| pk == pubkey)
             .map(|(nick, _)| nick.clone())
             .unwrap_or_else(|| community::short_id(pubkey).to_string())
+    }
+
+    pub(super) fn nick_or_short(&self, pubkey: &str) -> String {
+        self.nick_for(pubkey)
     }
 
     /// PeerId de um par por nick, PeerId ou prefixo da pubkey
@@ -427,6 +446,10 @@ impl Runtime {
         match self.identity.add_friend(&pubkey, alias.as_deref()) {
             Ok(_) => {
                 self.persist_identity();
+                self.subscribe_dm_with(&pubkey);
+                if self.is_pubkey_online(&pubkey) {
+                    self.send_ephemeral_key_offer(&pubkey);
+                }
                 self.emit(CoreEvent::FriendUpdated { pubkey: pubkey.to_lowercase(), alias, removed: false });
                 self.list_friends();
             }
@@ -469,6 +492,7 @@ impl Runtime {
     pub(super) fn friend_presence(&self, pubkey: &str, online: bool) {
         if let Some(friend) = self.identity.get_friends().iter().find(|f| f.public_key.eq_ignore_ascii_case(pubkey)) {
             self.emit(CoreEvent::FriendPresence { public_key: friend.public_key.clone(), alias: friend.alias.clone(), online });
+            self.list_friends();
         }
     }
 
