@@ -504,6 +504,16 @@ impl wire::WireMessage for MailboxMessage {
 }
 
 impl StoredEnvelope {
+    /// Converte um timestamp que pode estar em segundos ou em milissegundos Unix (UTC) para segundos,
+    /// usado nos cálculos de TTL (`expires_at = created_at_secs + effective_ttl`).
+    pub fn created_at_secs(ts: u64) -> u64 {
+        if ts >= 100_000_000_000 {
+            ts / 1_000
+        } else {
+            ts
+        }
+    }
+
     /// Alice cria um `StoredEnvelope` Sign-then-Seal para Bob, com sugestão opcional de TTL
     pub fn create_signed_and_sealed(
         sender_identity: &UserIdentity,
@@ -515,7 +525,7 @@ impl StoredEnvelope {
         let recipient_clean = recipient_pubkey.trim().to_lowercase();
         let recipient_x25519 = ed25519_pub_hex_to_x25519(&recipient_clean)?;
 
-        // 1. Sign: Alice assina o payload interno com sua chave privada Ed25519
+        // 1. Sign: Alice assina o payload interno com sua chave privada Ed25519 (created_at em milissegundos na v1)
         let signed_inner = SignedDmPayload::new_signed(sender_identity, &recipient_clean, text, created_at);
         let inner_bytes = postcard::to_allocvec(&signed_inner).map_err(|_| DmError::DecryptionFailed)?;
 
@@ -544,7 +554,7 @@ impl StoredEnvelope {
 
         let sender_pubkey = sender_identity.public_key_hex();
         let ephemeral_pubkey = eph_pub.to_bytes();
-        let default_expires = created_at.saturating_add(suggested_ttl.unwrap_or(7 * 86_400));
+        let default_expires = Self::created_at_secs(created_at).saturating_add(suggested_ttl.unwrap_or(7 * 86_400));
 
         let outer_sig_bytes = Self::outer_signing_bytes(
             &envelope_id,

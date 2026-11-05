@@ -187,6 +187,14 @@ pub fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default()
 }
 
+/// Agora, em milissegundos Unix (UTC) — usado para o timestamp cronológico de envio das mensagens
+pub fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 /// Estado do nó. Os campos são usados pelos módulos de cada assunto.
 pub(crate) struct Runtime {
     config: CoreConfig,

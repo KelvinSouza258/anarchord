@@ -185,6 +185,7 @@ impl Runtime {
             return self.error(CoreError::Friend("Você não pode enviar DM para si mesmo".into()));
         }
         let now = super::now_secs();
+        let now_ms = super::now_millis();
         let topic_str = self.subscribe_dm_with(&peer_pk);
         let online = self.is_pubkey_online(&peer_pk);
 
@@ -200,7 +201,7 @@ impl Runtime {
                 &self.identity,
                 &peer_pk,
                 text,
-                now,
+                now_ms,
                 session_key.as_ref(),
             ) {
                 Ok(envelope) => {
@@ -213,19 +214,19 @@ impl Runtime {
                         author: self.nick.clone(),
                         author_pubkey: self.my_pubkey(),
                         text: text.to_string(),
-                        timestamp: now,
+                        timestamp: now_ms,
                         offline_delivery: false,
                     });
                 }
                 Err(e) => self.error(CoreError::Friend(e.to_string())),
             }
         } else {
-            // Destinatário offline: cria StoredEnvelope Sign-then-Seal e delega aos amigos guardiões
+            // Destinatário offline: cria StoredEnvelope Sign-then-Seal (timestamp em ms) e delega aos amigos guardiões
             match StoredEnvelope::create_signed_and_sealed(
                 &self.identity,
                 &peer_pk,
                 text,
-                now,
+                now_ms,
                 suggested_ttl,
             ) {
                 Ok(stored) => {
@@ -264,7 +265,7 @@ impl Runtime {
                         author: self.nick.clone(),
                         author_pubkey: self.my_pubkey(),
                         text: text.to_string(),
-                        timestamp: now,
+                        timestamp: now_ms,
                         offline_delivery: true,
                     });
                     self.emit(CoreEvent::MailboxQueued {
@@ -537,7 +538,7 @@ impl Runtime {
     }
 
     /// Envia 1 única mensagem de cortesia E2EE avisando o remetente de que ele foi bloqueado temporariamente pelo firewall local
-    fn send_courtesy_block_notice(&mut self, recipient_pubkey: &str, reason: &str, duration_secs: u64, now: u64) {
+    fn send_courtesy_block_notice(&mut self, recipient_pubkey: &str, reason: &str, duration_secs: u64, _now: u64) {
         let topic_str = self.subscribe_dm_with(recipient_pubkey);
         let courtesy_text = format!(
             "🛡️ [Aviso Automático do Firewall de {}]: Suas mensagens diretas foram temporariamente limitadas por {} ({}). Caso seja um engano, aguarde ou peça para {} te adicionar aos amigos.",
@@ -551,7 +552,7 @@ impl Runtime {
             &self.identity,
             recipient_pubkey,
             &courtesy_text,
-            now,
+            super::now_millis(),
             None,
         ) {
             let wire_msg = DmWireMessage::Message(envelope);

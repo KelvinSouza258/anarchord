@@ -67,7 +67,7 @@ impl Runtime {
                 return self.error(CoreError::NotOnAllowList);
             }
         }
-        let message = ChatMessage::new_signed(&self.identity, &self.active.channel, text, super::now_secs());
+        let message = ChatMessage::new_signed(&self.identity, &self.active.channel, text, super::now_millis());
         let topic = self.active.topic.clone();
         if let Err(PublishError::NoGroupKey) = self.publish_content(&topic, crate::wire::encode(&message)) {
             self.error(CoreError::NoGroupKey);

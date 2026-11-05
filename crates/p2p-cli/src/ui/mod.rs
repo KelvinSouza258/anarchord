@@ -29,7 +29,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 /// Eventos enviados pelo backend P2P para atualizar a TUI
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    /// Mensagem de chat recebida (com timestamp cronológico de envio em segundos Unix)
+    /// Mensagem de chat recebida (com timestamp cronológico de envio em milissegundos Unix)
     ChatMessage {
         channel: String,
         author: String,
@@ -57,7 +57,7 @@ pub enum UiEvent {
     ServersChanged(Vec<ServerEntry>),
     /// Amigos conhecidos e seu status online/offline
     FriendsChanged(Vec<FriendUiEntry>),
-    /// Conversa direta (DM) recebida ou enviada (com timestamp cronológico de envio em segundos Unix)
+    /// Conversa direta (DM) recebida ou enviada (com timestamp cronológico de envio em milissegundos Unix)
     DirectMessage {
         peer_name: String,
         author: String,
@@ -111,9 +111,9 @@ pub struct TerminalUi {
     editor: LineEditor,
     /// Aba Chat: só conversas (mantidas em ordem cronológica por `chat_entries`)
     messages: Vec<String>,
-    /// Chaves de ordenação `(timestamp, seq)` paralelas a `messages`
+    /// Chaves de ordenação `(timestamp_ms, seq)` paralelas a `messages`
     chat_entries: Vec<(u64, u64)>,
-    /// Contador monotônico de chegada para desempate estável no mesmo segundo
+    /// Contador monotônico de chegada para desempate estável no mesmo milissegundo
     next_message_seq: u64,
     /// Aba Sistema: notificações do core (conexões, DHT, sincronização, avisos)
     system_messages: Vec<String>,
@@ -249,7 +249,8 @@ impl TerminalUi {
     }
 
     /// Insere uma mensagem de chat ou DM mantendo a lista `messages` ordenada
-    /// cronologicamente pelo `timestamp` de envio (e pela ordem de chegada `seq` em caso de empate).
+    /// cronologicamente pelo `timestamp` de envio em milissegundos (e pela ordem de chegada `seq`
+    /// caso duas mensagens tenham sido geradas no exato mesmo milissegundo).
     fn push_chat_message(&mut self, timestamp: u64, text: String) {
         let seq = self.next_message_seq;
         self.next_message_seq += 1;
@@ -571,11 +572,11 @@ impl TerminalUi {
             text => {
                 // Em canais normais fazemos eco imediato; em DMs (@Amigo), o Core emite DirectMessage de volta
                 if !self.current_channel.starts_with('@') {
-                    let now_ts = std::time::SystemTime::now()
+                    let now_ts_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
+                        .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    self.push_chat_message(now_ts, format!("[#{}] {}: {}", self.current_channel, self.my_nick, text));
+                    self.push_chat_message(now_ts_ms, format!("[#{}] {}: {}", self.current_channel, self.my_nick, text));
                 }
                 vec![UiAction::SendMessage(text.to_string())]
             }
@@ -1605,58 +1606,61 @@ mod tests {
     }
 
     /// Issue #62: Mensagens de chat e DMs que chegam fora de ordem (por latência do Gossipsub
-    /// ou entrega tardia via Guardião da Mailbox Offline) são reordenadas automaticamente na TUI
-    /// pela ordem cronológica de envio (`timestamp`), mantendo estabilidade (`seq`) no mesmo segundo.
+    /// ou entrega tardia via Guardião da Mailbox Offline) — inclusive enviadas dentro do mesmo segundo
+    /// com diferença de milissegundos — são reordenadas automaticamente na TUI pela ordem cronológica
+    /// de envio (`timestamp` em milissegundos), mantendo estabilidade (`seq`) no mesmo milissegundo.
     #[test]
     fn test_messages_reordered_chronologically_by_send_timestamp() {
         let mut ui = ui_for("Alice");
 
-        // 1) Chega primeiro uma mensagem mais recente enviada em t = 100
+        // 1) Chega primeiro uma mensagem mais recente enviada em t = 1_700_000_090_850 ms (.850s do segundo 90)
         ui.handle_event(UiEvent::ChatMessage {
             channel: "geral".into(),
             author: "Bob".into(),
-            text: "terceira (enviada em t=100, chegou primeiro)".into(),
-            timestamp: 1_700_000_100,
+            text: "quarta (enviada em .850s do seg 90, chegou primeiro)".into(),
+            timestamp: 1_700_000_090_850,
         });
 
-        // 2) Depois chega uma DM da Mailbox Offline que havia sido enviada antes, em t = 80
+        // 2) Depois chega uma DM da Mailbox Offline que havia sido enviada antes, em t = 1_700_000_080_100 ms
         ui.handle_event(UiEvent::DirectMessage {
             peer_name: "Carol".into(),
             author: "Carol".into(),
-            text: "primeira (enviada em t=80 via guardião, chegou atrasada)".into(),
-            timestamp: 1_700_000_080,
+            text: "primeira (enviada em t=80.100s via guardião, chegou atrasada)".into(),
+            timestamp: 1_700_000_080_100,
             offline_delivery: true,
         });
 
-        // 3) Depois chegam duas mensagens enviadas no mesmo segundo intermediário t = 90
+        // 3) Duas mensagens no MESMO SEGUNDO (seg 90), mas em milissegundos diferentes (.120s e .450s),
+        // chegando na ordem INVERSA (.450s chega antes de .120s): o timestamp em ms corrige a ordem!
         ui.handle_event(UiEvent::ChatMessage {
             channel: "geral".into(),
             author: "Dave".into(),
-            text: "segunda A (enviada em t=90, 1a no mesmo segundo)".into(),
-            timestamp: 1_700_000_090,
+            text: "terceira (enviada em .450s do seg 90, chegou antes da de .120s)".into(),
+            timestamp: 1_700_000_090_450,
         });
         ui.handle_event(UiEvent::DirectMessage {
             peer_name: "Bob".into(),
             author: "Bob".into(),
-            text: "segunda B (enviada em t=90, 2a no mesmo segundo)".into(),
-            timestamp: 1_700_000_090,
+            text: "segunda (enviada em .120s do seg 90, chegou depois da de .450s)".into(),
+            timestamp: 1_700_000_090_120,
             offline_delivery: false,
         });
 
         // O banner inicial (timestamp = 0) permanece no topo (índices 0 e 1),
-        // seguido pelas mensagens em ordem cronológica estrita: t=80 -> t=90 (A) -> t=90 (B) -> t=100
+        // seguido pelas mensagens em ordem cronológica estrita em milissegundos:
+        // 80.100s -> 90.120s -> 90.450s -> 90.850s
         assert!(ui.messages[0].contains("Bem-vindo ao Anarchord"));
-        assert!(ui.messages[2].contains("primeira (enviada em t=80"));
-        assert!(ui.messages[3].contains("segunda A (enviada em t=90, 1a"));
-        assert!(ui.messages[4].contains("segunda B (enviada em t=90, 2a"));
-        assert!(ui.messages[5].contains("terceira (enviada em t=100"));
+        assert!(ui.messages[2].contains("primeira (enviada em t=80.100s"));
+        assert!(ui.messages[3].contains("segunda (enviada em .120s"));
+        assert!(ui.messages[4].contains("terceira (enviada em .450s"));
+        assert!(ui.messages[5].contains("quarta (enviada em .850s"));
 
-        // Verifica também na tela renderizada que a posição vertical (linha) respeita a ordem de envio
+        // Verifica também na tela renderizada que a posição vertical (linha) respeita a ordem de envio em ms
         let screen = render(&mut ui);
-        let pos_t80 = screen.find("primeira (enviada em t=80").expect("t=80 na tela");
-        let pos_t90_a = screen.find("segunda A (enviada em t=90").expect("t=90 A na tela");
-        let pos_t90_b = screen.find("segunda B (enviada em t=90").expect("t=90 B na tela");
-        let pos_t100 = screen.find("terceira (enviada em t=100").expect("t=100 na tela");
-        assert!(pos_t80 < pos_t90_a && pos_t90_a < pos_t90_b && pos_t90_b < pos_t100, "tela fora de ordem:\n{}", screen);
+        let pos_1 = screen.find("primeira (enviada em t=80.100s").expect("1a na tela");
+        let pos_2 = screen.find("segunda (enviada em .120s").expect("2a na tela");
+        let pos_3 = screen.find("terceira (enviada em .450s").expect("3a na tela");
+        let pos_4 = screen.find("quarta (enviada em .850s").expect("4a na tela");
+        assert!(pos_1 < pos_2 && pos_2 < pos_3 && pos_3 < pos_4, "tela fora de ordem:\n{}", screen);
     }
 }
