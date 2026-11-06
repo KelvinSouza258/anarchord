@@ -186,6 +186,7 @@ impl Runtime {
                     self.links.remove(&peer_id);
                     self.discovery.addresses.remove(&peer_id);
                     self.identified.remove(&peer_id);
+                    self.peer_topics.remove(&peer_id);
                     self.relay_manager.remove_peer(&peer_id);
                     let has_peers = self.anarchord_peers().next().is_some();
                     self.has_anarchord_connected.store(has_peers, std::sync::atomic::Ordering::Relaxed);
@@ -255,9 +256,13 @@ impl Runtime {
                 }
             }
             SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
-                self.on_subscribed(peer_id, topic)
+                self.peer_topics.entry(peer_id).or_default().insert(topic.clone());
+                self.on_subscribed(peer_id, topic);
             }
-            SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { topic, .. })) => {
+            SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
+                if let Some(set) = self.peer_topics.get_mut(&peer_id) {
+                    set.remove(&topic);
+                }
                 if topic == self.active.topic.hash() {
                     self.publish_channel_members();
                 }

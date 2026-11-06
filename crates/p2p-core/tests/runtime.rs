@@ -345,3 +345,51 @@ async fn test_two_cores_resume_file_after_restart() {
         })
         .await;
 }
+
+
+/// Issue #74: Nós que iniciam no mesmo canal devem se ver mutuamente em ChannelMembers
+/// ao se conectarem, sem precisar de JoinChannel manual nem de mensagem de chat.
+#[tokio::test]
+async fn test_two_cores_see_each_other_in_same_channel_on_connect() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let room = format!("geral-{}", rand_suffix());
+            let (mut alice, alice_task) = start_with_dirs(
+                "Alice",
+                UserIdentity::generate_with_nick("Alice"),
+                temp_dir("alice_srv"),
+                temp_dir("alice_down"),
+                room.clone(),
+                None,
+            );
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+
+            let (mut bob, bob_task) = start_with_dirs(
+                "Bob",
+                UserIdentity::generate_with_nick("Bob"),
+                temp_dir("bob_srv"),
+                temp_dir("bob_down"),
+                room.clone(),
+                Some(alice_port),
+            );
+            tokio::task::spawn_local(bob_task.run());
+
+            let r = room.clone();
+            let r2 = room.clone();
+            let alice_sees_bob = alice.wait("Alice ver Bob em ChannelMembers", move |e| {
+                matches!(e, CoreEvent::ChannelMembers { channel, members } if channel == &r && members.iter().any(|m| m == "Bob"))
+            });
+            let bob_sees_alice = bob.wait("Bob ver Alice em ChannelMembers", move |e| {
+                matches!(e, CoreEvent::ChannelMembers { channel, members } if channel == &r2 && members.iter().any(|m| m == "Alice"))
+            });
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(alice_sees_bob, bob_sees_alice);
+            })
+            .await
+            .expect("Ambos os nós devem se ver em ChannelMembers após conexão direta");
+        })
+        .await;
+}

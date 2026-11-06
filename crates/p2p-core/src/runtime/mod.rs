@@ -215,6 +215,10 @@ pub(crate) struct Runtime {
     links: HashMap<PeerId, (String, bool)>,
     /// PeerId -> (nick, pubkey) dos pares Anarchord identificados
     peer_metadata: HashMap<PeerId, (String, String)>,
+    /// Tópicos em que cada par remoto se inscreveu: PeerId -> HashSet<TopicHash>
+    /// Usado como barreira reativa determinística para garantir que se o Gossipsub negociar antes
+    /// ou depois do Identify, a lista de membros do canal seja publicada assim que ambos estiverem prontos.
+    peer_topics: HashMap<PeerId, HashSet<libp2p::gossipsub::TopicHash>>,
     /// PeerId -> capacidades e versões de protocolo anunciadas no Identify
     peer_protocols: HashMap<PeerId, crate::wire::ProtocolCapabilities>,
     /// Capacidades locais deste nó (`v1..=v2` por padrão)
@@ -285,6 +289,7 @@ impl Runtime {
             connected_peers: HashSet::new(),
             links: HashMap::new(),
             peer_metadata: HashMap::new(),
+            peer_topics: HashMap::new(),
             peer_protocols: HashMap::new(),
             local_capabilities,
             warned_incompatible: HashSet::new(),

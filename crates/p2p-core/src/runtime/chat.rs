@@ -5,7 +5,7 @@ use crate::api::ChatMessage;
 use crate::community::{channel_topic, ChannelType, Space};
 use libp2p::gossipsub::{self, IdentTopic};
 use libp2p::PeerId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Canal de texto em que o usuário está (espaço + nome + tópico inscrito)
 pub struct ActiveChannel {
@@ -40,17 +40,33 @@ impl ActiveChannel {
     }
 }
 
-/// Nicks dos pares Anarchord (identificados via Identify) inscritos no tópico do canal
-pub fn channel_members(gossipsub: &gossipsub::Behaviour, peer_metadata: &HashMap<PeerId, (String, String)>, topic: &IdentTopic) -> Vec<String> {
+/// Nicks dos pares Anarchord (identificados via Identify) inscritos no tópico do canal.
+/// Suporta resolução através do Behaviour do GossipSub e também via rastreamento de eventos
+/// `peer_topics` (garantindo barreira reativa determinística independente da ordem de chegada de Identify/Subscribed).
+pub fn channel_members_with_topics(
+    gossipsub: &gossipsub::Behaviour,
+    peer_metadata: &HashMap<PeerId, (String, String)>,
+    peer_topics: &HashMap<PeerId, HashSet<gossipsub::TopicHash>>,
+    topic: &IdentTopic,
+) -> Vec<String> {
     let topic_hash = topic.hash();
-    let mut members: Vec<String> = gossipsub
-        .all_peers()
-        .filter(|(_, topics)| topics.contains(&&topic_hash))
-        .filter_map(|(peer, _)| peer_metadata.get(peer).map(|(nick, _)| nick.clone()))
+    let mut members: Vec<String> = peer_metadata
+        .iter()
+        .filter(|(peer, _)| {
+            peer_topics.get(peer).is_some_and(|topics| topics.contains(&topic_hash))
+                || gossipsub.all_peers().any(|(p, topics)| p == *peer && topics.contains(&&topic_hash))
+        })
+        .map(|(_, (nick, _))| nick.clone())
         .collect();
     members.sort();
     members.dedup();
     members
+}
+
+/// Nicks dos pares Anarchord inscritos no tópico do canal (compatibilidade com testes e API externa)
+#[allow(dead_code)]
+pub fn channel_members(gossipsub: &gossipsub::Behaviour, peer_metadata: &HashMap<PeerId, (String, String)>, topic: &IdentTopic) -> Vec<String> {
+    channel_members_with_topics(gossipsub, peer_metadata, &HashMap::new(), topic)
 }
 
 impl Runtime {
@@ -133,7 +149,12 @@ impl Runtime {
     }
 
     pub(super) fn publish_channel_members(&self) {
-        let members = channel_members(&self.node.swarm.behaviour().gossipsub, &self.peer_metadata, &self.active.topic);
+        let members = channel_members_with_topics(
+            &self.node.swarm.behaviour().gossipsub,
+            &self.peer_metadata,
+            &self.peer_topics,
+            &self.active.topic,
+        );
         self.emit(CoreEvent::ChannelMembers { channel: self.active.channel.clone(), members });
     }
 
