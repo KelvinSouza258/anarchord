@@ -184,6 +184,7 @@ Tracked as [GitHub milestones](https://github.com/VictorGerin/anarchord/mileston
 - [ ] Separation of Identity (Signing) and Encryption (X25519) keys with rotation [#69](https://github.com/VictorGerin/anarchord/issues/69)
 - [ ] Mutual friend request protocol with offline guardian support [#70](https://github.com/VictorGerin/anarchord/issues/70)
 - [ ] Mailbox optimization (Base64 for binary arrays) and reliable message pruning [#71](https://github.com/VictorGerin/anarchord/issues/71)
+- [ ] Mailbox metadata protection: move topic to encrypted payload [#72](https://github.com/VictorGerin/anarchord/issues/72)
 - [ ] Handle unshared or unavailable downloads gracefully (prevent 0% stalls) [#67](https://github.com/VictorGerin/anarchord/issues/67)
 - [ ] Bandwidth and rate limiting configuration for file transfers [#65](https://github.com/VictorGerin/anarchord/issues/65)
 - [ ] Encrypted space indicator 🔐 in TUI [#16](https://github.com/VictorGerin/anarchord/issues/16)
