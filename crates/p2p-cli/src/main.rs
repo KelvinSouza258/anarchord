@@ -5,7 +5,7 @@ mod ui;
 
 use clap::Parser;
 use p2p_core::files::{FileEvent, FileState};
-use p2p_core::runtime::{Core, CoreCommand, CoreConfig, CoreError, CoreEvent, ScreenEvent, ServerCommand, SpaceInfo, VoiceEvent};
+use p2p_core::runtime::{CoreCommand, CoreConfig, CoreError, CoreEvent, ScreenEvent, ServerCommand, SpaceInfo, VoiceEvent};
 use p2p_core::screen::VideoCodec;
 use p2p_core::UserIdentity;
 use screen_viewer::ScreenViewer;
@@ -309,8 +309,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sniff_file: std::env::var("ANARCHORD_SNIFF_FILE").ok().map(PathBuf::from),
         protocol_capabilities: None,
     };
-    let (core, task) = Core::start(config)?;
-    let (commands, events) = core.split();
+    let engine = p2p_ffi::FfiEngine::start(config)?;
+    let (commands, events) = engine.split();
 
     // Configura panic hook para garantir que o terminal seja sempre restaurado
     let default_panic = std::panic::take_hook();
@@ -344,14 +344,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui_handle
     };
 
-    // O loop do core roda nesta tarefa enquanto a UI estiver aberta
-    let run = task.run();
-    tokio::pin!(run);
-    tokio::select! {
-        _ = &mut run => {},
-        // A UI fechou (o Shutdown já foi enviado): o core termina de desanunciar o nó
-        _ = ui_handle => { let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut run).await; }
-    }
+    // A UI fechou (o Shutdown já foi enviado): o core worker encerra
+    let _ = ui_handle.await;
     TerminalUi::restore_terminal();
     // Encerra na hora: threads de áudio, captura e rede não seguram o processo
     std::process::exit(0)
@@ -882,12 +876,11 @@ mod tests {
             config.sniff_file = Some(sniff_file.clone());
             config.protocol_capabilities = protocol_capabilities;
             config.connect = connect_to.map(|port| format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap());
-            let (core, task) = Core::start(config).unwrap();
-            let port = task.listen_port();
-            let (commands, core_events) = core.split();
+            let engine = p2p_ffi::FfiEngine::start(config).unwrap();
+            let port = engine.listen_port();
+            let (commands, core_events) = engine.split();
             let (tx_ui, events) = tokio::sync::mpsc::unbounded_channel();
             let (actions, rx_actions) = tokio::sync::mpsc::unbounded_channel();
-            tokio::task::spawn_local(task.run());
             tokio::task::spawn_local(bridge(core_events, rx_actions, commands, tx_ui, Arc::new(AtomicBool::new(false))));
             (Self { actions, events, seen: Vec::new(), downloads: base.join("downloads"), sniff_file, pubkey }, port)
         }
