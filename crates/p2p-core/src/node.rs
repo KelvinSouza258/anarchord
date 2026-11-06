@@ -292,11 +292,27 @@ impl P2PNode {
         } else {
             listen_port
         };
-        let tcp_listen: Multiaddr = format!("/ip4/{}/tcp/{}", bind_ip, listen_port).parse().unwrap();
-        let quic_listen: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", bind_ip, listen_port).parse().unwrap();
+        let is_v6 = bind_ip.contains(':');
+        let proto = if is_v6 { "ip6" } else { "ip4" };
+        let tcp_listen: Multiaddr = format!("/{}/{}/tcp/{}", proto, bind_ip, listen_port).parse().unwrap();
+        let quic_listen: Multiaddr = format!("/{}/{}/udp/{}/quic-v1", proto, bind_ip, listen_port).parse().unwrap();
 
         swarm.listen_on(tcp_listen).map_err(|e| NodeError::SwarmInit(e.to_string()))?;
         swarm.listen_on(quic_listen).map_err(|e| NodeError::SwarmInit(e.to_string()))?;
+
+        // Dual-Stack (IPv4 + IPv6): em produção, escuta também em IPv6 se o SO suportar
+        if bind_ip == "0.0.0.0" {
+            if let Ok(tcp6) = format!("/ip6/::/tcp/{}", listen_port).parse::<Multiaddr>() {
+                if let Err(e) = swarm.listen_on(tcp6) {
+                    tracing::debug!("Escuta IPv6 TCP não disponível: {}", e);
+                }
+            }
+            if let Ok(quic6) = format!("/ip6/::/udp/{}/quic-v1", listen_port).parse::<Multiaddr>() {
+                if let Err(e) = swarm.listen_on(quic6) {
+                    tracing::debug!("Escuta IPv6 QUIC não disponível: {}", e);
+                }
+            }
+        }
 
         Ok(Self {
             peer_id,
@@ -417,5 +433,13 @@ mod tests {
         assert_ne!(port, 0);
         assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
         assert!(UdpSocket::bind(("127.0.0.1", port)).is_ok());
+    }
+
+    #[test]
+    fn test_node_dual_stack_multiaddr_format() {
+        let v4: Multiaddr = format!("/ip4/{}/tcp/{}", "127.0.0.1", 7000).parse().unwrap();
+        let v6: Multiaddr = format!("/ip6/{}/tcp/{}", "::1", 7000).parse().unwrap();
+        assert_eq!(v4.to_string(), "/ip4/127.0.0.1/tcp/7000");
+        assert_eq!(v6.to_string(), "/ip6/::1/tcp/7000");
     }
 }
