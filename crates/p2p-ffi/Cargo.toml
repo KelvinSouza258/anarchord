@@ -1,0 +1,22 @@
+[package]
+name = "p2p-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "Universal FFI & Shared Memory Layer for Anarchord P2P Engine"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+p2p-core = { path = "../p2p-core" }
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+postcard = { version = "1.1", features = ["alloc"] }
+tracing = "0.1"
+thiserror = "1.0"
+jni = "0.21"
+
+[dev-dependencies]
+tokio-test = "0.4"
+rand = "0.8"
