@@ -62,8 +62,9 @@ class MainActivity : AppCompatActivity() {
                     isRunning = true
                     startEventLoop()
                 } else {
+                    val err = NativeBridge.getLastError()
                     mainHandler.post {
-                        statusText.text = "🔴 Falha ao iniciar nó nativo"
+                        statusText.text = "🔴 Falha ao iniciar nó: $err"
                     }
                 }
             } catch (e: Exception) {

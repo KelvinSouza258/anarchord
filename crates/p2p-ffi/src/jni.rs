@@ -1,8 +1,9 @@
 //! Suporte nativo JNI para o aplicativo Android Anarchord.
 
 use crate::c_api::{
-    p2p_ffi_destroy, p2p_ffi_join_channel, p2p_ffi_listen_port, p2p_ffi_poll_event,
-    p2p_ffi_poll_event_json, p2p_ffi_send_message, p2p_ffi_start_simple, p2p_ffi_stop,
+    get_last_error, p2p_ffi_destroy, p2p_ffi_join_channel, p2p_ffi_listen_port,
+    p2p_ffi_poll_event, p2p_ffi_poll_event_json, p2p_ffi_send_message, p2p_ffi_start_simple,
+    p2p_ffi_stop,
 };
 use crate::engine::FfiEngine;
 use crate::memory::p2p_ffi_free_buffer;
@@ -10,6 +11,19 @@ use jni::objects::{JClass, JString};
 use jni::sys::{jint, jlong, jobject, jstring};
 use jni::JNIEnv;
 use std::ffi::CString;
+
+/// Retorna a última mensagem de erro registrada.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_anarchord_mobile_NativeBridge_getLastError(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let err = get_last_error();
+    match env.new_string(err) {
+        Ok(jstr) => jstr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
 
 /// Inicia o nó P2P a partir do Kotlin. Retorna o ponteiro `jlong` da engine.
 #[no_mangle]

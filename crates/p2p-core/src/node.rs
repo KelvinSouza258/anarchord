@@ -154,6 +154,9 @@ impl P2PNode {
         let keypair = identity.to_libp2p_keypair();
         let peer_id = PeerId::from(keypair.public());
 
+        let dns_config = libp2p::dns::ResolverConfig::cloudflare();
+        let dns_opts = libp2p::dns::ResolverOpts::default();
+
         let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
             .with_tokio()
             .with_tcp(
@@ -163,8 +166,7 @@ impl P2PNode {
             )
             .map_err(|e| NodeError::SwarmInit(e.to_string()))?
             .with_quic()
-            .with_dns()
-            .map_err(|e| NodeError::SwarmInit(e.to_string()))?
+            .with_dns_config(dns_config, dns_opts)
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .map_err(|e| NodeError::SwarmInit(e.to_string()))?
             .with_behaviour(|key, relay_client| {

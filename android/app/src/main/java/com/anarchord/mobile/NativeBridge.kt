@@ -9,10 +9,11 @@ import java.nio.ByteBuffer
 object NativeBridge {
     init {
         try {
-            System.loadLibrary("p2p_ffi")
-        } catch (e: UnsatisfiedLinkError) {
-            System.err.println("Aviso: libp2p_ffi não carregada em modo desktop/mock: ${e.message}")
+            System.loadLibrary("c++_shared")
+        } catch (e: Throwable) {
+            // Ignora se o sistema já tiver carregado
         }
+        System.loadLibrary("p2p_ffi")
     }
 
     /**
@@ -20,6 +21,11 @@ object NativeBridge {
      * Retorna o identificador nativo (ponteiro em memória `Long`).
      */
     external fun startSimple(nick: String, dataDir: String, port: Int): Long
+
+    /**
+     * Retorna a última mensagem de erro registrada pelo motor nativo.
+     */
+    external fun getLastError(): String
 
     /**
      * Envia mensagem de texto no canal ativo.

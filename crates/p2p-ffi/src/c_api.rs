@@ -17,6 +17,20 @@ pub const FFI_ERR_CODEC: i32 = -2;
 /// Código de retorno de erro ao executar/enviar comando
 pub const FFI_ERR_EXEC: i32 = -3;
 
+use std::sync::Mutex;
+
+static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+
+pub fn set_last_error(msg: String) {
+    if let Ok(mut lock) = LAST_ERROR.lock() {
+        *lock = msg;
+    }
+}
+
+pub fn get_last_error() -> String {
+    LAST_ERROR.lock().map(|l| l.clone()).unwrap_or_default()
+}
+
 /// Inicia o nó P2P com configurações básicas (Nick, Diretório de Armazenamento e Porta).
 ///
 /// # Safety
@@ -28,19 +42,30 @@ pub unsafe extern "C" fn p2p_ffi_start_simple(
     port: u16,
 ) -> *mut FfiEngine {
     if nick.is_null() || data_dir.is_null() {
+        set_last_error("Ponteiro nulo passado para p2p_ffi_start_simple".into());
         return std::ptr::null_mut();
     }
 
     let nick_str = match CStr::from_ptr(nick).to_str() {
         Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
+        Err(e) => {
+            set_last_error(format!("Nick inválido: {}", e));
+            return std::ptr::null_mut();
+        }
     };
     let dir_str = match CStr::from_ptr(data_dir).to_str() {
         Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
+        Err(e) => {
+            set_last_error(format!("DataDir inválido: {}", e));
+            return std::ptr::null_mut();
+        }
     };
 
     let dir_path = PathBuf::from(dir_str);
+    let _ = std::fs::create_dir_all(&dir_path);
+    let _ = std::fs::create_dir_all(dir_path.join("servers"));
+    let _ = std::fs::create_dir_all(dir_path.join("downloads"));
+
     let identity_path = dir_path.join("identity.json");
     let mut identity = if identity_path.exists() {
         UserIdentity::load_or_create(&identity_path).unwrap_or_else(|_| UserIdentity::generate_with_nick(nick_str))
@@ -54,13 +79,20 @@ pub unsafe extern "C" fn p2p_ffi_start_simple(
     config.identity_path = Some(identity_path);
     config.config_path = Some(dir_path.join("config.json"));
     config.port = port;
+    config.listen_ip = None; // 0.0.0.0 em produção/mobile
     config.discovery = true;
     config.public_defaults = true;
-    config.mdns = true;
+    // Em mobile, mDNS sem permissão de multicast e sem MulticastLock do Wi-Fi falha o socket UDP
+    config.mdns = false;
 
     match FfiEngine::start(config) {
         Ok(engine) => Box::into_raw(Box::new(engine)),
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => {
+            let err_msg = format!("FfiEngine::start falhou: {}", e);
+            eprintln!("[p2p_ffi] {}", err_msg);
+            set_last_error(err_msg);
+            std::ptr::null_mut()
+        }
     }
 }
 
