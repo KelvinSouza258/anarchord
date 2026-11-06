@@ -586,7 +586,7 @@ impl Runtime {
             .mailbox
             .get_ack(&envelope.envelope_id)
             .unwrap_or_else(|| ReceiptAck::new_signed(&self.identity, &envelope.envelope_id, now));
-        if !self.dm.mailbox.mark_delivered_to_me(&envelope.envelope_id, envelope.expires_at, ack.clone()) {
+        if !self.dm.mailbox.mark_delivered_to_me(&envelope.envelope_id, ack.clone()) {
             // Envelope já foi entregue antes (mesmo em sessão anterior!); apenas reenvia o ACK para limpar o remetente/guardião atrasado
             self.publish_mailbox_ack(ack);
             return;
