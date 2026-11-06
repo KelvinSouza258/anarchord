@@ -113,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_path: Some(args.data_dir.join("config.json")),
         identity,
         port: args.port,
+        listen_ip: None,
         servers_dir: args.data_dir.join("servers"),
         download_dir: args.data_dir.join("downloads"),
         channel: args.channel,

@@ -10,7 +10,7 @@ use super::crypto::FileKey;
 use super::manifest::Manifest;
 use super::protocol::{FileRequest, FileResponse};
 use super::store::{Origin, PieceStore};
-use super::{OfferInfo, SwarmMessage};
+use super::{file_swarm_topic, OfferInfo, SwarmMessage};
 use libp2p::PeerId;
 use rand::Rng;
 use std::collections::HashMap;
@@ -25,10 +25,11 @@ const MANIFEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Pedaços errados ou falhas antes de ignorar o par neste arquivo
 const MAX_STRIKES: u32 = 3;
 const BUSY_PAUSE: Duration = Duration::from_secs(2);
-/// De quanto em quanto tempo quem está baixando anuncia os pedaços novos na sala
+/// De quanto em quanto tempo quem está baixando anuncia os pedaços novos no enxame
 const HAVE_INTERVAL: Duration = Duration::from_secs(5);
-/// Sem ninguém para pedir: pergunta de novo na sala e na DHT
+/// Sem ninguém para pedir: pergunta de novo no enxame e na DHT
 const WANT_INTERVAL: Duration = Duration::from_secs(15);
+const WANT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const FIND_INTERVAL: Duration = Duration::from_secs(30);
 const HAVE_REPLY_INTERVAL: Duration = Duration::from_secs(3);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
@@ -170,7 +171,7 @@ impl Entry {
 
     /// Mensagem vinda de uma sala: um download retomado passa a pertencer a ela
     fn adopt_topic(&mut self, topic: &str) {
-        if matches!(self.audience, Audience::Anyone | Audience::Nobody) {
+        if !topic.starts_with("anarchord/file/") && matches!(self.audience, Audience::Anyone | Audience::Nobody) {
             self.audience = Audience::Topic(topic.to_string());
         }
     }
@@ -214,23 +215,41 @@ impl FileEngine {
                 publisher_name: body.publisher.chars().take(8).collect(),
                 key: store.key().cloned(),
             };
-            let mut peers = HashMap::new();
+            let peers = HashMap::new();
             let audience = match store.origin() {
                 Some(Origin::Topic(topic)) => Audience::Topic(topic.clone()),
                 Some(Origin::Peer(peer)) => match peer.parse::<PeerId>() {
-                    Ok(peer) => {
-                        peers.insert(peer, PeerInfo { full: true, ..Default::default() });
-                        Audience::Peer(peer)
-                    }
+                    Ok(peer) => Audience::Peer(peer),
                     Err(_) => Audience::Nobody,
                 },
                 None if offer.key.is_some() => Audience::Nobody,
                 None => Audience::Anyone,
             };
             actions.push(FileAction::Event(FileEvent::Started { cid, name: offer.name.clone() }));
+            // Issue #68: Emite progresso herdado do download parcial e publica Want imediatamente no enxame
+            let progress = store.progress();
+            let known_p = peers.len();
+            actions.push(FileAction::Event(FileEvent::Progress {
+                cid,
+                name: offer.name.clone(),
+                progress,
+                peers: known_p,
+            }));
+            actions.push(FileAction::Publish {
+                topic: file_swarm_topic(&cid),
+                message: SwarmMessage::Want { manifest: cid },
+            });
             self.files.insert(
                 cid,
-                Entry { offer, audience, store: Some(store), download: Some(Download::default()), peers, last_have_reply: None, is_own_share: false },
+                Entry {
+                    offer,
+                    audience,
+                    store: Some(store),
+                    download: Some(Download { last_want: None, ..Default::default() }),
+                    peers,
+                    last_have_reply: None,
+                    is_own_share: false,
+                },
             );
         }
         actions.extend(self.tick(now));
@@ -306,6 +325,11 @@ impl FileEngine {
             }
             SwarmMessage::Have { manifest, have } => {
                 let Some(entry) = self.files.get_mut(&manifest) else { return Vec::new() };
+                let is_swarm = topic == file_swarm_topic(&manifest);
+                let is_room = entry.topic() == Some(topic);
+                if !is_swarm && !is_room {
+                    return Vec::new();
+                }
                 if entry.store.as_ref().is_some_and(|s| s.manifest().piece_count() != have.len()) {
                     return Vec::new();
                 }
@@ -316,15 +340,20 @@ impl FileEngine {
             }
             SwarmMessage::Want { manifest } => {
                 let Some(entry) = self.files.get_mut(&manifest) else { return Vec::new() };
+                let is_swarm = topic == file_swarm_topic(&manifest);
+                let is_room = entry.topic() == Some(topic);
+                if !is_swarm && !is_room {
+                    return Vec::new();
+                }
                 entry.adopt_topic(topic);
                 let Some(store) = &entry.store else { return Vec::new() };
                 let recent = entry.last_have_reply.is_some_and(|t| now.duration_since(t) < HAVE_REPLY_INTERVAL);
-                if store.have().count() == 0 || recent || entry.topic() != Some(topic) {
+                if store.have().count() == 0 || recent {
                     return Vec::new();
                 }
                 entry.last_have_reply = Some(now);
                 vec![FileAction::Publish {
-                    topic: topic.to_string(),
+                    topic: file_swarm_topic(&manifest),
                     message: SwarmMessage::Have { manifest, have: store.have().clone() },
                 }]
             }
@@ -398,9 +427,11 @@ impl FileEngine {
         }
         entry.download = Some(Download { last_want: Some(now), ..Default::default() });
         let mut actions = vec![FileAction::Event(FileEvent::Started { cid, name: entry.offer.name.clone() })];
-        if let Some(topic) = entry.topic() {
-            actions.push(FileAction::Publish { topic: topic.to_string(), message: SwarmMessage::Want { manifest: cid } });
-        }
+        // Issue #66: Publica Want no tópico dedicado do arquivo (anarchord/file/<cid>)
+        actions.push(FileAction::Publish {
+            topic: file_swarm_topic(&cid),
+            message: SwarmMessage::Want { manifest: cid },
+        });
         actions.extend(self.schedule(&cid, now));
         Ok(actions)
     }
@@ -457,15 +488,13 @@ impl FileEngine {
                 let is_own_share = entry.is_own_share;
                 entry.store = None;
                 entry.download = None;
-                if let Some(topic) = entry.topic() {
-                    actions.push(FileAction::Publish {
-                        topic: topic.to_string(),
-                        message: SwarmMessage::Have {
-                            manifest: cid,
-                            have: super::store::Bitfield::new(piece_count),
-                        },
-                    });
-                }
+                actions.push(FileAction::Publish {
+                    topic: file_swarm_topic(&cid),
+                    message: SwarmMessage::Have {
+                        manifest: cid,
+                        have: super::store::Bitfield::new(piece_count),
+                    },
+                });
                 if is_own_share {
                     remove_cids.push(cid);
                     actions.push(FileAction::Event(FileEvent::Unshared { name }));
@@ -604,14 +633,22 @@ impl FileEngine {
         self.files.iter().filter(|(_, e)| e.download.is_some()).map(|(cid, _)| cid)
     }
 
-    /// Salas dos downloads em andamento: o nó precisa continuar inscrito nelas para receber
-    /// os mapas de pedaços (Have) mesmo depois de trocar de canal ou reiniciar
-    pub fn download_topics(&self) -> Vec<String> {
-        let mut topics: Vec<String> =
-            self.files.values().filter(|e| e.download.is_some()).filter_map(|e| e.topic().map(str::to_string)).collect();
+    /// Tópicos de enxame ativos (arquivos que estamos baixando ou semeando)
+    pub fn swarm_topics(&self) -> Vec<String> {
+        let mut topics: Vec<String> = self
+            .files
+            .iter()
+            .filter(|(_, e)| e.download.is_some() || e.store.as_ref().is_some_and(|s| s.have().count() > 0))
+            .map(|(cid, _)| file_swarm_topic(cid))
+            .collect();
         topics.sort();
         topics.dedup();
         topics
+    }
+
+    /// Salas e tópicos de arquivos ativos (mantido para compatibilidade)
+    pub fn download_topics(&self) -> Vec<String> {
+        self.swarm_topics()
     }
 
     /// Arquivos públicos que temos (para reanunciar na DHT)
@@ -626,24 +663,28 @@ impl FileEngine {
         for cid in cids {
             let Some(entry) = self.files.get_mut(&cid) else { continue };
             let known = entry.known_peers(now);
-            let topic = entry.topic().map(str::to_string);
             let public = entry.public();
             let have = entry.store.as_ref().map(|s| s.have().clone());
             let Some(download) = entry.download.as_mut() else { continue };
             let due = |last: Option<Instant>, every: Duration| last.is_none_or(|t| now.duration_since(t) >= every);
-            if let (Some(topic), Some(have)) = (&topic, &have) {
+            if let Some(have) = &have {
                 if download.have_dirty && due(download.last_have, HAVE_INTERVAL) {
                     download.have_dirty = false;
                     download.last_have = Some(now);
-                    actions.push(FileAction::Publish { topic: topic.clone(), message: SwarmMessage::Have { manifest: cid, have: have.clone() } });
+                    actions.push(FileAction::Publish {
+                        topic: file_swarm_topic(&cid),
+                        message: SwarmMessage::Have { manifest: cid, have: have.clone() },
+                    });
                 }
             }
             if known == 0 {
-                if let Some(topic) = &topic {
-                    if due(download.last_want, WANT_INTERVAL) {
-                        download.last_want = Some(now);
-                        actions.push(FileAction::Publish { topic: topic.clone(), message: SwarmMessage::Want { manifest: cid } });
-                    }
+                let wait = if known == 0 { WANT_RETRY_INTERVAL } else { WANT_INTERVAL };
+                if due(download.last_want, wait) {
+                    download.last_want = Some(now);
+                    actions.push(FileAction::Publish {
+                        topic: file_swarm_topic(&cid),
+                        message: SwarmMessage::Want { manifest: cid },
+                    });
                 }
                 if public && due(download.last_find, FIND_INTERVAL) {
                     download.last_find = Some(now);
@@ -685,9 +726,10 @@ impl FileEngine {
                 Ok(path) => {
                     let mut actions = vec![FileAction::Event(FileEvent::Completed { cid: *cid, name, path })];
                     let have = store.have().clone();
-                    if let Some(topic) = entry.topic() {
-                        actions.push(FileAction::Publish { topic: topic.to_string(), message: SwarmMessage::Have { manifest: *cid, have } });
-                    }
+                    actions.push(FileAction::Publish {
+                        topic: file_swarm_topic(cid),
+                        message: SwarmMessage::Have { manifest: *cid, have },
+                    });
                     if entry.public() {
                         actions.push(FileAction::Provide(*cid));
                     }
@@ -827,6 +869,7 @@ mod tests {
     }
 
     struct Node {
+        identity: UserIdentity,
         peer: PeerId,
         engine: FileEngine,
         events: Vec<FileEvent>,
@@ -850,21 +893,22 @@ mod tests {
     impl Net {
         fn new(count: usize) -> Self {
             let nodes = (0..count)
-                .map(|i| Node {
-                    peer: PeerId::random(),
-                    engine: FileEngine::new(temp_dir(&format!("p{}", i)), temp_dir(&format!("d{}", i))),
-                    events: Vec::new(),
-                    deny: HashSet::new(),
-                    budget: None,
-                    corrupt: false,
-                    offline: false,
+                .map(|i| {
+                    let identity = UserIdentity::generate();
+                    let peer = crate::api::peer_id_from_pubkey_hex(&identity.public_key_hex()).unwrap();
+                    Node {
+                        identity,
+                        peer,
+                        engine: FileEngine::new(temp_dir(&format!("p{}", i)), temp_dir(&format!("d{}", i))),
+                        events: Vec::new(),
+                        deny: HashSet::new(),
+                        budget: None,
+                        corrupt: false,
+                        offline: false,
+                    }
                 })
                 .collect();
             Self { nodes, now: Instant::now(), served: HashMap::new() }
-        }
-
-        fn index_of(&self, peer: &PeerId) -> usize {
-            self.nodes.iter().position(|n| n.peer == *peer).unwrap()
         }
 
         fn run(&mut self, origin: usize, actions: Vec<FileAction>) {
@@ -883,7 +927,11 @@ mod tests {
                         }
                     }
                     FileAction::Request { peer, request } => {
-                        let to = self.index_of(&peer);
+                        let Some(to) = self.nodes.iter().position(|n| n.peer == peer) else {
+                            let out = self.nodes[from].engine.on_failure(peer, request, now);
+                            queue.extend(out.into_iter().map(|a| (from, a)));
+                            continue;
+                        };
                         if self.nodes[to].offline {
                             let out = self.nodes[from].engine.on_failure(peer, request, now);
                             queue.extend(out.into_iter().map(|a| (from, a)));
@@ -937,7 +985,7 @@ mod tests {
             let path = dir.join("filme.mkv");
             let data: Vec<u8> = (0..(pieces as usize * PIECE_SIZE as usize - 100)).map(|i| (i * 31 % 256) as u8).collect();
             std::fs::write(&path, &data).unwrap();
-            let manifest = Manifest::from_file(&path, &UserIdentity::generate(), key.as_ref(), 0).unwrap();
+            let manifest = Manifest::from_file(&path, &self.nodes[from].identity, key.as_ref(), 0).unwrap();
             let (cid, actions) = self.nodes[from].engine.share(manifest, path, key, target, "Alice");
             self.run(from, actions);
             (cid, data)
@@ -1070,24 +1118,71 @@ mod tests {
 
     #[test]
     fn test_resume_unfinished_download() {
+        use sha2::{Digest, Sha512};
+
         let mut net = Net::new(2);
+        // Alice tem orçamento para servir apenas 2 pedaços de um total de 4 (exatamente 50%)
         net.nodes[0].budget = Some(2);
-        let (cid, data) = net.share(0, 5, None, ShareTarget::Topic(TOPIC.into()));
+        let (cid, data) = net.share(0, 4, None, ShareTarget::Topic(TOPIC.into()));
+        let expected_sha512 = Sha512::digest(&data);
+
+        // Bob inicia o download e atinge os 50%
         net.get(1, &cid);
         net.settle(|n| n.nodes[1].engine.list(n.now)[0].state != FileState::Offered);
         assert!(net.completed(1).is_none());
+        assert!(matches!(net.nodes[1].engine.list(net.now)[0].state, FileState::Downloading { progress, .. } if (progress - 0.5).abs() < 0.01), "deve ter baixado exatamente 50% antes da interrupção");
 
-        // "Reinicia" o nó 1 com as mesmas pastas
+        // Bob encerra o processo e reinicia o motor com as mesmas pastas de dados
         let partial = net.nodes[1].engine.partial_dir.clone();
         let downloads = net.nodes[1].engine.download_dir.clone();
         net.nodes[1].engine = FileEngine::new(partial, downloads);
         let now = net.now;
         let actions = net.nodes[1].engine.resume(now);
+
+        // Issue #68: resume deve emitir Started, Progress inicial herdado (exatamente 50% = 0.5) e Want no tópico dedicado
         assert!(actions.iter().any(|a| matches!(a, FileAction::Event(FileEvent::Started { .. }))));
+        assert!(actions.iter().any(|a| matches!(a, FileAction::Event(FileEvent::Progress { progress, .. }) if (*progress - 0.5).abs() < 0.01)));
+        assert!(actions.iter().any(|a| matches!(a, FileAction::Publish { topic, message: SwarmMessage::Want { manifest } } if *topic == file_swarm_topic(&cid) && *manifest == cid)));
+
+        // Alice volta a servir sem restrição de orçamento para Bob concluir o download
         net.nodes[0].budget = None;
         net.run(1, actions);
         net.settle(|n| n.completed(1).is_some());
-        assert_eq!(std::fs::read(net.completed(1).unwrap()).unwrap(), data);
+
+        // Validação estrita do arquivo usando SHA-512 antes e depois da transferência
+        let completed_path = net.completed(1).unwrap();
+        let actual_data = std::fs::read(&completed_path).unwrap();
+        let actual_sha512 = Sha512::digest(&actual_data);
+        assert_eq!(expected_sha512, actual_sha512, "SHA-512 do arquivo retomado e concluído deve ser idêntico ao original");
+    }
+
+    /// Issue #66: O tráfego do enxame (Have/Want) circula exclusivamente no tópico dedicado
+    /// `anarchord/file/<cid>`, mantendo o tópico da sala restrito apenas ao anúncio inicial (Offer).
+    #[test]
+    fn test_swarm_traffic_is_isolated_to_dedicated_file_topic() {
+        let mut net = Net::new(2);
+        let (cid, _data) = net.share(0, 3, None, ShareTarget::Topic(TOPIC.into()));
+
+        // Na oferta inicial, o anúncio vai para a sala
+        assert_eq!(net.nodes[1].events[0], FileEvent::Offered {
+            cid,
+            name: "filme.mkv".into(),
+            size: 3 * PIECE_SIZE as u64 - 100,
+            from: "Alice".into(),
+            direct: false,
+        });
+
+        // Quando o nó 1 pede o arquivo, a ação Publish gerada DEVE ser para anarchord/file/<cid>, NÃO para TOPIC
+        let now = net.now;
+        let actions = net.nodes[1].engine.get(&cid.short(), now).unwrap();
+        let want_action = actions.iter().find(|a| matches!(a, FileAction::Publish { message: SwarmMessage::Want { .. }, .. })).unwrap();
+        if let FileAction::Publish { topic, .. } = want_action {
+            assert_eq!(topic, &file_swarm_topic(&cid));
+            assert_ne!(topic, TOPIC);
+        }
+
+        // Tópicos ativos no motor do nó 1 devem conter o tópico dedicado
+        assert!(net.nodes[1].engine.swarm_topics().contains(&file_swarm_topic(&cid)));
     }
 
     #[test]

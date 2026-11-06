@@ -269,6 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_path: args.config.clone(),
         identity: identity.clone(),
         port: args.port,
+        listen_ip: None,
         servers_dir: servers_dir_for(&args.identity_file),
         download_dir: download_dir(),
         channel: args.channel.clone(),
@@ -581,7 +582,9 @@ fn download_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libp2p::PeerId;
+    fn rand_suffix() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+    }
 
     #[test]
     fn test_parse_user_input_commands() {
@@ -790,7 +793,7 @@ mod tests {
             protocol_capabilities: Option<p2p_core::ProtocolCapabilities>,
         ) -> (Self, u16) {
             let nick = identity.profile.display_name.clone();
-            let base = std::env::temp_dir().join(format!("anarchord_cli_{}_{}_{}", nick, std::process::id(), PeerId::random()));
+            let base = std::env::temp_dir().join(format!("anarchord_cli_{}_{}_{}", nick, std::process::id(), rand_suffix()));
             let pubkey = identity.public_key_hex();
             let sniff_file = base.join("packets.jsonl");
             let mut config = CoreConfig::new(identity, base.join("servers"), base.join("downloads"));
@@ -869,7 +872,7 @@ mod tests {
                 let (mut alice, port) = FakeUi::start("Alice", None);
                 let (mut bob, _) = FakeUi::start("Bob", Some(port));
                 // Sala exclusiva do teste, para não misturar com nós reais na LAN (mDNS)
-                let room = format!("arquivos-{}", PeerId::random());
+                let room = format!("arquivos-{}", rand_suffix());
                 alice.type_line(&format!("/join {}", room));
                 bob.type_line(&format!("/join {}", room));
                 let r = room.clone();
@@ -879,7 +882,7 @@ mod tests {
                     })
                     .await;
 
-                let dir = std::env::temp_dir().join(format!("anarchord_cli_share_{}", PeerId::random()));
+                let dir = std::env::temp_dir().join(format!("anarchord_cli_share_{}", rand_suffix()));
                 std::fs::create_dir_all(&dir).unwrap();
                 let path = dir.join("notas.txt");
                 let data: Vec<u8> = (0..600_000).map(|i| (i % 251) as u8).collect();
@@ -1204,7 +1207,7 @@ mod tests {
                     p2p_core::ProtocolCapabilities::legacy_v1(),
                 );
 
-                let room = format!("ver-room-{}", PeerId::random());
+                let room = format!("ver-room-{}", rand_suffix());
                 alice.type_line(&format!("/join {}", room));
                 bob.type_line(&format!("/join {}", room));
                 let r = room.clone();

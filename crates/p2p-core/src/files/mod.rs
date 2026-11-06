@@ -36,6 +36,11 @@ pub fn dht_key(cid: &Cid) -> libp2p::kad::RecordKey {
     libp2p::kad::RecordKey::new(&multihash)
 }
 
+/// Tópico dedicado do enxame Gossipsub para troca de Have e Want de um arquivo específico (`anarchord/file/<cid>`)
+pub fn file_swarm_topic(cid: &Cid) -> String {
+    format!("anarchord/file/{}", cid)
+}
+
 /// Arquivo oferecido: o suficiente para listar e começar a baixar (o resto vem do manifesto)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct OfferInfo {

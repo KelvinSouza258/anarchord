@@ -107,17 +107,28 @@ impl FilesState {
 impl Runtime {
     pub(super) fn resume_files(&mut self) {
         let actions = self.files.engine.resume(Instant::now());
-        self.follow_download_topics();
+        self.sync_swarm_topics();
         self.apply_file_actions(actions);
     }
 
-    /// Fica inscrito nas salas dos downloads em andamento (Have/Want circulam lá)
-    fn follow_download_topics(&mut self) {
-        for topic in self.files.engine.download_topics() {
-            let topic = libp2p::gossipsub::IdentTopic::new(topic);
-            if self.files.followed.insert(topic.hash().into_string()) {
+    /// Sincroniza as inscrições Gossipsub do enxame de arquivos:
+    /// - Inscreve nos tópicos dedicados dos arquivos que estamos baixando ou semeando (`anarchord/file/<cid>`)
+    /// - Desinscreve dos tópicos de arquivos que deixaram de ser ativos (/unshare, cancelamento, remoção)
+    pub(super) fn sync_swarm_topics(&mut self) {
+        let active_topics: HashSet<String> = self.files.engine.swarm_topics().into_iter().collect();
+
+        for topic_str in &active_topics {
+            let topic = libp2p::gossipsub::IdentTopic::new(topic_str);
+            if self.files.followed.insert(topic_str.clone()) {
                 let _ = self.node.swarm.behaviour_mut().gossipsub.subscribe(&topic);
             }
+        }
+
+        let to_unfollow: Vec<String> = self.files.followed.difference(&active_topics).cloned().collect();
+        for topic_str in to_unfollow {
+            let topic = libp2p::gossipsub::IdentTopic::new(&topic_str);
+            let _ = self.node.swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
+            self.files.followed.remove(&topic_str);
         }
     }
 
@@ -157,6 +168,7 @@ impl Runtime {
                 let nick = self.nick.clone();
                 self.files.watch_file_parent(&job.path);
                 let (_, actions) = self.files.engine.share(manifest, job.path, job.key, job.target, &nick);
+                self.sync_swarm_topics();
                 self.apply_file_actions(actions);
             }
             Err(e) => self.error(CoreError::Io { context: job.path.display().to_string(), message: e.to_string() }),
@@ -167,6 +179,7 @@ impl Runtime {
     /// monitorado foi deletado/movido no disco (sem polling).
     pub(super) fn on_fs_watch_event(&mut self) {
         let actions = self.files.engine.on_fs_change();
+        self.sync_swarm_topics();
         if !actions.is_empty() {
             self.apply_file_actions(actions);
         }
@@ -174,7 +187,10 @@ impl Runtime {
 
     pub(super) fn get_file(&mut self, query: &str) {
         match self.files.engine.get(query, Instant::now()) {
-            Ok(actions) => self.apply_file_actions(actions),
+            Ok(actions) => {
+                self.sync_swarm_topics();
+                self.apply_file_actions(actions);
+            }
             Err(e) => self.error(CoreError::File(e)),
         }
     }
@@ -188,7 +204,10 @@ impl Runtime {
 
     pub(super) fn unshare_file(&mut self, query: &str) {
         match self.files.engine.unshare(query) {
-            Ok(name) => self.emit(CoreEvent::File(FileEvent::Unshared { name })),
+            Ok(name) => {
+                self.sync_swarm_topics();
+                self.emit(CoreEvent::File(FileEvent::Unshared { name }));
+            }
             Err(e) => self.error(CoreError::File(e)),
         }
     }
@@ -198,7 +217,7 @@ impl Runtime {
     }
 
     pub(super) fn files_tick(&mut self) {
-        self.follow_download_topics();
+        self.sync_swarm_topics();
         let actions = self.files.engine.tick(Instant::now());
         self.apply_file_actions(actions);
     }
@@ -247,6 +266,9 @@ impl Runtime {
                     self.files.requests.insert(id, (peer, request));
                 }
                 FileAction::Publish { topic, message } => {
+                    if topic.starts_with("anarchord/file/") {
+                        self.sync_swarm_topics();
+                    }
                     if self.publish_content(&libp2p::gossipsub::IdentTopic::new(topic), crate::wire::encode(&message)).is_err() {
                         tracing::debug!("Mensagem do enxame não publicada (sem pares no tópico ou sem chave do grupo)");
                     }

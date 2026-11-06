@@ -18,7 +18,16 @@ use std::time::Duration;
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 fn node(nick: &str) -> P2PNode {
-    P2PNode::new(UserIdentity::generate_with_nick(nick), 0).expect("nó P2P deve iniciar")
+    P2PNode::with_options(
+        UserIdentity::generate_with_nick(nick),
+        p2p_core::NodeOptions {
+            port: 0,
+            listen_ip: Some("127.0.0.1".into()),
+            mdns: false,
+            ..Default::default()
+        },
+    )
+    .expect("nó P2P deve iniciar")
 }
 
 /// Tópico exclusivo do teste, para não misturar com nós Anarchord reais na LAN (mDNS)

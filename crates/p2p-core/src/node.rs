@@ -98,17 +98,17 @@ pub fn parse_agent_version(agent_version: &str) -> Option<(String, String)> {
 
 /// Encontra uma porta livre ao mesmo tempo em TCP e UDP, para que TCP e QUIC
 /// escutem na mesma porta e o anúncio no tracker (que só carrega uma porta) sirva aos dois
-fn pick_shared_tcp_udp_port() -> std::io::Result<u16> {
+fn pick_shared_tcp_udp_port(bind_ip: &str) -> std::io::Result<u16> {
     for _ in 0..32 {
-        let tcp = TcpListener::bind(("0.0.0.0", 0))?;
+        let tcp = TcpListener::bind((bind_ip, 0))?;
         let port = tcp.local_addr()?.port();
-        if UdpSocket::bind(("0.0.0.0", port)).is_ok() {
+        if UdpSocket::bind((bind_ip, port)).is_ok() {
             return Ok(port);
         }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AddrNotAvailable,
-        "nenhuma porta livre simultaneamente em TCP e UDP",
+        format!("nenhuma porta livre simultaneamente em TCP e UDP em {}", bind_ip),
     ))
 }
 
@@ -117,6 +117,8 @@ fn pick_shared_tcp_udp_port() -> std::io::Result<u16> {
 pub struct NodeOptions {
     /// Porta TCP + QUIC (0 = escolhe uma livre)
     pub port: u16,
+    /// Endereço IP de escuta (None = "0.0.0.0" em produção; Some("127.0.0.1") para loopback em testes)
+    pub listen_ip: Option<String>,
     /// Atende como servidor de Circuit Relay v2 (nós públicos)
     pub relay_server: bool,
     /// Rede de laboratório: endereços privados contam como "públicos" para AutoNAT e relay,
@@ -132,9 +134,10 @@ impl Default for NodeOptions {
     fn default() -> Self {
         Self {
             port: 0,
+            listen_ip: if cfg!(test) { Some("127.0.0.1".to_string()) } else { None },
             relay_server: false,
             lab: false,
-            mdns: true,
+            mdns: !cfg!(test),
             capabilities: None,
         }
     }
@@ -283,13 +286,14 @@ impl P2PNode {
             .build();
 
         // Escuta na mesma porta para TCP e QUIC (porta 0 = escolhe uma livre nos dois protocolos)
+        let bind_ip = options.listen_ip.as_deref().unwrap_or(if cfg!(test) { "127.0.0.1" } else { "0.0.0.0" });
         let listen_port = if listen_port == 0 {
-            pick_shared_tcp_udp_port().map_err(|e| NodeError::SwarmInit(e.to_string()))?
+            pick_shared_tcp_udp_port(bind_ip).map_err(|e| NodeError::SwarmInit(e.to_string()))?
         } else {
             listen_port
         };
-        let tcp_listen: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", listen_port).parse().unwrap();
-        let quic_listen: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", listen_port).parse().unwrap();
+        let tcp_listen: Multiaddr = format!("/ip4/{}/tcp/{}", bind_ip, listen_port).parse().unwrap();
+        let quic_listen: Multiaddr = format!("/ip4/{}/udp/{}/quic-v1", bind_ip, listen_port).parse().unwrap();
 
         swarm.listen_on(tcp_listen).map_err(|e| NodeError::SwarmInit(e.to_string()))?;
         swarm.listen_on(quic_listen).map_err(|e| NodeError::SwarmInit(e.to_string()))?;
@@ -409,9 +413,9 @@ mod tests {
 
     #[test]
     fn test_pick_shared_port_is_free_on_tcp_and_udp() {
-        let port = pick_shared_tcp_udp_port().unwrap();
+        let port = pick_shared_tcp_udp_port("127.0.0.1").unwrap();
         assert_ne!(port, 0);
-        assert!(TcpListener::bind(("0.0.0.0", port)).is_ok());
-        assert!(UdpSocket::bind(("0.0.0.0", port)).is_ok());
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+        assert!(UdpSocket::bind(("127.0.0.1", port)).is_ok());
     }
 }

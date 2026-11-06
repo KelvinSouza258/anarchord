@@ -45,6 +45,8 @@ pub struct CoreConfig {
     pub identity: UserIdentity,
     /// Porta TCP + QUIC (0 = escolhe uma livre)
     pub port: u16,
+    /// Endereço IP de escuta (None = "0.0.0.0" para todas as interfaces; Some("127.0.0.1") para loopback em testes)
+    pub listen_ip: Option<String>,
     /// Onde ficam os servidores acompanhados e o estado MLS
     pub servers_dir: PathBuf,
     /// Onde os downloads completos são salvos
@@ -92,6 +94,7 @@ impl CoreConfig {
             config_path: None,
             identity,
             port: 0,
+            listen_ip: Some("127.0.0.1".into()),
             servers_dir,
             download_dir,
             channel: "geral".into(),
@@ -105,7 +108,7 @@ impl CoreConfig {
             bootstrap: Vec::new(),
             trackers: Vec::new(),
             public_defaults: false,
-            mdns: true,
+            mdns: false,
             relay_server: false,
             lab: false,
             sniff_file: None,
@@ -255,6 +258,7 @@ impl Runtime {
             identity.clone(),
             crate::node::NodeOptions {
                 port: config.port,
+                listen_ip: config.listen_ip.clone(),
                 relay_server: config.relay_server,
                 lab: config.lab,
                 mdns: config.mdns,
