@@ -25,6 +25,9 @@ const MANIFEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Pedaços errados ou falhas antes de ignorar o par neste arquivo
 const MAX_STRIKES: u32 = 3;
 const BUSY_PAUSE: Duration = Duration::from_secs(2);
+/// Timeout de busca quando não há nenhum par disponível para o manifesto ou pedaços restantes (Issue #67)
+const MANIFEST_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const PIECE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// De quanto em quanto tempo quem está baixando anuncia os pedaços novos no enxame
 const HAVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Sem ninguém para pedir: pergunta de novo no enxame e na DHT
@@ -136,6 +139,7 @@ struct Download {
     have_dirty: bool,
     last_want: Option<Instant>,
     last_find: Option<Instant>,
+    no_source_since: Option<Instant>,
 }
 
 struct Entry {
@@ -336,6 +340,7 @@ impl FileEngine {
                 entry.adopt_topic(topic);
                 let info = entry.peers.entry(source).or_default();
                 info.have = Some(have.as_bytes().to_vec());
+                info.full = have.len() > 0 && have.is_complete();
                 self.schedule(&manifest, now)
             }
             SwarmMessage::Want { manifest } => {
@@ -524,10 +529,10 @@ impl FileEngine {
                         peers: entry.known_peers(now),
                     },
                     (None, Some(store)) => {
-                        if store.is_complete() && !store.path().exists() {
-                            FileState::Offered
-                        } else {
+                        if store.is_complete() && store.path().exists() {
                             FileState::Seeding
+                        } else {
+                            FileState::Offered
                         }
                     }
                     (None, None) => FileState::Offered,
@@ -593,6 +598,23 @@ impl FileEngine {
             }
             (_, FileResponse::NotFound) => {
                 entry.peers.remove(&peer);
+                if matches!(entry.audience, Audience::Peer(p) if p == peer) {
+                    entry.download = None;
+                    actions.push(failed(&entry.offer, "o par não possui mais este arquivo (pode ter parado de compartilhar)".into()));
+                    return actions;
+                }
+                if let Some(download) = entry.download.as_mut() {
+                    let has_source = match &entry.store {
+                        None => entry.peers.values().any(|p| p.usable(now) && (p.full || p.has_any() || p.have.is_none())),
+                        Some(store) => {
+                            !download.inflight.is_empty()
+                                || entry.peers.values().any(|p| p.usable(now) && store.have().missing().any(|idx| p.has(idx)))
+                        }
+                    };
+                    if !has_source {
+                        download.no_source_since.get_or_insert(now);
+                    }
+                }
             }
             _ => strike(entry, &peer),
         }
@@ -613,6 +635,13 @@ impl FileEngine {
         release(entry, &peer, &request);
         strike(entry, &peer);
         entry.peers.entry(peer).or_default().paused_until = Some(now + BUSY_PAUSE);
+        if matches!(entry.audience, Audience::Peer(p) if p == peer) {
+            let strikes = entry.peers.get(&peer).map_or(0, |p| p.strikes);
+            if strikes >= MAX_STRIKES {
+                entry.download = None;
+                return vec![failed(&entry.offer, "o par de envio direto está inacessível ou desconectou".into())];
+            }
+        }
         self.schedule(&cid, now)
     }
 
@@ -691,6 +720,34 @@ impl FileEngine {
                     actions.push(FileAction::FindProviders(cid));
                 }
             }
+
+            // Timeout de descoberta quando não há fontes disponíveis (Issue #67)
+            let has_source = match &entry.store {
+                None => entry.peers.values().any(|p| p.usable(now) && (p.full || p.has_any() || p.have.is_none())),
+                Some(store) => {
+                    store.is_complete()
+                        || !download.inflight.is_empty()
+                        || entry.peers.values().any(|p| p.usable(now) && store.have().missing().any(|idx| p.has(idx)))
+                }
+            };
+
+            if !has_source {
+                let since = download.no_source_since.get_or_insert(now);
+                let timeout = if entry.store.is_none() { MANIFEST_DISCOVERY_TIMEOUT } else { PIECE_DISCOVERY_TIMEOUT };
+                if now.duration_since(*since) >= timeout {
+                    let reason = if entry.store.is_none() {
+                        "nenhum par disponível com o arquivo (o compartilhamento pode ter sido encerrado)".to_string()
+                    } else {
+                        "todos os pares com os pedaços restantes estão indisponíveis".to_string()
+                    };
+                    entry.download = None;
+                    actions.push(failed(&entry.offer, reason));
+                    continue;
+                }
+            } else {
+                download.no_source_since = None;
+            }
+
             actions.extend(self.after_change(&cid, now));
         }
         actions
@@ -756,9 +813,16 @@ impl FileEngine {
         let mut actions = Vec::new();
 
         let Some(store) = store.as_ref() else {
-            let waiting = download.manifest_request.is_some_and(|(_, t)| now.duration_since(t) < MANIFEST_TIMEOUT);
-            if !waiting {
-                let previous = download.manifest_request.map(|(p, _)| p);
+            let previous = download.manifest_request.map(|(p, _)| p);
+            if let Some((prev_peer, t)) = download.manifest_request {
+                if now.duration_since(t) >= MANIFEST_TIMEOUT {
+                    if let Some(info) = peers.get_mut(&prev_peer) {
+                        info.strikes += 1;
+                    }
+                    download.manifest_request = None;
+                }
+            }
+            if download.manifest_request.is_none() {
                 let candidate = peers
                     .iter()
                     .filter(|(_, p)| p.usable(now) && (p.full || p.has_any() || p.have.is_none()))
@@ -1239,5 +1303,80 @@ mod tests {
         net.get(1, &cid);
         net.settle(|n| n.completed(1).is_some());
         assert_eq!(std::fs::read(net.completed(1).unwrap()).unwrap(), data);
+    }
+
+    /// Issue #67: Quando o publicador descompartilha antes de Bob baixar, Bob não deve travar em 0%;
+    /// deve receber FileEvent::Failed após o timeout e o estado deve retornar para Offered.
+    #[test]
+    fn test_download_fails_when_publisher_unshares_before_get() {
+        let mut net = Net::new(2);
+        let (cid, _) = net.share(0, 3, None, ShareTarget::Topic(TOPIC.into()));
+
+        // Alice descompartilha antes de Bob iniciar o download
+        assert_eq!(net.nodes[0].engine.unshare(&cid.short()).unwrap(), "filme.mkv");
+
+        // Bob tenta baixar o arquivo oferecido
+        net.get(1, &cid);
+
+        // Bob avança o tempo; Alice responde NotFound e o timeout de busca de manifesto é atingido
+        net.settle(|n| n.nodes[1].events.iter().any(|e| matches!(e, FileEvent::Failed { .. })));
+
+        let failed_event = net.nodes[1].events.iter().find(|e| matches!(e, FileEvent::Failed { .. })).unwrap();
+        if let FileEvent::Failed { cid: failed_cid, name, reason } = failed_event {
+            assert_eq!(*failed_cid, cid);
+            assert_eq!(name, "filme.mkv");
+            assert!(reason.contains("nenhum par disponível"), "motivo esperado: {}", reason);
+        }
+
+        // Estado do arquivo deve retornar para Offered e não mais Downloading
+        assert_eq!(net.nodes[1].engine.list(net.now)[0].state, FileState::Offered);
+    }
+
+    /// Issue #67: No envio direto (Audience::Peer), se o par responde NotFound, a falha deve ser
+    /// imediata sem esperar timeout longo.
+    #[test]
+    fn test_direct_send_fails_immediately_on_not_found() {
+        let mut net = Net::new(2);
+        let bob = net.nodes[1].peer;
+        let (cid, _) = net.share(0, 2, None, ShareTarget::Peer(bob));
+
+        // Alice descompartilha o envio direto
+        assert_eq!(net.nodes[0].engine.unshare(&cid.short()).unwrap(), "filme.mkv");
+
+        // Bob tenta baixar
+        net.get(1, &cid);
+
+        // A resposta NotFound no envio direto gera FileEvent::Failed imediatamente na mesma rodada
+        assert!(net.nodes[1].events.iter().any(|e| matches!(e, FileEvent::Failed { .. })));
+        assert_eq!(net.nodes[1].engine.list(net.now)[0].state, FileState::Offered);
+    }
+
+    /// Issue #67: Se todos os pares com os pedaços restantes saírem no meio do download,
+    /// o download deve falhar com FileEvent::Failed por timeout de pedaços e resetar para Offered.
+    #[test]
+    fn test_download_fails_when_all_seeders_disconnect_mid_download() {
+        let mut net = Net::new(2);
+        // Alice tem orçamento para enviar apenas o manifesto e 1 pedaço de 4
+        net.nodes[0].budget = Some(1);
+        let (cid, _) = net.share(0, 4, None, ShareTarget::Topic(TOPIC.into()));
+
+        net.get(1, &cid);
+        // Bob obtém o primeiro pedaço
+        net.settle(|n| n.nodes[1].engine.list(n.now)[0].state != FileState::Offered);
+
+        // Alice desconecta
+        net.nodes[0].offline = true;
+
+        // Bob aguarda o timeout de pedaços indisponíveis (PIECE_DISCOVERY_TIMEOUT = 30s)
+        net.settle(|n| n.nodes[1].events.iter().any(|e| matches!(e, FileEvent::Failed { .. })));
+
+        let failed_event = net.nodes[1].events.iter().find(|e| matches!(e, FileEvent::Failed { .. })).unwrap();
+        if let FileEvent::Failed { cid: failed_cid, name, reason } = failed_event {
+            assert_eq!(*failed_cid, cid);
+            assert_eq!(name, "filme.mkv");
+            assert!(reason.contains("pedaços restantes estão indisponíveis"), "motivo esperado: {}", reason);
+        }
+
+        assert_eq!(net.nodes[1].engine.list(net.now)[0].state, FileState::Offered);
     }
 }
