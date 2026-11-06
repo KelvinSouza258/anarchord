@@ -929,8 +929,14 @@ impl TerminalUi {
                         .find(|(_, n, _)| n == nick)
                         .map(|(_, _, pk)| if pk.len() >= 6 { format!(" ({})", &pk[..6]) } else { format!(" ({})", pk) })
                         .unwrap_or_default();
-                    let is_friend = self.friends.iter().any(|f| f.display_name.eq_ignore_ascii_case(nick));
-                    let friend_badge = if is_friend { " 💚" } else { "" };
+                    let friend_info = self.friends.iter().find(|f| f.display_name.eq_ignore_ascii_case(nick));
+                    let friend_badge = match friend_info.map(|f| f.state) {
+                        Some(p2p_core::identity::FriendState::Confirmed) => " 💚",
+                        Some(p2p_core::identity::FriendState::PendingOutgoing) => " ⏳",
+                        Some(p2p_core::identity::FriendState::PendingIncoming) => " 📩",
+                        Some(p2p_core::identity::FriendState::Rejected) => " 🚫",
+                        None => "",
+                    };
 
                     room_members_items.push(ListItem::new(Line::from(vec![
                         Span::styled("🟢 ", Style::default().fg(Color::Green)),
@@ -950,14 +956,31 @@ impl TerminalUi {
                 } else {
                     format!(" ({})", f.public_key)
                 };
-                let (dot, style) = if f.online {
-                    ("🟢 ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-                } else {
-                    ("⚪ ", Style::default().fg(Color::Gray))
+                let (dot, badge, style) = match f.state {
+                    p2p_core::identity::FriendState::Confirmed => {
+                        let dot = if f.online { "🟢 " } else { "⚪ " };
+                        let style = if f.online {
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        };
+                        (dot, " 💚", style)
+                    }
+                    p2p_core::identity::FriendState::PendingOutgoing => {
+                        let dot = if f.online { "🟢 " } else { "⚪ " };
+                        (dot, " ⏳", Style::default().fg(Color::Yellow))
+                    }
+                    p2p_core::identity::FriendState::PendingIncoming => {
+                        ("📩 ", " 📩", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+                    }
+                    p2p_core::identity::FriendState::Rejected => {
+                        ("🚫 ", " 🚫", Style::default().fg(Color::DarkGray))
+                    }
                 };
+                let dot_fg = if f.online { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) };
                 room_members_items.push(ListItem::new(Line::from(vec![
-                    Span::styled(dot, if f.online { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) }),
-                    Span::styled(format!("{} 💚", f.display_name), style),
+                    Span::styled(dot, dot_fg),
+                    Span::styled(format!("{}{}", f.display_name, badge), style),
                     Span::styled(short_pk, Style::default().fg(Color::DarkGray)),
                 ])));
             }
@@ -1524,11 +1547,13 @@ mod tests {
                 public_key: "1111222233334444".into(),
                 display_name: "Bobby".into(),
                 online: false,
+                state: p2p_core::identity::FriendState::Confirmed,
             },
             FriendUiEntry {
                 public_key: "aaaabbbbccccdddd".into(),
                 display_name: "Carol".into(),
                 online: true,
+                state: p2p_core::identity::FriendState::Confirmed,
             },
         ]));
         let screen = render(&mut ui);

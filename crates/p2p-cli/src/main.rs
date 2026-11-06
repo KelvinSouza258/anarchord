@@ -82,6 +82,9 @@ pub enum ChatAction {
     ListFiles,
     Unshare(String),
     AddFriend { pubkey: String, alias: Option<String> },
+    AcceptFriend(String),
+    RejectFriend(String),
+    ResendFriendRequest { target: String, message: Option<String> },
     RemoveFriend(String),
     ListFriends,
     OpenDm(String),
@@ -203,6 +206,18 @@ pub fn parse_user_input(input: &str) -> ChatAction {
             match (parts.next(), parts.next().map(str::trim), parts.next().map(str::trim)) {
                 (Some("add"), Some(pubkey), alias) if !pubkey.is_empty() => {
                     return ChatAction::AddFriend { pubkey: pubkey.to_string(), alias: alias.filter(|a| !a.is_empty()).map(str::to_string) };
+                }
+                (Some("accept"), Some(target), _) if !target.is_empty() => {
+                    return ChatAction::AcceptFriend(target.to_string());
+                }
+                (Some("reject"), Some(target), _) if !target.is_empty() => {
+                    return ChatAction::RejectFriend(target.to_string());
+                }
+                (Some("resend"), Some(target), msg) if !target.is_empty() => {
+                    return ChatAction::ResendFriendRequest {
+                        target: target.to_string(),
+                        message: msg.filter(|m| !m.is_empty()).map(str::to_string),
+                    };
                 }
                 (Some("remove" | "rm"), Some(pubkey), _) if !pubkey.is_empty() => return ChatAction::RemoveFriend(pubkey.to_string()),
                 (Some("list"), _, _) => return ChatAction::ListFriends,
@@ -437,6 +452,7 @@ fn ui_events(event: &CoreEvent) -> Vec<UiEvent> {
                         public_key: f.public_key.clone(),
                         display_name,
                         online: f.online,
+                        state: f.state,
                     }
                 })
                 .collect(),
@@ -553,6 +569,9 @@ impl ChatAction {
             ChatAction::ListFiles => CoreCommand::ListFiles,
             ChatAction::Unshare(query) => CoreCommand::Unshare(query),
             ChatAction::AddFriend { pubkey, alias } => CoreCommand::AddFriend { pubkey, alias },
+            ChatAction::AcceptFriend(target) => CoreCommand::AcceptFriend { target },
+            ChatAction::RejectFriend(target) => CoreCommand::RejectFriend { target },
+            ChatAction::ResendFriendRequest { target, message } => CoreCommand::ResendFriendRequest { target, message },
             ChatAction::RemoveFriend(pubkey) => CoreCommand::RemoveFriend { pubkey },
             ChatAction::ListFriends => CoreCommand::ListFriends,
             ChatAction::OpenDm(target) => CoreCommand::OpenDm { target },
@@ -642,6 +661,16 @@ mod tests {
             ChatAction::AddFriend { pubkey: pk.clone(), alias: Some("Bob da Silva".into()) }
         );
         assert_eq!(parse_user_input(&format!("/friend add {}", pk)), ChatAction::AddFriend { pubkey: pk.clone(), alias: None });
+        assert_eq!(parse_user_input(&format!("/friend accept {}", pk)), ChatAction::AcceptFriend(pk.clone()));
+        assert_eq!(parse_user_input(&format!("/friend reject {}", pk)), ChatAction::RejectFriend(pk.clone()));
+        assert_eq!(
+            parse_user_input(&format!("/friend resend {} Olá!", pk)),
+            ChatAction::ResendFriendRequest { target: pk.clone(), message: Some("Olá!".into()) }
+        );
+        assert_eq!(
+            parse_user_input(&format!("/friend resend {}", pk)),
+            ChatAction::ResendFriendRequest { target: pk.clone(), message: None }
+        );
         assert_eq!(parse_user_input(&format!("/friend remove {}", pk)), ChatAction::RemoveFriend(pk));
     }
 
@@ -701,6 +730,53 @@ mod tests {
                 alice.wait_log("adicionado pelo nick", "Bob adicionado").await;
                 alice.type_line("/friend add Fantasma");
                 alice.wait_log("nick desconhecido", "'Fantasma' não encontrado").await;
+            })
+            .await;
+    }
+
+    /// Fluxo completo de Pedido Mútuo de Amizade (Friend Request):
+    /// Envio -> Recebimento -> Aceite -> Confirmação -> Reenvio -> Rejeição
+    #[tokio::test]
+    async fn test_mutual_friend_request_workflow_in_the_tui() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut alice, port) = FakeUi::start("Alice", None);
+                let (mut bob, _) = FakeUi::start("Bob", Some(port));
+                let bob_key = bob.pubkey.clone();
+                let alice_key = alice.pubkey.clone();
+
+                alice.wait("Alice identificar Bob", move |e| matches!(e, UiEvent::PeerConnected { pubkey, .. } if *pubkey == bob_key)).await;
+                bob.wait("Bob identificar Alice", move |e| matches!(e, UiEvent::PeerConnected { pubkey, .. } if *pubkey == alice_key)).await;
+
+                // 1. Alice envia pedido de amizade para Bob
+                alice.type_line(&format!("/friend add {} Bobby", bob.pubkey));
+                alice.wait_log("Alice adicionou Bobby pendente", "Bobby adicionado").await;
+
+                // 2. Bob recebe o pedido de amizade de Alice
+                bob.wait_log("Bob recebeu pedido de Alice", "Pedido de amizade recebido de Alice").await;
+
+                // 3. Bob aceita o pedido de Alice
+                bob.type_line(&format!("/friend accept {}", alice.pubkey));
+                bob.wait_log("Bob confirmou Alice", "Alice adicionado").await;
+
+                // 4. Alice é notificada que Bob aceitou seu pedido
+                alice.wait_log("Alice recebe confirmação do Bob", "aceitou seu pedido de amizade").await;
+
+                // 5. Teste de rejeição e reenvio:
+                // Bob remove Alice
+                bob.type_line(&format!("/friend remove {}", alice.pubkey));
+                bob.wait_log("Bob removeu Alice", "removido").await;
+
+                // Alice reenvia pedido para Bob
+                alice.type_line("/friend resend Bobby Quer conversar?");
+                bob.wait_log("Bob recebeu reenvio de Alice", "Pedido de amizade recebido de Alice").await;
+
+                // Bob recusa o pedido
+                bob.type_line(&format!("/friend reject {}", alice.pubkey));
+
+                // Alice é notificada da recusa
+                alice.wait_log("Alice recebe recusa do Bob", "recusou seu pedido de amizade").await;
             })
             .await;
     }

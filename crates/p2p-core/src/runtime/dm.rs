@@ -5,8 +5,10 @@ use crate::community::{format_duration, short_id};
 use crate::config::NodeConfig;
 use crate::dm::{
     dm_topic, DirectMessageEnvelope, DmFirewall, DmFirewallVerdict, DmPeerSession, DmWireMessage,
-    EphemeralKeyOffer, MailboxMessage, MailboxStore, ReceiptAck, StoredEnvelope, MAILBOX_TOPIC,
+    EphemeralKeyOffer, FriendRequest, FriendResponse, MailboxMessage, MailboxStore, ReceiptAck,
+    StoredEnvelope, FRIEND_REQUEST_MAILBOX_TOPIC, FRIEND_RESPONSE_MAILBOX_TOPIC, MAILBOX_TOPIC,
 };
+use crate::identity::FriendState;
 use crate::wire;
 use libp2p::gossipsub::IdentTopic;
 use std::collections::{HashMap, HashSet};
@@ -331,6 +333,85 @@ impl Runtime {
                     }
                 }
             }
+            DmWireMessage::FriendRequest(req) => {
+                if !req.recipient_pubkey.eq_ignore_ascii_case(&my_pk)
+                    || req.sender_pubkey.eq_ignore_ascii_case(&my_pk)
+                {
+                    return;
+                }
+                if !req.verify() {
+                    tracing::debug!("Pedido de amizade com assinatura inválida descartado");
+                    return;
+                }
+                let sender_pk = req.sender_pubkey.to_lowercase();
+                let now = super::now_secs();
+                if self.dm.firewall.is_blocked(&sender_pk, now) {
+                    tracing::debug!("Pedido de amizade de {} ignorado pelo firewall", short_id(&sender_pk));
+                    return;
+                }
+                let current_state = self.identity.get_friend_state(&sender_pk);
+                let sender_nick = req.sender_nick.clone();
+                if current_state == Some(FriendState::Confirmed) {
+                    let _ = self.identity.update_friend_encryption_key(&req.encryption_advertisement);
+                    self.persist_identity();
+                    return;
+                }
+                let _ = self.identity.add_or_update_friend(&sender_pk, Some(&sender_nick), FriendState::PendingIncoming);
+                let _ = self.identity.update_friend_encryption_key(&req.encryption_advertisement);
+                self.persist_identity();
+                self.emit(CoreEvent::FriendRequestReceived {
+                    pubkey: sender_pk,
+                    sender_nick,
+                    message: req.message,
+                    offline_delivery: false,
+                });
+                self.list_friends();
+            }
+            DmWireMessage::FriendResponse(resp) => {
+                if !resp.recipient_pubkey.eq_ignore_ascii_case(&my_pk)
+                    || resp.sender_pubkey.eq_ignore_ascii_case(&my_pk)
+                {
+                    return;
+                }
+                if !resp.verify() {
+                    tracing::debug!("Resposta de amizade com assinatura inválida descartada");
+                    return;
+                }
+                let sender_pk = resp.sender_pubkey.to_lowercase();
+                let peer_name = self.friendly_name(&sender_pk);
+                if resp.accepted {
+                    let _ = self.identity.add_or_update_friend(&sender_pk, None, FriendState::Confirmed);
+                    if let Some(ref adv) = resp.encryption_advertisement {
+                        let _ = self.identity.update_friend_encryption_key(adv);
+                    }
+                    self.persist_identity();
+                    self.dm.firewall.unblock(&sender_pk);
+                    self.subscribe_dm_with(&sender_pk);
+                    if self.is_pubkey_online(&sender_pk) {
+                        self.send_ephemeral_key_offer(&sender_pk);
+                        self.delegate_pending_to_friend(&sender_pk);
+                    }
+                    self.emit(CoreEvent::FriendRequestAccepted {
+                        pubkey: sender_pk.clone(),
+                        peer_name,
+                        offline_delivery: false,
+                    });
+                    self.emit(CoreEvent::FriendUpdated {
+                        pubkey: sender_pk,
+                        alias: self.identity.get_friend(&resp.sender_pubkey).and_then(|f| f.alias.clone()),
+                        removed: false,
+                    });
+                } else {
+                    let _ = self.identity.set_friend_state(&sender_pk, FriendState::Rejected);
+                    self.persist_identity();
+                    self.emit(CoreEvent::FriendRequestRejected {
+                        pubkey: sender_pk,
+                        peer_name,
+                        offline_delivery: false,
+                    });
+                }
+                self.list_friends();
+            }
             DmWireMessage::Message(envelope) => {
                 if !envelope.recipient_pubkey.eq_ignore_ascii_case(&my_pk)
                     || envelope.sender_pubkey.eq_ignore_ascii_case(&my_pk)
@@ -510,6 +591,78 @@ impl Runtime {
             self.publish_mailbox_ack(ack);
             return;
         }
+
+        if envelope.topic == FRIEND_REQUEST_MAILBOX_TOPIC {
+            match envelope.unseal_and_verify(&self.identity) {
+                Ok(payload) => {
+                    let sender_pk = payload.sender_pubkey.to_lowercase();
+                    if !self.dm.firewall.is_blocked(&sender_pk, now) {
+                        let current_state = self.identity.get_friend_state(&sender_pk);
+                        if current_state != Some(FriendState::Confirmed) {
+                            let _ = self.identity.add_or_update_friend(&sender_pk, Some(&payload.sender_nick), FriendState::PendingIncoming);
+                            self.persist_identity();
+                            let msg = if payload.text.is_empty() { None } else { Some(payload.text) };
+                            self.emit(CoreEvent::FriendRequestReceived {
+                                pubkey: sender_pk,
+                                sender_nick: payload.sender_nick,
+                                message: msg,
+                                offline_delivery: true,
+                            });
+                            self.list_friends();
+                        }
+                    }
+                    self.publish_mailbox_ack(ack);
+                }
+                Err(e) => {
+                    tracing::debug!("Envelope offline de friend_request inválido: {}", e);
+                }
+            }
+            return;
+        }
+
+        if envelope.topic == FRIEND_RESPONSE_MAILBOX_TOPIC {
+            match envelope.unseal_and_verify(&self.identity) {
+                Ok(payload) => {
+                    let sender_pk = payload.sender_pubkey.to_lowercase();
+                    let peer_name = self.friendly_name(&sender_pk);
+                    if payload.text.trim().eq_ignore_ascii_case("ACCEPTED") {
+                        let _ = self.identity.set_friend_state(&sender_pk, FriendState::Confirmed);
+                        self.persist_identity();
+                        self.dm.firewall.unblock(&sender_pk);
+                        self.subscribe_dm_with(&sender_pk);
+                        if self.is_pubkey_online(&sender_pk) {
+                            self.send_ephemeral_key_offer(&sender_pk);
+                            self.delegate_pending_to_friend(&sender_pk);
+                        }
+                        self.emit(CoreEvent::FriendRequestAccepted {
+                            pubkey: sender_pk.clone(),
+                            peer_name,
+                            offline_delivery: true,
+                        });
+                        self.emit(CoreEvent::FriendUpdated {
+                            pubkey: sender_pk,
+                            alias: self.identity.get_friend(&payload.sender_pubkey).and_then(|f| f.alias.clone()),
+                            removed: false,
+                        });
+                    } else {
+                        let _ = self.identity.set_friend_state(&sender_pk, FriendState::Rejected);
+                        self.persist_identity();
+                        self.emit(CoreEvent::FriendRequestRejected {
+                            pubkey: sender_pk,
+                            peer_name,
+                            offline_delivery: true,
+                        });
+                    }
+                    self.list_friends();
+                    self.publish_mailbox_ack(ack);
+                }
+                Err(e) => {
+                    tracing::debug!("Envelope offline de friend_response inválido: {}", e);
+                }
+            }
+            return;
+        }
+
         match envelope.unseal_and_verify(&self.identity) {
             Ok(payload) => {
                 let sender_pk = payload.sender_pubkey.to_lowercase();
@@ -769,5 +922,219 @@ impl Runtime {
         } else {
             self.error(CoreError::Friend(format!("'{}' não está bloqueado no firewall", target)));
         }
+    }
+
+    /// Envia pedido de amizade mútuo (online via DM topic ou offline via Guardiões)
+    pub(super) fn send_friend_request(&mut self, who: &str, alias: Option<&str>, message: Option<&str>) {
+        let (pubkey, inferred_alias) = match self.resolve_dm_target(who) {
+            Some((pk, name)) => {
+                let alias_opt = alias.map(str::to_string).or_else(|| {
+                    if !pk.eq_ignore_ascii_case(&name) {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                });
+                (pk, alias_opt)
+            }
+            None => {
+                let who_trim = who.trim();
+                if who_trim.len() == 64 && who_trim.chars().all(|c| c.is_ascii_hexdigit()) {
+                    (who_trim.to_lowercase(), alias.map(str::to_string))
+                } else {
+                    return self.error(CoreError::PeerNotFound(who.to_string()));
+                }
+            }
+        };
+
+        if pubkey.eq_ignore_ascii_case(&self.my_pubkey()) {
+            return self.error(CoreError::Friend("Você não pode adicionar a si mesmo como amigo".into()));
+        }
+
+        // Se já tínhamos um pedido recebido pendente deste par, adicionar significa aceitar!
+        if self.identity.get_friend_state(&pubkey) == Some(FriendState::PendingIncoming) {
+            self.accept_friend(&pubkey);
+            return;
+        }
+
+        let now = super::now_secs();
+        let now_ms = super::now_millis();
+
+        // 1. Registra localmente como PendingOutgoing
+        if let Err(e) = self.identity.add_or_update_friend(&pubkey, inferred_alias.as_deref(), FriendState::PendingOutgoing) {
+            return self.error(CoreError::Friend(e.to_string()));
+        }
+        self.persist_identity();
+        self.dm.firewall.unblock(&pubkey);
+        self.subscribe_dm_with(&pubkey);
+
+        // 2. Envia online via tópico mútuo
+        let req = FriendRequest::new_signed(&self.identity, &pubkey, message, now);
+        let dm_top = IdentTopic::new(dm_topic(&self.my_pubkey(), &pubkey));
+        let wire_msg = wire::encode(&DmWireMessage::FriendRequest(req));
+        let _ = self.publish_gossip(dm_top, wire_msg);
+
+        if self.is_pubkey_online(&pubkey) {
+            self.send_ephemeral_key_offer(&pubkey);
+            self.delegate_pending_to_friend(&pubkey);
+        }
+
+        // 3. Enfileira na Mailbox para entrega offline via Guardiões caso o par esteja offline
+        let intro_msg = message.unwrap_or("");
+        if let Ok(stored) = StoredEnvelope::create_signed_and_sealed_topic(
+            &self.identity,
+            &pubkey,
+            FRIEND_REQUEST_MAILBOX_TOPIC,
+            intro_msg,
+            now_ms,
+            None,
+        ) {
+            let env_id = stored.envelope_id.clone();
+            self.dm.mailbox.insert_own(stored.clone(), &self.dm.node_config, now);
+            let msg = MailboxMessage::Store(stored);
+            let bytes = wire::encode(&msg);
+            if self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes).is_ok() {
+                let mailbox_hash = IdentTopic::new(MAILBOX_TOPIC).hash();
+                let subscribed_friends: Vec<String> = self
+                    .node
+                    .swarm
+                    .behaviour()
+                    .gossipsub
+                    .all_peers()
+                    .filter(|(_, topics)| topics.contains(&&mailbox_hash))
+                    .filter_map(|(peer, _)| self.peer_metadata.get(peer).map(|(_, pk)| pk.to_lowercase()))
+                    .filter(|pk| {
+                        self.identity
+                            .get_friends()
+                            .iter()
+                            .any(|f| f.public_key.eq_ignore_ascii_case(pk))
+                    })
+                    .collect();
+                for friend_pk in subscribed_friends {
+                    self.dm.mailbox.mark_delegated_to_guardian(&env_id, &friend_pk);
+                }
+            }
+        }
+
+        self.emit(CoreEvent::FriendUpdated {
+            pubkey: pubkey.to_lowercase(),
+            alias: inferred_alias,
+            removed: false,
+        });
+        self.list_friends();
+    }
+
+    /// Aceita um pedido de amizade pendente
+    pub(super) fn accept_friend(&mut self, target: &str) {
+        let (pubkey, _) = match self.resolve_dm_target(target) {
+            Some(res) => res,
+            None => {
+                let t_trim = target.trim();
+                if t_trim.len() == 64 && t_trim.chars().all(|c| c.is_ascii_hexdigit()) {
+                    (t_trim.to_lowercase(), t_trim.to_string())
+                } else {
+                    return self.error(CoreError::Friend(format!("Contato '{}' não encontrado para aceitar", target)));
+                }
+            }
+        };
+
+        let now = super::now_secs();
+        let now_ms = super::now_millis();
+
+        if !self.identity.set_friend_state(&pubkey, FriendState::Confirmed) {
+            let _ = self.identity.add_or_update_friend(&pubkey, None, FriendState::Confirmed);
+        }
+        self.persist_identity();
+        self.dm.firewall.unblock(&pubkey);
+        self.subscribe_dm_with(&pubkey);
+
+        // Envia resposta positiva online
+        let resp = FriendResponse::new_signed(&self.identity, &pubkey, true, now);
+        let dm_top = IdentTopic::new(dm_topic(&self.my_pubkey(), &pubkey));
+        let wire_msg = wire::encode(&DmWireMessage::FriendResponse(resp));
+        let _ = self.publish_gossip(dm_top, wire_msg);
+
+        if self.is_pubkey_online(&pubkey) {
+            self.send_ephemeral_key_offer(&pubkey);
+            self.delegate_pending_to_friend(&pubkey);
+        }
+
+        // Também despacha via Mailbox para entrega offline garantida
+        if let Ok(stored) = StoredEnvelope::create_signed_and_sealed_topic(
+            &self.identity,
+            &pubkey,
+            FRIEND_RESPONSE_MAILBOX_TOPIC,
+            "ACCEPTED",
+            now_ms,
+            None,
+        ) {
+            self.dm.mailbox.insert_own(stored.clone(), &self.dm.node_config, now);
+            let msg = MailboxMessage::Store(stored);
+            let bytes = wire::encode(&msg);
+            let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
+        }
+
+        self.emit(CoreEvent::FriendUpdated {
+            pubkey: pubkey.clone(),
+            alias: self.identity.get_friend(&pubkey).and_then(|f| f.alias.clone()),
+            removed: false,
+        });
+        self.list_friends();
+    }
+
+    /// Rejeita um pedido de amizade pendente
+    pub(super) fn reject_friend(&mut self, target: &str) {
+        let (pubkey, _) = match self.resolve_dm_target(target) {
+            Some(res) => res,
+            None => {
+                let t_trim = target.trim();
+                if t_trim.len() == 64 && t_trim.chars().all(|c| c.is_ascii_hexdigit()) {
+                    (t_trim.to_lowercase(), t_trim.to_string())
+                } else {
+                    return self.error(CoreError::Friend(format!("Contato '{}' não encontrado para rejeitar", target)));
+                }
+            }
+        };
+
+        let now = super::now_secs();
+        let now_ms = super::now_millis();
+
+        let _ = self.identity.set_friend_state(&pubkey, FriendState::Rejected);
+        self.persist_identity();
+
+        let _peer_name = self.friendly_name(&pubkey);
+
+        // Envia resposta de rejeição online
+        let resp = FriendResponse::new_signed(&self.identity, &pubkey, false, now);
+        let dm_top = IdentTopic::new(dm_topic(&self.my_pubkey(), &pubkey));
+        let wire_msg = wire::encode(&DmWireMessage::FriendResponse(resp));
+        let _ = self.publish_gossip(dm_top, wire_msg);
+
+        // Despacha via Mailbox para entrega offline
+        if let Ok(stored) = StoredEnvelope::create_signed_and_sealed_topic(
+            &self.identity,
+            &pubkey,
+            FRIEND_RESPONSE_MAILBOX_TOPIC,
+            "REJECTED",
+            now_ms,
+            None,
+        ) {
+            self.dm.mailbox.insert_own(stored.clone(), &self.dm.node_config, now);
+            let msg = MailboxMessage::Store(stored);
+            let bytes = wire::encode(&msg);
+            let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
+        }
+
+        self.emit(CoreEvent::FriendUpdated {
+            pubkey: pubkey.clone(),
+            alias: self.identity.get_friend(&pubkey).and_then(|f| f.alias.clone()),
+            removed: false,
+        });
+        self.list_friends();
+    }
+
+    /// Reenvia pedido de amizade a um contato
+    pub(super) fn resend_friend_request(&mut self, target: &str, message: Option<&str>) {
+        self.send_friend_request(target, None, message);
     }
 }
