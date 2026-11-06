@@ -168,37 +168,49 @@ While inside the chat console, you can use built-in slash commands:
 - [x] Asymmetric DM Application Firewall (Friends vs. Strangers limits, progressive blocking `1m → 5m → 30m → 24h`, single E2EE courtesy block notice, `/firewall`) ([#48](https://github.com/VictorGerin/anarchord/issues/48)).
 - [x] Raw Application Packet Sniffer (`sniffer.rs`) & cryptographic wire dissector in `anarlab` (`packets.jsonl` / `packets.log`).
 
+### Phase 7: Swarm Optimization, Dynamic Resume & Protocol Engine ✅ (Completed)
+- [x] Protocol versioning & cross-version compatibility engine (`v1..=v2`) with Identify negotiation ([#51](https://github.com/VictorGerin/anarchord/issues/51), [#61](https://github.com/VictorGerin/anarchord/issues/61)).
+- [x] Swarm traffic isolation via dedicated per-file Gossipsub topics (`anarchord/file/<cid>`) ([#66](https://github.com/VictorGerin/anarchord/issues/66)).
+- [x] Download resume and automatic provider reconnection across application restarts ([#68](https://github.com/VictorGerin/anarchord/issues/68)).
+- [x] Re-download support for deleted files using OS-level filesystem events (`notify`) ([#64](https://github.com/VictorGerin/anarchord/issues/64)).
+- [x] Terminal QoL: auto-complete for file CIDs in `/get`, interactive popup in `/files` ([#63](https://github.com/VictorGerin/anarchord/issues/63)), and chronological timestamp sorting ([#62](https://github.com/VictorGerin/anarchord/issues/62)).
+
 ### Upcoming milestones
 Tracked as [GitHub milestones](https://github.com/VictorGerin/anarchord/milestones); every item is an issue with acceptance criteria. Design principles and threat model: [wiki](https://github.com/VictorGerin/anarchord/wiki/Principios-e-Modelo-de-Ameacas).
 
-**v0.2 Foundation** ⏳
-- [x] Protocol versioning & cross-version compatibility [#51](https://github.com/VictorGerin/anarchord/issues/51)
-- [x] Versioned protocol engine with version/capability negotiation [#61](https://github.com/VictorGerin/anarchord/issues/61)
-- [ ] Git-based versioning [#19](https://github.com/VictorGerin/anarchord/issues/19) and signed, verifiable releases [#49](https://github.com/VictorGerin/anarchord/issues/49)
-- [ ] Crypto hardening: keys encrypted at rest, periodic key updates, safety numbers, fuzzing [#45](https://github.com/VictorGerin/anarchord/issues/45)
-- [ ] Application firewall against spam/abuse with progressive blocking [#48](https://github.com/VictorGerin/anarchord/issues/48) *(Asymmetric DM Firewall with progressive blocking & courtesy notice completed ✅; channel/global firewall remaining)*
-- [ ] Topic subscriptions only for what is open [#56](https://github.com/VictorGerin/anarchord/issues/56)
-- [ ] Lab performance metrics (bandwidth, latency, CPU per node) [#57](https://github.com/VictorGerin/anarchord/issues/57) and lab in CI [#18](https://github.com/VictorGerin/anarchord/issues/18)
+**v0.2 Core, Friends & File Swarm** ⏳
+- [x] Protocol versioning & cross-version compatibility engine [#51](https://github.com/VictorGerin/anarchord/issues/51), [#61](https://github.com/VictorGerin/anarchord/issues/61)
+- [x] Swarm traffic isolation & download resume across restarts [#66](https://github.com/VictorGerin/anarchord/issues/66), [#68](https://github.com/VictorGerin/anarchord/issues/68)
+- [ ] Separation of Identity (Signing) and Encryption (X25519) keys with rotation [#69](https://github.com/VictorGerin/anarchord/issues/69)
+- [ ] Mutual friend request protocol with offline guardian support [#70](https://github.com/VictorGerin/anarchord/issues/70)
+- [ ] Handle unshared or unavailable downloads gracefully (prevent 0% stalls) [#67](https://github.com/VictorGerin/anarchord/issues/67)
+- [ ] Bandwidth and rate limiting configuration for file transfers [#65](https://github.com/VictorGerin/anarchord/issues/65)
+- [ ] Encrypted space indicator 🔐 in TUI [#16](https://github.com/VictorGerin/anarchord/issues/16)
+- [ ] Clean up terminal logging and hole punching noise in System tab [#40](https://github.com/VictorGerin/anarchord/issues/40), [#28](https://github.com/VictorGerin/anarchord/issues/28)
 
-**v0.3 Servers & Invites**
+**v0.3 Servers & Moderation**
+- [ ] Certified moderators can admit/remove MLS members without owner online [#42](https://github.com/VictorGerin/anarchord/issues/42)
 - [ ] Signed invites (expiry, recipient, message) [#43](https://github.com/VictorGerin/anarchord/issues/43), direct invites [#44](https://github.com/VictorGerin/anarchord/issues/44), usage limits [#50](https://github.com/VictorGerin/anarchord/issues/50)
-- [ ] Certified moderators can admit/remove MLS members [#42](https://github.com/VictorGerin/anarchord/issues/42)
+- [ ] Server crypto hardening & keys encrypted at rest [#45](https://github.com/VictorGerin/anarchord/issues/45)
 - [ ] Configuration chain consolidation [#52](https://github.com/VictorGerin/anarchord/issues/52)
-- [ ] MLS & control-topic scaling (batched commits, commit catch-up, no polling) [#53](https://github.com/VictorGerin/anarchord/issues/53), control topic split by function [#58](https://github.com/VictorGerin/anarchord/issues/58)
-- [ ] Metadata leakage review (topics, DHT) [#47](https://github.com/VictorGerin/anarchord/issues/47)
+- [ ] MLS & control-topic scaling [#53](https://github.com/VictorGerin/anarchord/issues/53), control topic split by function [#58](https://github.com/VictorGerin/anarchord/issues/58)
 - [ ] Server discovery: open directory and tag search [#60](https://github.com/VictorGerin/anarchord/issues/60)
+- [ ] Metadata leakage review (topics, DHT) [#47](https://github.com/VictorGerin/anarchord/issues/47)
 
-**v0.4 Channels, DMs & History**
+**v0.4 Channels, History & Room Presence**
 - [x] 1:1 DMs with ephemeral session keys [#36](https://github.com/VictorGerin/anarchord/issues/36) and offline delivery via guardians [#37](https://github.com/VictorGerin/anarchord/issues/37)
 - [x] Configurable node & mailbox limits (`config.json` / `/config`) [#38](https://github.com/VictorGerin/anarchord/issues/38)
-- [ ] Unified channel/server history & offline delivery [#26](https://github.com/VictorGerin/anarchord/issues/26), [#39](https://github.com/VictorGerin/anarchord/issues/39)
-- [ ] Per-channel encryption: ephemeral MLS groups with elected room leader, private channels [#46](https://github.com/VictorGerin/anarchord/issues/46)
+- [ ] Cooperative channel/server history synchronization for offline members [#39](https://github.com/VictorGerin/anarchord/issues/39), [#26](https://github.com/VictorGerin/anarchord/issues/26)
+- [ ] Per-channel encryption: ephemeral MLS groups with elected room leader [#46](https://github.com/VictorGerin/anarchord/issues/46)
 - [ ] Room presence by join/leave, no polling [#55](https://github.com/VictorGerin/anarchord/issues/55)
+- [ ] Topic subscriptions only for active rooms [#56](https://github.com/VictorGerin/anarchord/issues/56)
 
-**v0.5 Scale & Devices**
-- [ ] Media protocol with volunteer relays for large voice/screen rooms [#54](https://github.com/VictorGerin/anarchord/issues/54)
-- [ ] Scalable peer exchange [#8](https://github.com/VictorGerin/anarchord/issues/8), scale scenarios [#23](https://github.com/VictorGerin/anarchord/issues/23)
-- [ ] Light nodes (consume without relaying) [#59](https://github.com/VictorGerin/anarchord/issues/59) and mobile apps [#27](https://github.com/VictorGerin/anarchord/issues/27)
+**v0.5 Distribution, Release & Clients**
+- [ ] Signed and verifiable binary releases & auto-update [#49](https://github.com/VictorGerin/anarchord/issues/49)
+- [ ] Git-based SemVer automation (`release.py`, `build.rs`) [#19](https://github.com/VictorGerin/anarchord/issues/19)
+- [ ] Lab performance metrics [#57](https://github.com/VictorGerin/anarchord/issues/57) and automated lab in GitHub Actions CI [#18](https://github.com/VictorGerin/anarchord/issues/18)
+- [ ] Media relay protocol for large voice/screen rooms [#54](https://github.com/VictorGerin/anarchord/issues/54)
+- [ ] Light nodes [#59](https://github.com/VictorGerin/anarchord/issues/59) and mobile apps [#27](https://github.com/VictorGerin/anarchord/issues/27)
 - [ ] Desktop GUI with **Tauri** [#25](https://github.com/VictorGerin/anarchord/issues/25)
 
 ---
