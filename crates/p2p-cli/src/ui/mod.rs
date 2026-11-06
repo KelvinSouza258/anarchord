@@ -910,25 +910,33 @@ impl TerminalUi {
         let current_members = self.channel_members.get(&self.current_channel);
         
         let mut room_members_items: Vec<ListItem> = Vec::new();
-        let mut seen_nicks = HashSet::new();
+        let mut seen_keys = HashSet::new();
 
         // Usuário atual na sala
         room_members_items.push(ListItem::new(Line::from(vec![
             Span::styled("👤 ", Style::default().fg(Color::Yellow)),
             Span::styled(format!("{} (Você)", self.my_nick), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ])));
-        seen_nicks.insert(self.my_nick.clone());
+        seen_keys.insert((self.my_nick.clone(), self.my_pubkey.clone()));
         self.member_rows = vec![self.my_nick.clone()];
 
         // Pares ativos na sala atual
         if let Some(members) = current_members {
             for nick in members {
-                if seen_nicks.insert(nick.clone()) {
+                let peer_pk = self.peers.iter()
+                    .find(|(_, n, _)| n == nick)
+                    .map(|(_, _, pk)| pk.clone())
+                    .unwrap_or_default();
+                let is_self = nick == &self.my_nick && (peer_pk.is_empty() || peer_pk == self.my_pubkey);
+                if !is_self && seen_keys.insert((nick.clone(), peer_pk.clone())) {
                     self.member_rows.push(nick.clone());
-                    let short_pk = self.peers.iter()
-                        .find(|(_, n, _)| n == nick)
-                        .map(|(_, _, pk)| if pk.len() >= 6 { format!(" ({})", &pk[..6]) } else { format!(" ({})", pk) })
-                        .unwrap_or_default();
+                    let short_pk = if peer_pk.len() >= 6 {
+                        format!(" ({})", &peer_pk[..6])
+                    } else if !peer_pk.is_empty() {
+                        format!(" ({})", peer_pk)
+                    } else {
+                        String::new()
+                    };
                     let friend_info = self.friends.iter().find(|f| f.display_name.eq_ignore_ascii_case(nick));
                     let friend_badge = match friend_info.map(|f| f.state) {
                         Some(p2p_core::identity::FriendState::Confirmed) => " 💚",
@@ -949,7 +957,7 @@ impl TerminalUi {
 
         // Amigos (online fora da sala ou offline) também aparecem clicáveis na lista
         for f in &self.friends {
-            if seen_nicks.insert(f.display_name.clone()) {
+            if seen_keys.insert((f.display_name.clone(), f.public_key.clone())) {
                 self.member_rows.push(f.display_name.clone());
                 let short_pk = if f.public_key.len() >= 6 {
                     format!(" ({})", &f.public_key[..6])
