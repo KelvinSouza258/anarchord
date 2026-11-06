@@ -592,9 +592,9 @@ impl Runtime {
             return;
         }
 
-        if envelope.topic == FRIEND_REQUEST_MAILBOX_TOPIC {
-            match envelope.unseal_and_verify(&self.identity) {
-                Ok(payload) => {
+        match envelope.unseal_and_verify(&self.identity) {
+            Ok(payload) => {
+                if payload.topic == FRIEND_REQUEST_MAILBOX_TOPIC {
                     let sender_pk = payload.sender_pubkey.to_lowercase();
                     if !self.dm.firewall.is_blocked(&sender_pk, now) {
                         let current_state = self.identity.get_friend_state(&sender_pk);
@@ -612,17 +612,10 @@ impl Runtime {
                         }
                     }
                     self.publish_mailbox_ack(ack);
+                    return;
                 }
-                Err(e) => {
-                    tracing::debug!("Envelope offline de friend_request inválido: {}", e);
-                }
-            }
-            return;
-        }
 
-        if envelope.topic == FRIEND_RESPONSE_MAILBOX_TOPIC {
-            match envelope.unseal_and_verify(&self.identity) {
-                Ok(payload) => {
+                if payload.topic == FRIEND_RESPONSE_MAILBOX_TOPIC {
                     let sender_pk = payload.sender_pubkey.to_lowercase();
                     let peer_name = self.friendly_name(&sender_pk);
                     if payload.text.trim().eq_ignore_ascii_case("ACCEPTED") {
@@ -655,16 +648,9 @@ impl Runtime {
                     }
                     self.list_friends();
                     self.publish_mailbox_ack(ack);
+                    return;
                 }
-                Err(e) => {
-                    tracing::debug!("Envelope offline de friend_response inválido: {}", e);
-                }
-            }
-            return;
-        }
 
-        match envelope.unseal_and_verify(&self.identity) {
-            Ok(payload) => {
                 let sender_pk = payload.sender_pubkey.to_lowercase();
                 let is_my_friend = self
                     .identity

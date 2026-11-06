@@ -408,7 +408,6 @@ fn dissect_stored_envelope(env: StoredEnvelope) -> SniffedCrypto {
         &env.envelope_id,
         &env.sender_pubkey,
         &env.recipient_pubkey,
-        &env.topic,
         &env.ephemeral_pubkey,
         &env.nonce,
         &env.ciphertext,

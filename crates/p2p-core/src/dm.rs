@@ -93,12 +93,20 @@ pub fn derive_static_dm_key(identity: &UserIdentity, peer_pubkey_hex: &str) -> R
     Ok(derive_aead_key(shared.as_bytes(), DM_HKDF_INFO))
 }
 
+fn default_payload_topic() -> String {
+    DEFAULT_MAILBOX_TOPIC.to_string()
+}
+
 /// Carga interna autenticada e assinada pelo autor (Sign-then-Seal)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SignedDmPayload {
     pub sender_pubkey: String,
     pub sender_nick: String,
     pub recipient_pubkey: String,
+    /// Tópico da mensagem interna (ex: "dm", "friend_request", "friend_response").
+    /// Fica completamente cifrado para que guardiões intermediários não conheçam o metadado.
+    #[serde(default = "default_payload_topic")]
+    pub topic: String,
     pub text: String,
     pub timestamp: u64,
     #[serde(with = "serde_bytes")]
@@ -112,22 +120,45 @@ impl SignedDmPayload {
         text: &str,
         timestamp: u64,
     ) -> Self {
+        Self::new_signed_with_topic(identity, recipient_pubkey, DEFAULT_MAILBOX_TOPIC, text, timestamp)
+    }
+
+    pub fn new_signed_with_topic(
+        identity: &UserIdentity,
+        recipient_pubkey: &str,
+        topic: &str,
+        text: &str,
+        timestamp: u64,
+    ) -> Self {
         let sender_pubkey = identity.public_key_hex();
         let sender_nick = identity.profile.display_name.clone();
         let recipient_pubkey = recipient_pubkey.trim().to_lowercase();
-        let sig_bytes = Self::signing_bytes(&sender_pubkey, &sender_nick, &recipient_pubkey, text, timestamp);
+        let sig_bytes = Self::signing_bytes(&sender_pubkey, &sender_nick, &recipient_pubkey, topic, text, timestamp);
         let signature = identity.sign(&sig_bytes);
         Self {
             sender_pubkey,
             sender_nick,
             recipient_pubkey,
+            topic: topic.to_string(),
             text: text.to_string(),
             timestamp,
             signature,
         }
     }
 
-    fn signing_bytes(
+    pub fn signing_bytes(
+        sender_pubkey: &str,
+        sender_nick: &str,
+        recipient_pubkey: &str,
+        topic: &str,
+        text: &str,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let tuple = (sender_pubkey, sender_nick, recipient_pubkey, topic, text, timestamp);
+        postcard::to_extend(&tuple, b"anarchord-dm-v2\0".to_vec()).expect("serializável")
+    }
+
+    fn legacy_signing_bytes(
         sender_pubkey: &str,
         sender_nick: &str,
         recipient_pubkey: &str,
@@ -144,10 +175,25 @@ impl SignedDmPayload {
             &self.sender_pubkey,
             &self.sender_nick,
             &self.recipient_pubkey,
+            &self.topic,
             &self.text,
             self.timestamp,
         );
-        verify_signature_hex(&self.sender_pubkey, &bytes, &self.signature)
+        if verify_signature_hex(&self.sender_pubkey, &bytes, &self.signature) {
+            return true;
+        }
+        // Retrocompatibilidade: payloads legados assinados sem o campo topic
+        if self.topic == DEFAULT_MAILBOX_TOPIC {
+            let legacy_bytes = Self::legacy_signing_bytes(
+                &self.sender_pubkey,
+                &self.sender_nick,
+                &self.recipient_pubkey,
+                &self.text,
+                self.timestamp,
+            );
+            return verify_signature_hex(&self.sender_pubkey, &legacy_bytes, &self.signature);
+        }
+        false
     }
 }
 
@@ -652,13 +698,9 @@ pub const KEY_ADV_MAILBOX_TOPIC: &str = "key_adv";
 pub const FRIEND_REQUEST_MAILBOX_TOPIC: &str = "friend_request";
 pub const FRIEND_RESPONSE_MAILBOX_TOPIC: &str = "friend_response";
 
-fn default_envelope_topic() -> String {
-    DEFAULT_MAILBOX_TOPIC.to_string()
-}
-
 /// Envelope cifrado Sign-then-Seal armazenado por guardiões amigos quando o destinatário está offline.
-/// O guardião (Carol) vê apenas `sender_pubkey`, `recipient_pubkey` e `topic`, sem conhecer o conteúdo interno;
-/// a rede de guardiões atua como middleware agnóstico ao conteúdo para entrega assíncrona.
+/// O guardião (Carol) vê apenas `sender_pubkey`, `recipient_pubkey` e metadados de expiração, sem conhecer
+/// o conteúdo ou o tópico interno (DM, friend_request, etc.); a rede atua como middleware cego para entrega assíncrona.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct StoredEnvelope {
     /// Identificador único determinístico (SHA-256 do ciphertext + nonce) para deduplicação
@@ -667,15 +709,14 @@ pub struct StoredEnvelope {
     pub sender_pubkey: String,
     /// Chave pública Ed25519 do destinatário (Bob) — permite a Carol saber para quem entregar
     pub recipient_pubkey: String,
-    /// Tópico / Finalidade do envelope (ex.: "dm", "key_adv", etc.).
-    #[serde(default = "default_envelope_topic")]
-    pub topic: String,
     /// Chave efêmera pública X25519 gerada por Alice exclusivamente para este envelope
+    #[serde(with = "crate::b64::arr32")]
     pub ephemeral_pubkey: [u8; 32],
     /// Nonce ChaCha20-Poly1305
+    #[serde(with = "crate::b64::arr12")]
     pub nonce: [u8; 12],
     /// Carga cifrada contendo `SignedDmPayload` (texto + timestamp + assinatura Ed25519 de Alice)
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::b64")]
     pub ciphertext: Vec<u8>,
     /// Timestamp UNIX de criação
     pub created_at: u64,
@@ -684,7 +725,7 @@ pub struct StoredEnvelope {
     /// Timestamp UNIX de expiração calculado pelo guardião (`created_at + effective_ttl`)
     pub expires_at: u64,
     /// Assinatura externa de Alice sobre os metadados do envelope (impede que terceiros forjem pedidos em nome de Alice)
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::b64")]
     pub outer_signature: Vec<u8>,
 }
 
@@ -694,7 +735,7 @@ pub struct ReceiptAck {
     pub envelope_id: String,
     pub recipient_pubkey: String,
     pub timestamp: u64,
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::b64")]
     pub signature: Vec<u8>,
 }
 
@@ -782,8 +823,14 @@ impl StoredEnvelope {
             .resolve_encryption_public_key(&recipient_clean)
             .map_err(|_| DmError::InvalidPublicKey)?;
 
-        // 1. Sign: Alice assina o payload interno com sua chave privada Ed25519
-        let signed_inner = SignedDmPayload::new_signed(sender_identity, &recipient_clean, text, created_at);
+        // 1. Sign: Alice assina o payload interno COM O TÓPICO cifrado dentro (Blind Guardian)
+        let signed_inner = SignedDmPayload::new_signed_with_topic(
+            sender_identity,
+            &recipient_clean,
+            topic,
+            text,
+            created_at,
+        );
         let inner_bytes = postcard::to_allocvec(&signed_inner).map_err(|_| DmError::DecryptionFailed)?;
 
         // 2. Seal: Alice gera chave efêmera X25519 e cifra para a chave pública de Bob
@@ -817,7 +864,6 @@ impl StoredEnvelope {
             &envelope_id,
             &sender_pubkey,
             &recipient_clean,
-            topic,
             &ephemeral_pubkey,
             &nonce,
             &ciphertext,
@@ -830,7 +876,6 @@ impl StoredEnvelope {
             envelope_id,
             sender_pubkey,
             recipient_pubkey: recipient_clean,
-            topic: topic.to_string(),
             ephemeral_pubkey,
             nonce,
             ciphertext,
@@ -845,39 +890,23 @@ impl StoredEnvelope {
         envelope_id: &str,
         sender_pubkey: &str,
         recipient_pubkey: &str,
-        topic: &str,
         ephemeral_pubkey: &[u8; 32],
         nonce: &[u8; 12],
         ciphertext: &[u8],
         created_at: u64,
         suggested_ttl: Option<u64>,
     ) -> Vec<u8> {
-        if topic == DEFAULT_MAILBOX_TOPIC {
-            let tuple = (
-                envelope_id,
-                sender_pubkey,
-                recipient_pubkey,
-                ephemeral_pubkey,
-                nonce,
-                ciphertext,
-                created_at,
-                suggested_ttl,
-            );
-            postcard::to_extend(&tuple, b"anarchord-sealed-outer-v1\0".to_vec()).expect("serializável")
-        } else {
-            let tuple = (
-                envelope_id,
-                sender_pubkey,
-                recipient_pubkey,
-                topic,
-                ephemeral_pubkey,
-                nonce,
-                ciphertext,
-                created_at,
-                suggested_ttl,
-            );
-            postcard::to_extend(&tuple, b"anarchord-sealed-outer-v2\0".to_vec()).expect("serializável")
-        }
+        let tuple = (
+            envelope_id,
+            sender_pubkey,
+            recipient_pubkey,
+            ephemeral_pubkey,
+            nonce,
+            ciphertext,
+            created_at,
+            suggested_ttl,
+        );
+        postcard::to_extend(&tuple, b"anarchord-sealed-outer-v3\0".to_vec()).expect("serializável")
     }
 
     /// Verifica se o pedido de armazenamento foi realmente assinado por `sender_pubkey`
@@ -886,14 +915,33 @@ impl StoredEnvelope {
             &self.envelope_id,
             &self.sender_pubkey,
             &self.recipient_pubkey,
-            &self.topic,
             &self.ephemeral_pubkey,
             &self.nonce,
             &self.ciphertext,
             self.created_at,
             self.suggested_ttl,
         );
-        verify_signature_hex(&self.sender_pubkey, &bytes, &self.outer_signature)
+        if verify_signature_hex(&self.sender_pubkey, &bytes, &self.outer_signature) {
+            return true;
+        }
+
+        // Retrocompatibilidade para envelopes antigos (v1 sem topic na tupla)
+        let tuple_v1 = (
+            &self.envelope_id,
+            &self.sender_pubkey,
+            &self.recipient_pubkey,
+            &self.ephemeral_pubkey,
+            &self.nonce,
+            &self.ciphertext,
+            self.created_at,
+            self.suggested_ttl,
+        );
+        let bytes_v1 = postcard::to_extend(&tuple_v1, b"anarchord-sealed-outer-v1\0".to_vec()).expect("serializável");
+        if verify_signature_hex(&self.sender_pubkey, &bytes_v1, &self.outer_signature) {
+            return true;
+        }
+
+        false
     }
 
     /// Bob decifra o envelope (mesmo tendo vindo de Carol, uma estranha) e valida a assinatura interna de Alice
@@ -1206,7 +1254,17 @@ impl MailboxStore {
             .retain(|id, _| self.envelopes.contains_key(id));
         self.delivered_ids.retain(|_, &mut exp| exp > now);
         let removed = before.saturating_sub(self.envelopes.len());
-        if removed > 0 {
+
+        // Issue #71: Expurgar ACKs antigos (reter por no máximo 7 dias para evitar acúmulo no disco)
+        const MAX_ACK_RETENTION_SECS: u64 = 7 * 86_400;
+        let ack_before = self.acks.len();
+        self.acks.retain(|_, ack| {
+            let ack_ts_secs = StoredEnvelope::created_at_secs(ack.timestamp);
+            now.saturating_sub(ack_ts_secs) < MAX_ACK_RETENTION_SECS
+        });
+        let acks_removed = ack_before.saturating_sub(self.acks.len());
+
+        if removed > 0 || acks_removed > 0 {
             self.persist();
         }
         removed
@@ -1891,7 +1949,6 @@ mod tests {
             1000,
             Some(3600),
         ).unwrap();
-        assert_eq!(offline_env_epoch0.topic, DEFAULT_MAILBOX_TOPIC);
         assert!(offline_env_epoch0.verify_outer());
 
         let dm_env_epoch0 = DirectMessageEnvelope::seal(
@@ -1918,8 +1975,9 @@ mod tests {
 
         let dec_offline = offline_env_epoch0.unseal_and_verify(&bob).unwrap();
         assert_eq!(dec_offline.text, "Mensagem offline guardada na época 0");
+        assert_eq!(dec_offline.topic, DEFAULT_MAILBOX_TOPIC);
 
-        // 4. Teste de envelope com tópico genérico personalizado (rede de guardiões agnóstica ao conteúdo)
+        // 4. Teste de envelope com tópico genérico personalizado (rede de guardiões cega ao conteúdo/tópico)
         let custom_env = StoredEnvelope::create_signed_and_sealed_topic(
             &alice,
             &bob_uid,
@@ -1928,10 +1986,10 @@ mod tests {
             2000,
             Some(7200),
         ).unwrap();
-        assert_eq!(custom_env.topic, "presence_update");
         assert!(custom_env.verify_outer());
         let dec_custom = custom_env.unseal_and_verify(&bob).unwrap();
         assert_eq!(dec_custom.text, "offline presence payload");
+        assert_eq!(dec_custom.topic, "presence_update");
     }
 
     #[test]
@@ -1978,12 +2036,81 @@ mod tests {
             1020,
             None,
         ).unwrap();
-        assert_eq!(offline_req.topic, FRIEND_REQUEST_MAILBOX_TOPIC);
         assert!(offline_req.verify_outer());
 
         // Bob desempacota e autentica Alice
         let unsealed = offline_req.unseal_and_verify(&bob).unwrap();
         assert_eq!(unsealed.sender_pubkey, alice_pk);
         assert_eq!(unsealed.text, "Pedido offline via Guardiões");
+        assert_eq!(unsealed.topic, FRIEND_REQUEST_MAILBOX_TOPIC);
+    }
+
+    #[test]
+    fn test_blind_guardian_base64_optimization_and_ack_purging() {
+        let alice = UserIdentity::generate_with_nick("Alice");
+        let bob = UserIdentity::generate_with_nick("Bob");
+        let bob_pk = bob.public_key_hex();
+
+        // 1. Cria StoredEnvelope com tópico interno
+        let env = StoredEnvelope::create_signed_and_sealed_topic(
+            &alice,
+            &bob_pk,
+            "topico_secreto",
+            "conteúdo confidencial",
+            1_000_000,
+            Some(3600),
+        ).unwrap();
+
+        // 2. Verifica que a serialização JSON usa Base64 e NÃO vaza 'topic' para o guardião
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains(r#""topic""#), "O guardião não deve ter acesso ao campo topic");
+        assert!(!json.contains(r#""topic_legacy""#));
+        // Confirma que campos binários são strings Base64 e não arrays numéricos
+        assert!(json.contains(r#""ciphertext":""#));
+        assert!(json.contains(r#""ephemeral_pubkey":""#));
+        assert!(json.contains(r#""nonce":""#));
+        assert!(json.contains(r#""outer_signature":""#));
+
+        // Deserializa o JSON de volta para StoredEnvelope
+        let decoded: StoredEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.envelope_id, env.envelope_id);
+        assert!(decoded.verify_outer());
+
+        // Bob decifra e encontra o tópico original
+        let unsealed = decoded.unseal_and_verify(&bob).unwrap();
+        assert_eq!(unsealed.topic, "topico_secreto");
+        assert_eq!(unsealed.text, "conteúdo confidencial");
+
+        // 3. ReceiptAck serializa assinatura em Base64
+        let ack = ReceiptAck::new_signed(&bob, &env.envelope_id, 1_000_100);
+        let ack_json = serde_json::to_string(&ack).unwrap();
+        assert!(ack_json.contains(r#""signature":""#));
+        assert_eq!(serde_json::from_str::<ReceiptAck>(&ack_json).unwrap(), ack);
+
+        // 4. Retrocompatibilidade: aceita envelopes antigos com arrays numéricos e 'topic' externo no JSON
+        let legacy_json = format!(
+            r#"{{"envelope_id":"test1234","sender_pubkey":"{}","recipient_pubkey":"{}","topic":"dm","ephemeral_pubkey":{:?},"nonce":{:?},"ciphertext":{:?},"created_at":1000,"suggested_ttl":3600,"expires_at":4600,"outer_signature":{:?}}}"#,
+            alice.public_key_hex(),
+            bob_pk,
+            vec![1u8; 32],
+            vec![2u8; 12],
+            vec![3u8; 20],
+            vec![4u8; 64],
+        );
+        let legacy_env: Result<StoredEnvelope, _> = serde_json::from_str(&legacy_json);
+        assert!(legacy_env.is_ok(), "Deve deserializar JSON legado com arrays numéricos e topic ignorado");
+
+        // 5. Expurgar ACKs antigos no MailboxStore
+        let mut store = MailboxStore::load(None, 1000);
+        store.acks.insert(ack.envelope_id.clone(), ack);
+        assert_eq!(store.acks.len(), 1);
+
+        // Se passar menos de 7 dias (ex.: 1 dia = 86400s), ACK é preservado
+        store.purge_expired(1_000_100 + 86_400);
+        assert_eq!(store.acks.len(), 1, "ACK recente não deve ser expurgado");
+
+        // Se passar mais de 7 dias (ex.: 8 dias), ACK é expurgado
+        store.purge_expired(1_000_100 + 8 * 86_400);
+        assert_eq!(store.acks.len(), 0, "ACK com mais de 7 dias deve ser expurgado");
     }
 }
