@@ -231,6 +231,10 @@ pub(crate) struct Runtime {
     dialed_open: HashSet<Multiaddr>,
     /// Histórico de discagens de endereços IP descobertos via tracker: Multiaddr -> Instant
     tracker_dial_attempts: HashMap<Multiaddr, std::time::Instant>,
+    /// Pares para os quais hole punching direto já teve sucesso na conexão ativa (evita spam na aba Sistema)
+    dcutr_punched: HashSet<PeerId>,
+    /// Histórico de falhas de hole punching por par para cooldown: PeerId -> (Instant, String)
+    dcutr_last_failure: HashMap<PeerId, (std::time::Instant, String)>,
     has_anarchord_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     relay_manager: RelayManager,
     discovery: discovery::DiscoveryState,
@@ -296,6 +300,8 @@ impl Runtime {
             identified: HashSet::new(),
             dialed_open: HashSet::new(),
             tracker_dial_attempts: HashMap::new(),
+            dcutr_punched: HashSet::new(),
+            dcutr_last_failure: HashMap::new(),
             has_anarchord_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relay_manager,
             discovery: discovery::DiscoveryState::new(config.lab),
@@ -572,6 +578,25 @@ impl Runtime {
 
     pub(super) fn nick_or_short(&self, pubkey: &str) -> String {
         self.nick_for(pubkey)
+    }
+
+    /// Nome amigável de exibição de um par (alias de amigo > nick conectado > PeerId cru) com prefixo do PeerId
+    pub(super) fn peer_display_name(&self, peer_id: &PeerId) -> String {
+        if let Some((nick, pubkey)) = self.peer_metadata.get(peer_id) {
+            let name = if let Some(friend) = self
+                .identity
+                .get_friends()
+                .iter()
+                .find(|f| f.public_key.eq_ignore_ascii_case(pubkey))
+            {
+                friend.alias.as_ref().unwrap_or(nick)
+            } else {
+                nick
+            };
+            format!("{} ({})", name, community::short_id(&peer_id.to_string()))
+        } else {
+            peer_id.to_string()
+        }
     }
 
     /// PeerId de um par por nick, PeerId ou prefixo da pubkey

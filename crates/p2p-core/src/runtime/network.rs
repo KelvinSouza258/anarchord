@@ -15,6 +15,9 @@ use libp2p::swarm::SwarmEvent;
 use libp2p::{gossipsub, Multiaddr, PeerId};
 use std::collections::HashMap;
 
+/// Intervalo mínimo entre mensagens de erro de hole punching repetidas para o mesmo par (Issue #40)
+const DCUTR_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl Runtime {
     /// Trackers em uso: os informados e, com `public_defaults`, os públicos embutidos
     fn trackers(&self) -> Vec<String> {
@@ -188,6 +191,8 @@ impl Runtime {
                     self.identified.remove(&peer_id);
                     self.peer_topics.remove(&peer_id);
                     self.relay_manager.remove_peer(&peer_id);
+                    self.dcutr_punched.remove(&peer_id);
+                    self.dcutr_last_failure.remove(&peer_id);
                     let has_peers = self.anarchord_peers().next().is_some();
                     self.has_anarchord_connected.store(has_peers, std::sync::atomic::Ordering::Relaxed);
                     if let Some((nick, pubkey)) = self.peer_metadata.get(&peer_id).cloned() {
@@ -343,8 +348,8 @@ impl Runtime {
                 }
             }
             SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(libp2p::dcutr::Event { remote_peer_id, result })) => match result {
-                Ok(_) => self.emit(CoreEvent::Network(NetworkEvent::HolePunched(remote_peer_id.to_string()))),
-                Err(e) => self.emit(CoreEvent::Network(NetworkEvent::HolePunchFailed { peer_id: remote_peer_id.to_string(), error: e.to_string() })),
+                Ok(_) => self.on_dcutr_success(remote_peer_id),
+                Err(e) => self.on_dcutr_failure(remote_peer_id, &e.to_string()),
             },
             _ => {}
         }
@@ -517,6 +522,31 @@ impl Runtime {
         }
     }
 
+    fn on_dcutr_success(&mut self, remote_peer_id: PeerId) {
+        if self.dcutr_punched.insert(remote_peer_id) {
+            let peer_label = self.peer_display_name(&remote_peer_id);
+            self.emit(CoreEvent::Network(NetworkEvent::HolePunched(peer_label)));
+        }
+    }
+
+    fn on_dcutr_failure(&mut self, remote_peer_id: PeerId, error: &str) {
+        let now = std::time::Instant::now();
+        let should_emit = match self.dcutr_last_failure.get(&remote_peer_id) {
+            Some((last_time, last_err)) => {
+                now.duration_since(*last_time) >= DCUTR_FAILURE_COOLDOWN || last_err != error
+            }
+            None => true,
+        };
+        if should_emit {
+            self.dcutr_last_failure.insert(remote_peer_id, (now, error.to_string()));
+            let peer_label = self.peer_display_name(&remote_peer_id);
+            self.emit(CoreEvent::Network(NetworkEvent::HolePunchFailed {
+                peer_id: peer_label,
+                error: error.to_string(),
+            }));
+        }
+    }
+
     /// Pede reserva nos relays candidatos que faltam (só age quando o AutoNAT indicou NAT)
     fn request_relay_reservations(&mut self) {
         for (relay, circuit_addr) in self.relay_manager.next_reservations() {
@@ -528,5 +558,107 @@ impl Runtime {
                 Err(e) => tracing::warn!("Falha ao pedir reserva em {}: {:?}", circuit_addr, e),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::CoreConfig;
+    use crate::UserIdentity;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    #[tokio::test]
+    async fn test_peer_display_name_formatting() {
+        let (tx, _rx) = unbounded_channel();
+        let temp = std::env::temp_dir().join(format!("test_dcutr_fmt_{}", rand::random::<u32>()));
+        let config = CoreConfig::new(UserIdentity::generate_with_nick("Alice"), temp.join("servers"), temp.join("downloads"));
+        let mut runtime = Runtime::new(config, tx).unwrap();
+
+        let peer1 = PeerId::random();
+        assert_eq!(runtime.peer_display_name(&peer1), peer1.to_string());
+
+        // Identificado com nick
+        let bob_identity = UserIdentity::generate();
+        let bob_pubkey = bob_identity.public_key_hex();
+        runtime.peer_metadata.insert(peer1, ("Bob".to_string(), bob_pubkey.clone()));
+        let label = runtime.peer_display_name(&peer1);
+        assert!(label.starts_with("Bob ("), "{}", label);
+        assert!(label.contains(&community::short_id(&peer1.to_string())));
+
+        // Com apelido de amigo
+        runtime.identity.add_friend(&bob_pubkey, Some("Bobby")).unwrap();
+        let label_friend = runtime.peer_display_name(&peer1);
+        assert!(label_friend.starts_with("Bobby ("), "{}", label_friend);
+    }
+
+    #[tokio::test]
+    async fn test_dcutr_deduplication_and_cooldown() {
+        let (tx, mut rx) = unbounded_channel();
+        let temp = std::env::temp_dir().join(format!("test_dcutr_dedup_{}", rand::random::<u32>()));
+        let config = CoreConfig::new(UserIdentity::generate_with_nick("Alice"), temp.join("servers"), temp.join("downloads"));
+        let mut runtime = Runtime::new(config, tx).unwrap();
+
+        let peer1 = PeerId::random();
+        runtime.peer_metadata.insert(peer1, ("Bob".to_string(), "pubkey123".to_string()));
+
+        // 1) Primeiro sucesso de hole punching: emite HolePunched
+        runtime.handle_swarm_event(SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(libp2p::dcutr::Event {
+            remote_peer_id: peer1,
+            result: Ok(libp2p::swarm::ConnectionId::new_unchecked(1)),
+        })));
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], CoreEvent::Network(NetworkEvent::HolePunched(label)) if label.contains("Bob")));
+
+        // 2) Segundo sucesso de hole punching para o mesmo peer conectado: DEDUPLICADO (não emite nada)
+        runtime.handle_swarm_event(SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(libp2p::dcutr::Event {
+            remote_peer_id: peer1,
+            result: Ok(libp2p::swarm::ConnectionId::new_unchecked(2)),
+        })));
+        assert!(rx.try_recv().is_err(), "sucesso repetido não deve emitir evento");
+
+        // 3) Falha de hole punching: emite HolePunchFailed
+        runtime.on_dcutr_failure(peer1, "dial timeout");
+        let ev = rx.try_recv().expect("falha deve emitir evento");
+        assert!(matches!(ev, CoreEvent::Network(NetworkEvent::HolePunchFailed { peer_id, error }) if peer_id.contains("Bob") && error == "dial timeout"));
+
+        // 4) Falha consecutiva idêntica logo em seguida: SUPRIMIDA por cooldown
+        runtime.on_dcutr_failure(peer1, "dial timeout");
+        assert!(rx.try_recv().is_err(), "falha consecutiva idêntica em cooldown deve ser suprimida");
+
+        // 5) Falha com erro diferente: emite imediatamente mesmo em cooldown
+        runtime.on_dcutr_failure(peer1, "connection refused");
+        let ev = rx.try_recv().expect("erro diferente deve emitir evento");
+        assert!(matches!(ev, CoreEvent::Network(NetworkEvent::HolePunchFailed { error, .. }) if error == "connection refused"));
+
+        // 6) Ao desconectar totalmente (num_established == 0), o estado é limpo
+        runtime.handle_swarm_event(SwarmEvent::ConnectionClosed {
+            peer_id: peer1,
+            connection_id: libp2p::swarm::ConnectionId::new_unchecked(1),
+            endpoint: libp2p::core::ConnectedPoint::Listener {
+                local_addr: "/ip4/127.0.0.1/tcp/8000".parse().unwrap(),
+                send_back_addr: "/ip4/127.0.0.1/tcp/8001".parse().unwrap(),
+            },
+            num_established: 0,
+            cause: None,
+        });
+
+        // 7) Nova conexão subsequente pode emitir HolePunched novamente
+        runtime.handle_swarm_event(SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(libp2p::dcutr::Event {
+            remote_peer_id: peer1,
+            result: Ok(libp2p::swarm::ConnectionId::new_unchecked(3)),
+        })));
+        let mut new_events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, CoreEvent::Network(NetworkEvent::HolePunched(_))) {
+                new_events.push(ev);
+            }
+        }
+        assert_eq!(new_events.len(), 1, "após reconexão, novo hole punch deve ser emitido");
     }
 }
