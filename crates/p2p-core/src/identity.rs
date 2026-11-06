@@ -70,6 +70,26 @@ struct LegacyIdentityKeys {
     pub public_key_pem: String,
 }
 
+/// Estado da relação de amizade entre dois nós
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FriendState {
+    /// Amizade mútua confirmada (ambos os lados aceitaram)
+    Confirmed,
+    /// Pedido enviado por nós, aguardando resposta do par
+    PendingOutgoing,
+    /// Pedido recebido do par, aguardando nossa confirmação ou recusa
+    PendingIncoming,
+    /// Pedido rejeitado (localmente ou pelo par)
+    Rejected,
+}
+
+impl Default for FriendState {
+    fn default() -> Self {
+        FriendState::Confirmed
+    }
+}
+
 /// Registro de amigo / contato na lista de amigos local
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FriendEntry {
@@ -86,6 +106,9 @@ pub struct FriendEntry {
     /// Época da chave de criptografia conhecida
     #[serde(default)]
     pub encryption_epoch: u64,
+    /// Estado da relação de amizade
+    #[serde(default)]
+    pub state: FriendState,
 }
 
 /// Registro serializável de uma chave de criptografia anterior arquivada no histórico
@@ -448,7 +471,7 @@ impl UserIdentity {
         self.profile.display_name = nick.to_string();
     }
 
-    /// Adiciona ou atualiza um amigo na lista local
+    /// Adiciona ou atualiza um amigo na lista local (estado padrão: Confirmed)
     pub fn add_friend(&mut self, pubkey_hex: &str, alias: Option<&str>) -> Result<(), IdentityError> {
         let pubkey_clean = pubkey_hex.trim().to_lowercase();
         if hex_decode_32(&pubkey_clean).is_err() {
@@ -464,17 +487,100 @@ impl UserIdentity {
             .as_secs();
 
         if let Some(existing) = self.friends.iter_mut().find(|f| f.public_key.eq_ignore_ascii_case(&pubkey_clean)) {
-            existing.alias = alias.map(|a| a.trim().to_string());
+            if let Some(a) = alias {
+                let trimmed = a.trim();
+                if !trimmed.is_empty() {
+                    existing.alias = Some(trimmed.to_string());
+                }
+            }
         } else {
             self.friends.push(FriendEntry {
                 public_key: pubkey_clean,
-                alias: alias.map(|a| a.trim().to_string()),
+                alias: alias.map(|a| a.trim().to_string()).filter(|a| !a.is_empty()),
                 added_at: now,
                 encryption_public_key: None,
                 encryption_epoch: 0,
+                state: FriendState::Confirmed,
             });
         }
         Ok(())
+    }
+
+    /// Adiciona ou atualiza um amigo na lista local especificando seu estado
+    pub fn add_or_update_friend(
+        &mut self,
+        pubkey_hex: &str,
+        alias: Option<&str>,
+        state: FriendState,
+    ) -> Result<(), IdentityError> {
+        let pubkey_clean = pubkey_hex.trim().to_lowercase();
+        if hex_decode_32(&pubkey_clean).is_err() {
+            return Err(IdentityError::InvalidKey("A chave pública deve ter exatamente 64 caracteres hexadecimais (32 bytes)".into()));
+        }
+        if pubkey_clean == self.public_key_hex().to_lowercase() {
+            return Err(IdentityError::InvalidKey("Você não pode adicionar a si mesmo como amigo".into()));
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if let Some(existing) = self.friends.iter_mut().find(|f| f.public_key.eq_ignore_ascii_case(&pubkey_clean)) {
+            if let Some(a) = alias {
+                let trimmed = a.trim();
+                if !trimmed.is_empty() {
+                    existing.alias = Some(trimmed.to_string());
+                }
+            }
+            existing.state = state;
+        } else {
+            self.friends.push(FriendEntry {
+                public_key: pubkey_clean,
+                alias: alias.map(|a| a.trim().to_string()).filter(|a| !a.is_empty()),
+                added_at: now,
+                encryption_public_key: None,
+                encryption_epoch: 0,
+                state,
+            });
+        }
+        Ok(())
+    }
+
+    /// Altera o estado de amizade de um contato existente. Retorna `true` se encontrou.
+    pub fn set_friend_state(&mut self, pubkey_hex: &str, state: FriendState) -> bool {
+        let pubkey_clean = pubkey_hex.trim().to_lowercase();
+        if let Some(existing) = self.friends.iter_mut().find(|f| f.public_key.eq_ignore_ascii_case(&pubkey_clean)) {
+            existing.state = state;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Obtém o estado de amizade de um contato
+    pub fn get_friend_state(&self, pubkey_hex: &str) -> Option<FriendState> {
+        let pubkey_clean = pubkey_hex.trim().to_lowercase();
+        self.friends
+            .iter()
+            .find(|f| f.public_key.eq_ignore_ascii_case(&pubkey_clean))
+            .map(|f| f.state)
+    }
+
+    /// Obtém uma referência ao registro do amigo
+    pub fn get_friend(&self, pubkey_hex: &str) -> Option<&FriendEntry> {
+        let pubkey_clean = pubkey_hex.trim().to_lowercase();
+        self.friends
+            .iter()
+            .find(|f| f.public_key.eq_ignore_ascii_case(&pubkey_clean))
+    }
+
+    /// Obtém uma referência mutável ao registro do amigo
+    pub fn get_friend_mut(&mut self, pubkey_hex: &str) -> Option<&mut FriendEntry> {
+        let pubkey_clean = pubkey_hex.trim().to_lowercase();
+        self.friends
+            .iter_mut()
+            .find(|f| f.public_key.eq_ignore_ascii_case(&pubkey_clean))
     }
 
     /// Remove um amigo da lista local pelo pubkey_hex. Retorna `true` se encontrou e removeu.
@@ -917,5 +1023,36 @@ mod tests {
         assert!(!loaded.remove_friend(&friend_pk)); // já removido
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_friend_states_transitions_and_retrocompat() {
+        let mut user = UserIdentity::generate_with_nick("Alice");
+        let friend = UserIdentity::generate_with_nick("Bob");
+        let f_pk = friend.public_key_hex();
+
+        // 1. Inicia como PendingOutgoing
+        user.add_or_update_friend(&f_pk, Some("Bob"), FriendState::PendingOutgoing).unwrap();
+        assert_eq!(user.get_friend_state(&f_pk), Some(FriendState::PendingOutgoing));
+
+        // 2. Transição para Confirmed
+        assert!(user.set_friend_state(&f_pk, FriendState::Confirmed));
+        assert_eq!(user.get_friend_state(&f_pk), Some(FriendState::Confirmed));
+
+        // 3. Transição para Rejected
+        assert!(user.set_friend_state(&f_pk, FriendState::Rejected));
+        assert_eq!(user.get_friend_state(&f_pk), Some(FriendState::Rejected));
+
+        // 4. Teste de retrocompatibilidade JSON (sem o campo `state`)
+        let legacy_json = format!(
+            r#"{{
+                "public_key": "{}",
+                "alias": "Bob Legado",
+                "added_at": 1700000000
+            }}"#,
+            f_pk
+        );
+        let deserialized: FriendEntry = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(deserialized.state, FriendState::Confirmed);
     }
 }

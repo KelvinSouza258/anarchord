@@ -18,11 +18,14 @@ pub mod file_transfer;
 pub mod screen;
 
 pub use identity::{
-    EncryptionKeyAdvertisement, FriendEntry, IdentityKeys, KeyPairInfo,
+    EncryptionKeyAdvertisement, FriendEntry, FriendState, IdentityKeys, KeyPairInfo,
     SignedEncryptionKeyAdvertisement, UserIdentity,
 };
 pub use config::NodeConfig;
-pub use dm::{dm_topic, DirectMessageEnvelope, DmWireMessage, MailboxMessage, StoredEnvelope};
+pub use dm::{
+    dm_topic, DirectMessageEnvelope, DmWireMessage, FriendRequest, FriendResponse, MailboxMessage,
+    StoredEnvelope,
+};
 pub use api::{peer_id_from_pubkey_hex, ChatMessage};
 pub use runtime::{Core, CoreCommand, CoreConfig, CoreEvent, CoreHandle, CoreTask};
 pub use community::{Channel, ChannelType, ServerMessage, ServerRegistry, Space};

@@ -27,6 +27,8 @@ const DM_SESSION_HKDF_INFO: &[u8] = b"anarchord-dm-session-v1";
 const DM_SEALED_HKDF_INFO: &[u8] = b"anarchord-dm-sealed-box-v1";
 const DM_SIGN_DOMAIN: &[u8] = b"anarchord-dm-sig-v1\0";
 const DM_KEY_OFFER_DOMAIN: &[u8] = b"anarchord-dm-eph-key-v1\0";
+const FRIEND_REQ_DOMAIN: &[u8] = b"anarchord-friend-req-v1\0";
+const FRIEND_RESP_DOMAIN: &[u8] = b"anarchord-friend-resp-v1\0";
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum DmError {
@@ -218,12 +220,208 @@ pub struct DirectMessageEnvelope {
     pub signature: Vec<u8>,
 }
 
+/// Pedido mútuo de amizade assinado digitalmente pela chave de assinatura raiz (Ed25519)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FriendRequest {
+    /// Chave pública Ed25519 do remetente (Alice) em hexadecimal (64 chars)
+    pub sender_pubkey: String,
+    /// Apelido / Display name público de quem envia
+    pub sender_nick: String,
+    /// Chave pública Ed25519 do destinatário (Bob) em hexadecimal (64 chars)
+    pub recipient_pubkey: String,
+    /// Mensagem de saudação ou apresentação opcional
+    pub message: Option<String>,
+    /// Anúncio assinado da chave de criptografia X25519 de quem envia
+    pub encryption_advertisement: crate::identity::SignedEncryptionKeyAdvertisement,
+    /// Timestamp Unix (segundos)
+    pub timestamp: u64,
+    /// Assinatura Ed25519 sobre os campos do pedido
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+impl FriendRequest {
+    pub fn new_signed(
+        identity: &UserIdentity,
+        recipient_pubkey: &str,
+        message: Option<&str>,
+        timestamp: u64,
+    ) -> Self {
+        let sender_pubkey = identity.public_key_hex();
+        let sender_nick = identity.profile.display_name.clone();
+        let recipient_pubkey = recipient_pubkey.trim().to_lowercase();
+        let message = message.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+        let encryption_advertisement = identity.create_key_advertisement();
+        let sig_bytes = Self::signing_bytes(
+            &sender_pubkey,
+            &sender_nick,
+            &recipient_pubkey,
+            message.as_deref(),
+            &encryption_advertisement,
+            timestamp,
+        );
+        let signature = identity.sign(&sig_bytes);
+        Self {
+            sender_pubkey,
+            sender_nick,
+            recipient_pubkey,
+            message,
+            encryption_advertisement,
+            timestamp,
+            signature,
+        }
+    }
+
+    pub fn signing_bytes(
+        sender_pubkey: &str,
+        sender_nick: &str,
+        recipient_pubkey: &str,
+        message: Option<&str>,
+        advertisement: &crate::identity::SignedEncryptionKeyAdvertisement,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let tuple = (
+            sender_pubkey,
+            sender_nick,
+            recipient_pubkey,
+            message,
+            &advertisement.advertisement.encryption_public_key,
+            advertisement.advertisement.epoch,
+            timestamp,
+        );
+        postcard::to_extend(&tuple, FRIEND_REQ_DOMAIN.to_vec()).expect("serializável")
+    }
+
+    pub fn verify(&self) -> bool {
+        if !self.encryption_advertisement.verify() {
+            return false;
+        }
+        if !self.encryption_advertisement.advertisement.user_id.eq_ignore_ascii_case(&self.sender_pubkey) {
+            return false;
+        }
+        let bytes = Self::signing_bytes(
+            &self.sender_pubkey,
+            &self.sender_nick,
+            &self.recipient_pubkey,
+            self.message.as_deref(),
+            &self.encryption_advertisement,
+            self.timestamp,
+        );
+        verify_signature_hex(&self.sender_pubkey, &bytes, &self.signature)
+    }
+}
+
+/// Resposta ao pedido de amizade (Aceite ou Recusa) assinada digitalmente
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FriendResponse {
+    /// Chave pública Ed25519 de quem responde em hexadecimal (64 chars)
+    pub sender_pubkey: String,
+    /// Apelido / Display name de quem responde
+    pub sender_nick: String,
+    /// Chave pública Ed25519 de quem enviou o pedido original
+    pub recipient_pubkey: String,
+    /// `true` se aceitou a amizade, `false` se recusou
+    pub accepted: bool,
+    /// Anúncio assinado da chave de criptografia X25519 (se aceito)
+    pub encryption_advertisement: Option<crate::identity::SignedEncryptionKeyAdvertisement>,
+    /// Timestamp Unix (segundos)
+    pub timestamp: u64,
+    /// Assinatura Ed25519 sobre os campos da resposta
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+impl FriendResponse {
+    pub fn new_signed(
+        identity: &UserIdentity,
+        recipient_pubkey: &str,
+        accepted: bool,
+        timestamp: u64,
+    ) -> Self {
+        let sender_pubkey = identity.public_key_hex();
+        let sender_nick = identity.profile.display_name.clone();
+        let recipient_pubkey = recipient_pubkey.trim().to_lowercase();
+        let encryption_advertisement = if accepted {
+            Some(identity.create_key_advertisement())
+        } else {
+            None
+        };
+        let adv_pub = encryption_advertisement.as_ref().map(|a| a.advertisement.encryption_public_key.as_str());
+        let adv_epoch = encryption_advertisement.as_ref().map(|a| a.advertisement.epoch);
+        let sig_bytes = Self::signing_bytes(
+            &sender_pubkey,
+            &sender_nick,
+            &recipient_pubkey,
+            accepted,
+            adv_pub,
+            adv_epoch,
+            timestamp,
+        );
+        let signature = identity.sign(&sig_bytes);
+        Self {
+            sender_pubkey,
+            sender_nick,
+            recipient_pubkey,
+            accepted,
+            encryption_advertisement,
+            timestamp,
+            signature,
+        }
+    }
+
+    pub fn signing_bytes(
+        sender_pubkey: &str,
+        sender_nick: &str,
+        recipient_pubkey: &str,
+        accepted: bool,
+        adv_pub: Option<&str>,
+        adv_epoch: Option<u64>,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let tuple = (
+            sender_pubkey,
+            sender_nick,
+            recipient_pubkey,
+            accepted,
+            adv_pub,
+            adv_epoch,
+            timestamp,
+        );
+        postcard::to_extend(&tuple, FRIEND_RESP_DOMAIN.to_vec()).expect("serializável")
+    }
+
+    pub fn verify(&self) -> bool {
+        if let Some(ref adv) = self.encryption_advertisement {
+            if !adv.verify() {
+                return false;
+            }
+            if !adv.advertisement.user_id.eq_ignore_ascii_case(&self.sender_pubkey) {
+                return false;
+            }
+        }
+        let adv_pub = self.encryption_advertisement.as_ref().map(|a| a.advertisement.encryption_public_key.as_str());
+        let adv_epoch = self.encryption_advertisement.as_ref().map(|a| a.advertisement.epoch);
+        let bytes = Self::signing_bytes(
+            &self.sender_pubkey,
+            &self.sender_nick,
+            &self.recipient_pubkey,
+            self.accepted,
+            adv_pub,
+            adv_epoch,
+            self.timestamp,
+        );
+        verify_signature_hex(&self.sender_pubkey, &bytes, &self.signature)
+    }
+}
+
 /// Mensagens que circulam no tópico de DM
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum DmWireMessage {
     KeyOffer(EphemeralKeyOffer),
     Message(DirectMessageEnvelope),
     KeyAdvertisement(crate::identity::SignedEncryptionKeyAdvertisement),
+    FriendRequest(FriendRequest),
+    FriendResponse(FriendResponse),
 }
 
 impl wire::WireMessage for DmWireMessage {
@@ -451,6 +649,8 @@ impl Default for DmPeerSession {
 
 pub const DEFAULT_MAILBOX_TOPIC: &str = "dm";
 pub const KEY_ADV_MAILBOX_TOPIC: &str = "key_adv";
+pub const FRIEND_REQUEST_MAILBOX_TOPIC: &str = "friend_request";
+pub const FRIEND_RESPONSE_MAILBOX_TOPIC: &str = "friend_response";
 
 fn default_envelope_topic() -> String {
     DEFAULT_MAILBOX_TOPIC.to_string()
@@ -1267,6 +1467,17 @@ impl DmFirewall {
         }
     }
 
+    /// Retorna se o par está bloqueado ativamente neste instante
+    pub fn is_blocked(&self, pubkey: &str, now: u64) -> bool {
+        let pk = pubkey.trim().to_lowercase();
+        if let Some(state) = self.peers.get(&pk) {
+            if let Some(until) = state.blocked_until {
+                return now < until;
+            }
+        }
+        false
+    }
+
     /// Lista todos os pares atualmente bloqueados
     pub fn active_blocks(&self, now: u64) -> Vec<FirewallBlockEntry> {
         let mut out: Vec<FirewallBlockEntry> = self
@@ -1721,5 +1932,58 @@ mod tests {
         assert!(custom_env.verify_outer());
         let dec_custom = custom_env.unseal_and_verify(&bob).unwrap();
         assert_eq!(dec_custom.text, "offline presence payload");
+    }
+
+    #[test]
+    fn test_friend_request_and_response_signed_protocol() {
+        let alice = UserIdentity::generate_with_nick("Alice");
+        let bob = UserIdentity::generate_with_nick("Bob");
+        let mallory = UserIdentity::generate_with_nick("Mallory");
+
+        let alice_pk = alice.public_key_hex();
+        let bob_pk = bob.public_key_hex();
+
+        // 1. Alice cria pedido de amizade assinado para Bob
+        let req = FriendRequest::new_signed(&alice, &bob_pk, Some("Olá Bob, vamos conectar!"), 1000);
+        assert!(req.verify());
+        assert_eq!(req.sender_pubkey, alice_pk);
+        assert_eq!(req.recipient_pubkey, bob_pk);
+        assert_eq!(req.message.as_deref(), Some("Olá Bob, vamos conectar!"));
+        assert!(req.encryption_advertisement.verify());
+
+        // Forjamento: se Mallory tentar assinar com sua própria chave fingindo ser Alice
+        let mut tampered_req = req.clone();
+        tampered_req.signature = mallory.sign(b"fake");
+        assert!(!tampered_req.verify());
+
+        // 2. Bob responde Aceitando com resposta assinada e seu anúncio de chave
+        let resp_accept = FriendResponse::new_signed(&bob, &alice_pk, true, 1005);
+        assert!(resp_accept.verify());
+        assert!(resp_accept.accepted);
+        assert!(resp_accept.encryption_advertisement.is_some());
+        assert!(resp_accept.encryption_advertisement.as_ref().unwrap().verify());
+
+        // 3. Bob responde Rejeitando
+        let resp_reject = FriendResponse::new_signed(&bob, &alice_pk, false, 1010);
+        assert!(resp_reject.verify());
+        assert!(!resp_reject.accepted);
+        assert!(resp_reject.encryption_advertisement.is_none());
+
+        // 4. Transporte assíncrono via Guardiões (Mailbox offline)
+        let offline_req = StoredEnvelope::create_signed_and_sealed_topic(
+            &alice,
+            &bob_pk,
+            FRIEND_REQUEST_MAILBOX_TOPIC,
+            "Pedido offline via Guardiões",
+            1020,
+            None,
+        ).unwrap();
+        assert_eq!(offline_req.topic, FRIEND_REQUEST_MAILBOX_TOPIC);
+        assert!(offline_req.verify_outer());
+
+        // Bob desempacota e autentica Alice
+        let unsealed = offline_req.unseal_and_verify(&bob).unwrap();
+        assert_eq!(unsealed.sender_pubkey, alice_pk);
+        assert_eq!(unsealed.text, "Pedido offline via Guardiões");
     }
 }

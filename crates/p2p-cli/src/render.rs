@@ -114,6 +114,27 @@ pub fn describe(event: &CoreEvent) -> Vec<String> {
             let name = alias.clone().unwrap_or_else(|| short_id(pubkey).to_string());
             one(if *removed { format!("💔 Amigo {} removido", name) } else { format!("💚 Amigo {} adicionado", name) })
         }
+        CoreEvent::FriendRequestReceived { pubkey, sender_nick, message, offline_delivery } => {
+            let tag = if *offline_delivery { " [offline]" } else { "" };
+            let msg_part = message.as_ref().map(|m| format!(": \"{}\"", m)).unwrap_or_default();
+            one(format!(
+                "📩 Pedido de amizade recebido de {} ({}){}{}. Digite '/friend accept {}' ou '/friend reject {}'",
+                sender_nick,
+                short_id(pubkey),
+                tag,
+                msg_part,
+                sender_nick,
+                sender_nick
+            ))
+        }
+        CoreEvent::FriendRequestAccepted { pubkey, peer_name, offline_delivery } => {
+            let tag = if *offline_delivery { " (entregue via guardião)" } else { "" };
+            one(format!("💚 {} ({}) aceitou seu pedido de amizade!{}", peer_name, short_id(pubkey), tag))
+        }
+        CoreEvent::FriendRequestRejected { pubkey, peer_name, offline_delivery } => {
+            let tag = if *offline_delivery { " (entregue via guardião)" } else { "" };
+            one(format!("🚫 {} ({}) recusou seu pedido de amizade.{}", peer_name, short_id(pubkey), tag))
+        }
         CoreEvent::DmOpened { peer_name, channel, .. } => {
             one(format!("💬 Conversa direta aberta com {} ({}). Suas mensagens vão cifradas de ponta a ponta.", peer_name, channel))
         }
@@ -458,12 +479,30 @@ fn friends(list: &[FriendStatus]) -> Vec<String> {
     let mut lines = vec![format!("👥 Amigos ({}):", list.len())];
     for f in list {
         let name = f.alias.clone().or_else(|| f.current_nick.clone()).unwrap_or_else(|| "(sem nome)".to_string());
+        let (icon, status_label) = match f.state {
+            p2p_core::identity::FriendState::Confirmed => (
+                if f.online { "🟢" } else { "⚪" },
+                if f.online { "online" } else { "offline" },
+            ),
+            p2p_core::identity::FriendState::PendingOutgoing => (
+                if f.online { "🟢" } else { "⚪" },
+                "pendente (enviado)",
+            ),
+            p2p_core::identity::FriendState::PendingIncoming => (
+                "📩",
+                "pedido recebido",
+            ),
+            p2p_core::identity::FriendState::Rejected => (
+                "🚫",
+                "recusado",
+            ),
+        };
         lines.push(format!(
             "   {} {} · {} · {}",
-            if f.online { "🟢" } else { "⚪" },
+            icon,
             name,
             short_id(&f.public_key),
-            if f.online { "online" } else { "offline" }
+            status_label
         ));
     }
     lines

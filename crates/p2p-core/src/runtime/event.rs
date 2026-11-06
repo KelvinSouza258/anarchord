@@ -53,6 +53,25 @@ pub enum CoreEvent {
     FriendPresence { public_key: String, alias: Option<String>, online: bool },
     /// Amigo adicionado ou removido com sucesso
     FriendUpdated { pubkey: String, alias: Option<String>, removed: bool },
+    /// Pedido de amizade recebido de outro par
+    FriendRequestReceived {
+        pubkey: String,
+        sender_nick: String,
+        message: Option<String>,
+        offline_delivery: bool,
+    },
+    /// Pedido de amizade enviado foi aceito pelo outro par
+    FriendRequestAccepted {
+        pubkey: String,
+        peer_name: String,
+        offline_delivery: bool,
+    },
+    /// Pedido de amizade enviado foi rejeitado pelo outro par
+    FriendRequestRejected {
+        pubkey: String,
+        peer_name: String,
+        offline_delivery: bool,
+    },
     /// Canal de DM privado aberto na TUI (`@Amigo`)
     DmOpened { peer_pubkey: String, peer_name: String, channel: String },
     /// Mensagem Direta (DM 1:1 E2EE) enviada ou recebida (online ou entregue via Mailbox offline)
@@ -126,6 +145,8 @@ pub struct FriendStatus {
     pub online: bool,
     pub current_nick: Option<String>,
     pub peer_id: Option<String>,
+    #[serde(default)]
+    pub state: crate::identity::FriendState,
 }
 
 /// Resumo de versão do protocolo e capacidades de um par Anarchord conectado (`/peers`)

@@ -27,6 +27,7 @@ pub struct FriendUiEntry {
     pub public_key: String,
     pub display_name: String,
     pub online: bool,
+    pub state: p2p_core::identity::FriendState,
 }
 
 /// Servidor exibido nos menus (enviado pelo backend em `UiEvent::ServersChanged`)
@@ -174,17 +175,45 @@ pub fn friends_menu(friends: &[FriendUiEntry]) -> Menu {
         run("📋 Listar amigos no log (/friends)", "/friends"),
     ];
     for f in friends {
-        let icon = if f.online { "🟢" } else { "⚪" };
+        let (icon, sub_items) = match f.state {
+            p2p_core::identity::FriendState::Confirmed => {
+                let icon = if f.online { "🟢" } else { "⚪" };
+                let items = vec![
+                    run("💬 Abrir conversa direta (DM)", format!("/dm open {}", f.display_name)),
+                    ask("📨 Enviar mensagem direta…", format!("Mensagem para {}", f.display_name), format!("/dm {} {{}}", f.display_name)),
+                    run("💔 Remover dos amigos", format!("/friend remove {}", f.public_key)),
+                ];
+                (icon, items)
+            }
+            p2p_core::identity::FriendState::PendingIncoming => {
+                let icon = "📩";
+                let items = vec![
+                    run("✅ Aceitar pedido de amizade", format!("/friend accept {}", f.public_key)),
+                    run("❌ Rejeitar pedido de amizade", format!("/friend reject {}", f.public_key)),
+                    run("💔 Remover / ignorar", format!("/friend remove {}", f.public_key)),
+                ];
+                (icon, items)
+            }
+            p2p_core::identity::FriendState::PendingOutgoing => {
+                let icon = "⏳";
+                let items = vec![
+                    run("🔄 Reenviar pedido de amizade", format!("/friend resend {}", f.public_key)),
+                    run("💔 Cancelar / remover pedido", format!("/friend remove {}", f.public_key)),
+                ];
+                (icon, items)
+            }
+            p2p_core::identity::FriendState::Rejected => {
+                let icon = "🚫";
+                let items = vec![
+                    run("🔄 Reenviar pedido de amizade", format!("/friend resend {}", f.public_key)),
+                    run("💔 Remover da lista", format!("/friend remove {}", f.public_key)),
+                ];
+                (icon, items)
+            }
+        };
         let short_pk = if f.public_key.len() >= 8 { &f.public_key[..8] } else { &f.public_key };
         let label = format!("{} {} ({}) ▸", icon, f.display_name, short_pk);
-        let sub = Menu::new(
-            format!(" {} ", f.display_name),
-            vec![
-                run("💬 Abrir conversa direta (DM)", format!("/dm open {}", f.display_name)),
-                ask("📨 Enviar mensagem direta…", format!("Mensagem para {}", f.display_name), format!("/dm {} {{}}", f.display_name)),
-                run("💔 Remover dos amigos", format!("/friend remove {}", f.public_key)),
-            ],
-        );
+        let sub = Menu::new(format!(" {} ", f.display_name), sub_items);
         items.push(MenuItem { label, action: MenuAction::Submenu(sub) });
     }
     Menu::new(" Amigos e DMs ", items)

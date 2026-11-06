@@ -40,8 +40,14 @@ pub enum CoreCommand {
     RejectFile(String),
     Unshare(String),
     ListFiles,
-    /// Gerenciamento de amigos locais
+    /// Gerenciamento de amigos e pedidos de amizade
     AddFriend { pubkey: String, alias: Option<String> },
+    /// Aceita um pedido de amizade pendente
+    AcceptFriend { target: String },
+    /// Rejeita um pedido de amizade pendente
+    RejectFriend { target: String },
+    /// Reenvia pedido de amizade a um par
+    ResendFriendRequest { target: String, message: Option<String> },
     RemoveFriend { pubkey: String },
     ListFriends,
     /// Abre uma conversa privada de DM como canal ativo (`@Nome`)

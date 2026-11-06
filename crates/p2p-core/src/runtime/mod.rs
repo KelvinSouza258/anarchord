@@ -452,6 +452,9 @@ impl Runtime {
             CoreCommand::Unshare(query) => self.unshare_file(&query),
             CoreCommand::ListFiles => self.list_files(),
             CoreCommand::AddFriend { pubkey, alias } => self.add_friend(&pubkey, alias.as_deref()),
+            CoreCommand::AcceptFriend { target } => self.accept_friend(&target),
+            CoreCommand::RejectFriend { target } => self.reject_friend(&target),
+            CoreCommand::ResendFriendRequest { target, message } => self.resend_friend_request(&target, message.as_deref()),
             CoreCommand::RemoveFriend { pubkey } => self.remove_friend(&pubkey),
             CoreCommand::ListFriends => self.list_friends(),
             CoreCommand::OpenDm { target } => self.open_dm(&target),
@@ -603,34 +606,9 @@ impl Runtime {
         });
     }
 
-    /// Adiciona um amigo localmente. Aceita a pubkey completa ou o nick de um par conectado
+    /// Adiciona um amigo e envia pedido mútuo de amizade (online e via Guardiões offline)
     fn add_friend(&mut self, who: &str, alias: Option<&str>) {
-        let who = who.trim();
-        let is_key = who.len() == 64 && who.chars().all(|c| c.is_ascii_hexdigit());
-        let (pubkey, alias) = if is_key {
-            (who.to_string(), alias.map(str::to_string))
-        } else {
-            match self.find_peer(who).and_then(|peer| self.peer_metadata.get(&peer).cloned()) {
-                // Pelo nick: o apelido padrão é o próprio nick
-                Some((nick, pubkey)) => (pubkey, Some(alias.map(str::to_string).unwrap_or(nick))),
-                None => return self.error(CoreError::PeerNotFound(who.to_string())),
-            }
-        };
-        match self.identity.add_friend(&pubkey, alias.as_deref()) {
-            Ok(_) => {
-                self.persist_identity();
-                // Se estava bloqueado como desconhecido no firewall, ao virar amigo é desbloqueado na hora!
-                self.dm.firewall.unblock(&pubkey);
-                self.subscribe_dm_with(&pubkey);
-                if self.is_pubkey_online(&pubkey) {
-                    self.send_ephemeral_key_offer(&pubkey);
-                    self.delegate_pending_to_friend(&pubkey);
-                }
-                self.emit(CoreEvent::FriendUpdated { pubkey: pubkey.to_lowercase(), alias, removed: false });
-                self.list_friends();
-            }
-            Err(e) => self.error(CoreError::Friend(e.to_string())),
-        }
+        self.send_friend_request(who, alias, None);
     }
 
     /// Remove um amigo localmente (pubkey ou nick/apelido)
@@ -694,6 +672,7 @@ impl Runtime {
                     online,
                     current_nick,
                     peer_id,
+                    state: f.state,
                 }
             })
             .collect();

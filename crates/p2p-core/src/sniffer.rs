@@ -232,6 +232,53 @@ fn dissect_incoming(incoming: Incoming) -> (String, SniffedCrypto) {
                 },
             )
         }
+        Incoming::DirectMessage(DmWireMessage::FriendRequest(req)) => {
+            let sig_bytes = crate::dm::FriendRequest::signing_bytes(
+                &req.sender_pubkey,
+                &req.sender_nick,
+                &req.recipient_pubkey,
+                req.message.as_deref(),
+                &req.encryption_advertisement,
+                req.timestamp,
+            );
+            let valid = req.verify();
+            (
+                "DirectMessage.FriendRequest".to_string(),
+                SniffedCrypto {
+                    sender_pubkey: Some(req.sender_pubkey),
+                    recipient_pubkey: Some(req.recipient_pubkey),
+                    signing_bytes_hex: Some(hex_encode(&sig_bytes)),
+                    signature_hex: Some(hex_encode(&req.signature)),
+                    signature_valid: Some(valid),
+                    ..Default::default()
+                },
+            )
+        }
+        Incoming::DirectMessage(DmWireMessage::FriendResponse(resp)) => {
+            let adv_pub = resp.encryption_advertisement.as_ref().map(|a| a.advertisement.encryption_public_key.as_str());
+            let adv_epoch = resp.encryption_advertisement.as_ref().map(|a| a.advertisement.epoch);
+            let sig_bytes = crate::dm::FriendResponse::signing_bytes(
+                &resp.sender_pubkey,
+                &resp.sender_nick,
+                &resp.recipient_pubkey,
+                resp.accepted,
+                adv_pub,
+                adv_epoch,
+                resp.timestamp,
+            );
+            let valid = resp.verify();
+            (
+                "DirectMessage.FriendResponse".to_string(),
+                SniffedCrypto {
+                    sender_pubkey: Some(resp.sender_pubkey),
+                    recipient_pubkey: Some(resp.recipient_pubkey),
+                    signing_bytes_hex: Some(hex_encode(&sig_bytes)),
+                    signature_hex: Some(hex_encode(&resp.signature)),
+                    signature_valid: Some(valid),
+                    ..Default::default()
+                },
+            )
+        }
         Incoming::DirectMessage(DmWireMessage::Message(env)) => {
             let sig_bytes = DirectMessageEnvelope::signing_bytes(
                 &env.sender_pubkey,
