@@ -183,6 +183,7 @@ Tracked as [GitHub milestones](https://github.com/VictorGerin/anarchord/mileston
 - [x] Swarm traffic isolation & download resume across restarts [#66](https://github.com/VictorGerin/anarchord/issues/66), [#68](https://github.com/VictorGerin/anarchord/issues/68)
 - [ ] Separation of Identity (Signing) and Encryption (X25519) keys with rotation [#69](https://github.com/VictorGerin/anarchord/issues/69)
 - [ ] Mutual friend request protocol with offline guardian support [#70](https://github.com/VictorGerin/anarchord/issues/70)
+- [ ] Friend request outbox retention under firewall cooldown and cross-request resolution [#73](https://github.com/VictorGerin/anarchord/issues/73)
 - [ ] Mailbox optimization (Base64 for binary arrays) and reliable message pruning [#71](https://github.com/VictorGerin/anarchord/issues/71)
 - [ ] Mailbox metadata protection: move topic to encrypted payload [#72](https://github.com/VictorGerin/anarchord/issues/72)
 - [ ] Handle unshared or unavailable downloads gracefully (prevent 0% stalls) [#67](https://github.com/VictorGerin/anarchord/issues/67)
