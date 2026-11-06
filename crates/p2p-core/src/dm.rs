@@ -3,15 +3,14 @@
 //! e Mailbox Offline Descentralizada (Store-and-Forward via Guardiões Amigos).
 
 use crate::config::{DmPolicyConfig, NodeConfig};
-use crate::identity::{hex_decode_32, verify_signature_hex, UserIdentity};
+use crate::identity::{verify_signature_hex, UserIdentity};
 use crate::wire;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use curve25519_dalek::edwards::CompressedEdwardsY;
 use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -66,19 +65,12 @@ pub fn dm_topic(pubkey_a: &str, pubkey_b: &str) -> String {
 
 /// Converte uma chave privada Ed25519 (seed de 32 bytes) para um `StaticSecret` X25519 (RFC 8032)
 pub fn ed25519_priv_to_x25519(ed_secret_bytes: &[u8; 32]) -> StaticSecret {
-    let hash = Sha512::digest(ed_secret_bytes);
-    let mut scalar = [0u8; 32];
-    scalar.copy_from_slice(&hash[..32]);
-    StaticSecret::from(scalar)
+    crate::identity::ed25519_priv_to_x25519(ed_secret_bytes)
 }
 
 /// Converte uma chave pública Ed25519 (hex de 64 chars) para `X25519PublicKey` (ponto Montgomery biracionalmente equivalente)
 pub fn ed25519_pub_hex_to_x25519(pubkey_hex: &str) -> Result<X25519PublicKey, DmError> {
-    let bytes = hex_decode_32(pubkey_hex).map_err(|_| DmError::InvalidPublicKey)?;
-    let compressed = CompressedEdwardsY(bytes);
-    let edwards_point = compressed.decompress().ok_or(DmError::InvalidPublicKey)?;
-    let montgomery = edwards_point.to_montgomery();
-    Ok(X25519PublicKey::from(montgomery.to_bytes()))
+    crate::identity::ed25519_pub_hex_to_x25519(pubkey_hex).map_err(|_| DmError::InvalidPublicKey)
 }
 
 /// Deriva chave simétrica ChaCha20-Poly1305 de 256 bits a partir de um segredo compartilhado X25519 via HKDF-SHA256
@@ -89,10 +81,12 @@ fn derive_aead_key(shared_secret: &[u8; 32], info: &[u8]) -> [u8; 32] {
     okm
 }
 
-/// Deriva a chave base estática ECDH entre a identidade local e a chave pública do par
+/// Deriva a chave base estática ECDH entre a chave de criptografia local X25519 e a chave pública do par
 pub fn derive_static_dm_key(identity: &UserIdentity, peer_pubkey_hex: &str) -> Result<[u8; 32], DmError> {
-    let my_x25519 = ed25519_priv_to_x25519(&identity.signing_key_bytes());
-    let peer_x25519 = ed25519_pub_hex_to_x25519(peer_pubkey_hex)?;
+    let my_x25519 = identity.encryption_secret();
+    let peer_x25519 = identity
+        .resolve_encryption_public_key(peer_pubkey_hex)
+        .map_err(|_| DmError::InvalidPublicKey)?;
     let shared = my_x25519.diffie_hellman(&peer_x25519);
     Ok(derive_aead_key(shared.as_bytes(), DM_HKDF_INFO))
 }
@@ -229,6 +223,7 @@ pub struct DirectMessageEnvelope {
 pub enum DmWireMessage {
     KeyOffer(EphemeralKeyOffer),
     Message(DirectMessageEnvelope),
+    KeyAdvertisement(crate::identity::SignedEncryptionKeyAdvertisement),
 }
 
 impl wire::WireMessage for DmWireMessage {
@@ -258,7 +253,9 @@ impl DirectMessageEnvelope {
         let (aead_key, uses_session_key) = match session_key {
             Some(k) => (*k, true),
             None => {
-                let recipient_x25519 = ed25519_pub_hex_to_x25519(&recipient_clean)?;
+                let recipient_x25519 = identity
+                    .resolve_encryption_public_key(&recipient_clean)
+                    .map_err(|_| DmError::InvalidPublicKey)?;
                 let shared = eph_secret.diffie_hellman(&recipient_x25519);
                 (derive_aead_key(shared.as_bytes(), DM_HKDF_INFO), false)
             }
@@ -320,31 +317,59 @@ impl DirectMessageEnvelope {
             return Err(DmError::InvalidSignature);
         }
 
-        let aead_key = if self.uses_session_key {
-            *session_key.ok_or(DmError::DecryptionFailed)?
-        } else {
-            let my_x25519 = ed25519_priv_to_x25519(&recipient_identity.signing_key_bytes());
-            let sender_eph = X25519PublicKey::from(self.ephemeral_pubkey);
-            let shared = my_x25519.diffie_hellman(&sender_eph);
-            derive_aead_key(shared.as_bytes(), DM_HKDF_INFO)
-        };
-
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&aead_key));
-        let plaintext = cipher
-            .decrypt(Nonce::from_slice(&self.nonce), self.ciphertext.as_ref())
-            .map_err(|_| DmError::DecryptionFailed)?;
-
-        let payload: SignedDmPayload =
-            postcard::from_bytes(&plaintext).map_err(|_| DmError::DecryptionFailed)?;
-
-        if !payload.sender_pubkey.eq_ignore_ascii_case(&self.sender_pubkey)
-            || !payload.recipient_pubkey.eq_ignore_ascii_case(&my_pub)
-            || !payload.verify()
-        {
-            return Err(DmError::InvalidSignature);
+        if self.uses_session_key {
+            let key = *session_key.ok_or(DmError::DecryptionFailed)?;
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+            let plaintext = cipher
+                .decrypt(Nonce::from_slice(&self.nonce), self.ciphertext.as_ref())
+                .map_err(|_| DmError::DecryptionFailed)?;
+            let payload: SignedDmPayload =
+                postcard::from_bytes(&plaintext).map_err(|_| DmError::DecryptionFailed)?;
+            if !payload.sender_pubkey.eq_ignore_ascii_case(&self.sender_pubkey)
+                || !payload.recipient_pubkey.eq_ignore_ascii_case(&my_pub)
+                || !payload.verify()
+            {
+                return Err(DmError::InvalidSignature);
+            }
+            return Ok(payload);
         }
 
-        Ok(payload)
+        // 1. Tenta decifrar com a chave estática X25519 atual
+        let sender_eph = X25519PublicKey::from(self.ephemeral_pubkey);
+        let my_x25519 = recipient_identity.encryption_secret();
+        let shared = my_x25519.diffie_hellman(&sender_eph);
+        let aead_key = derive_aead_key(shared.as_bytes(), DM_HKDF_INFO);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&aead_key));
+
+        if let Ok(plaintext) = cipher.decrypt(Nonce::from_slice(&self.nonce), self.ciphertext.as_ref()) {
+            if let Ok(payload) = postcard::from_bytes::<SignedDmPayload>(&plaintext) {
+                if payload.sender_pubkey.eq_ignore_ascii_case(&self.sender_pubkey)
+                    && payload.recipient_pubkey.eq_ignore_ascii_case(&my_pub)
+                    && payload.verify()
+                {
+                    return Ok(payload);
+                }
+            }
+        }
+
+        // 2. Se falhou, tenta as chaves anteriores do histórico arquivadas em identity.json
+        for hist in recipient_identity.previous_encryption_keys().iter().rev() {
+            let shared = hist.secret.diffie_hellman(&sender_eph);
+            let aead_key = derive_aead_key(shared.as_bytes(), DM_HKDF_INFO);
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&aead_key));
+            if let Ok(plaintext) = cipher.decrypt(Nonce::from_slice(&self.nonce), self.ciphertext.as_ref()) {
+                if let Ok(payload) = postcard::from_bytes::<SignedDmPayload>(&plaintext) {
+                    if payload.sender_pubkey.eq_ignore_ascii_case(&self.sender_pubkey)
+                        && payload.recipient_pubkey.eq_ignore_ascii_case(&my_pub)
+                        && payload.verify()
+                    {
+                        return Ok(payload);
+                    }
+                }
+            }
+        }
+
+        Err(DmError::DecryptionFailed)
     }
 
     pub fn signing_bytes(
@@ -424,10 +449,16 @@ impl Default for DmPeerSession {
 // ISSUE #37: MENSAGENS OFFLINE VIA GUARDIÕES AMIGOS (STORE-AND-FORWARD MAILBOX)
 // ============================================================================
 
+pub const DEFAULT_MAILBOX_TOPIC: &str = "dm";
+pub const KEY_ADV_MAILBOX_TOPIC: &str = "key_adv";
+
+fn default_envelope_topic() -> String {
+    DEFAULT_MAILBOX_TOPIC.to_string()
+}
+
 /// Envelope cifrado Sign-then-Seal armazenado por guardiões amigos quando o destinatário está offline.
-/// O guardião (Carol) vê apenas `sender_pubkey` e `recipient_pubkey`, mas não consegue ler o conteúdo;
-/// o destinatário (Bob) pode receber o envelope de um completo estranho (Carol) e verificar a
-/// assinatura interna de Alice.
+/// O guardião (Carol) vê apenas `sender_pubkey`, `recipient_pubkey` e `topic`, sem conhecer o conteúdo interno;
+/// a rede de guardiões atua como middleware agnóstico ao conteúdo para entrega assíncrona.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct StoredEnvelope {
     /// Identificador único determinístico (SHA-256 do ciphertext + nonce) para deduplicação
@@ -436,6 +467,9 @@ pub struct StoredEnvelope {
     pub sender_pubkey: String,
     /// Chave pública Ed25519 do destinatário (Bob) — permite a Carol saber para quem entregar
     pub recipient_pubkey: String,
+    /// Tópico / Finalidade do envelope (ex.: "dm", "key_adv", etc.).
+    #[serde(default = "default_envelope_topic")]
+    pub topic: String,
     /// Chave efêmera pública X25519 gerada por Alice exclusivamente para este envelope
     pub ephemeral_pubkey: [u8; 32],
     /// Nonce ChaCha20-Poly1305
@@ -497,6 +531,8 @@ pub enum MailboxMessage {
     Deliver(StoredEnvelope),
     /// Destinatário confirma o recebimento e autoriza os guardiões a liberarem o espaço em disco
     Ack(ReceiptAck),
+    /// Anúncio de rotação de chave de criptografia propagado e sincronizado via guardiões amigos
+    KeyAdvertisement(crate::identity::SignedEncryptionKeyAdvertisement),
 }
 
 impl wire::WireMessage for MailboxMessage {
@@ -514,7 +550,7 @@ impl StoredEnvelope {
         }
     }
 
-    /// Alice cria um `StoredEnvelope` Sign-then-Seal para Bob, com sugestão opcional de TTL
+    /// Alice cria um `StoredEnvelope` Sign-then-Seal para Bob, com tópico padrão "dm"
     pub fn create_signed_and_sealed(
         sender_identity: &UserIdentity,
         recipient_pubkey: &str,
@@ -522,10 +558,31 @@ impl StoredEnvelope {
         created_at: u64,
         suggested_ttl: Option<u64>,
     ) -> Result<Self, DmError> {
-        let recipient_clean = recipient_pubkey.trim().to_lowercase();
-        let recipient_x25519 = ed25519_pub_hex_to_x25519(&recipient_clean)?;
+        Self::create_signed_and_sealed_topic(
+            sender_identity,
+            recipient_pubkey,
+            DEFAULT_MAILBOX_TOPIC,
+            text,
+            created_at,
+            suggested_ttl,
+        )
+    }
 
-        // 1. Sign: Alice assina o payload interno com sua chave privada Ed25519 (created_at em milissegundos na v1)
+    /// Cria um envelope genérico orientado a tópico armazenado pelos guardiões amigos
+    pub fn create_signed_and_sealed_topic(
+        sender_identity: &UserIdentity,
+        recipient_pubkey: &str,
+        topic: &str,
+        text: &str,
+        created_at: u64,
+        suggested_ttl: Option<u64>,
+    ) -> Result<Self, DmError> {
+        let recipient_clean = recipient_pubkey.trim().to_lowercase();
+        let recipient_x25519 = sender_identity
+            .resolve_encryption_public_key(&recipient_clean)
+            .map_err(|_| DmError::InvalidPublicKey)?;
+
+        // 1. Sign: Alice assina o payload interno com sua chave privada Ed25519
         let signed_inner = SignedDmPayload::new_signed(sender_identity, &recipient_clean, text, created_at);
         let inner_bytes = postcard::to_allocvec(&signed_inner).map_err(|_| DmError::DecryptionFailed)?;
 
@@ -560,6 +617,7 @@ impl StoredEnvelope {
             &envelope_id,
             &sender_pubkey,
             &recipient_clean,
+            topic,
             &ephemeral_pubkey,
             &nonce,
             &ciphertext,
@@ -572,6 +630,7 @@ impl StoredEnvelope {
             envelope_id,
             sender_pubkey,
             recipient_pubkey: recipient_clean,
+            topic: topic.to_string(),
             ephemeral_pubkey,
             nonce,
             ciphertext,
@@ -586,23 +645,39 @@ impl StoredEnvelope {
         envelope_id: &str,
         sender_pubkey: &str,
         recipient_pubkey: &str,
+        topic: &str,
         ephemeral_pubkey: &[u8; 32],
         nonce: &[u8; 12],
         ciphertext: &[u8],
         created_at: u64,
         suggested_ttl: Option<u64>,
     ) -> Vec<u8> {
-        let tuple = (
-            envelope_id,
-            sender_pubkey,
-            recipient_pubkey,
-            ephemeral_pubkey,
-            nonce,
-            ciphertext,
-            created_at,
-            suggested_ttl,
-        );
-        postcard::to_extend(&tuple, b"anarchord-sealed-outer-v1\0".to_vec()).expect("serializável")
+        if topic == DEFAULT_MAILBOX_TOPIC {
+            let tuple = (
+                envelope_id,
+                sender_pubkey,
+                recipient_pubkey,
+                ephemeral_pubkey,
+                nonce,
+                ciphertext,
+                created_at,
+                suggested_ttl,
+            );
+            postcard::to_extend(&tuple, b"anarchord-sealed-outer-v1\0".to_vec()).expect("serializável")
+        } else {
+            let tuple = (
+                envelope_id,
+                sender_pubkey,
+                recipient_pubkey,
+                topic,
+                ephemeral_pubkey,
+                nonce,
+                ciphertext,
+                created_at,
+                suggested_ttl,
+            );
+            postcard::to_extend(&tuple, b"anarchord-sealed-outer-v2\0".to_vec()).expect("serializável")
+        }
     }
 
     /// Verifica se o pedido de armazenamento foi realmente assinado por `sender_pubkey`
@@ -611,6 +686,7 @@ impl StoredEnvelope {
             &self.envelope_id,
             &self.sender_pubkey,
             &self.recipient_pubkey,
+            &self.topic,
             &self.ephemeral_pubkey,
             &self.nonce,
             &self.ciphertext,
@@ -627,28 +703,43 @@ impl StoredEnvelope {
             return Err(DmError::WrongRecipient);
         }
 
-        let my_x25519 = ed25519_priv_to_x25519(&recipient_identity.signing_key_bytes());
         let eph_pub = X25519PublicKey::from(self.ephemeral_pubkey);
+
+        // 1. Tenta decifrar com a chave X25519 atual
+        let my_x25519 = recipient_identity.encryption_secret();
         let shared = my_x25519.diffie_hellman(&eph_pub);
         let aead_key = derive_aead_key(shared.as_bytes(), DM_SEALED_HKDF_INFO);
-
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&aead_key));
-        let plaintext = cipher
-            .decrypt(Nonce::from_slice(&self.nonce), self.ciphertext.as_ref())
-            .map_err(|_| DmError::DecryptionFailed)?;
 
-        let inner: SignedDmPayload =
-            postcard::from_bytes(&plaintext).map_err(|_| DmError::DecryptionFailed)?;
-
-        // Verifica que o autor dentro do ciphertext assinou com sua chave Ed25519 e corresponde ao sender externo
-        if !inner.sender_pubkey.eq_ignore_ascii_case(&self.sender_pubkey)
-            || !inner.recipient_pubkey.eq_ignore_ascii_case(&my_pub)
-            || !inner.verify()
-        {
-            return Err(DmError::InvalidSignature);
+        if let Ok(plaintext) = cipher.decrypt(Nonce::from_slice(&self.nonce), self.ciphertext.as_ref()) {
+            if let Ok(inner) = postcard::from_bytes::<SignedDmPayload>(&plaintext) {
+                if inner.sender_pubkey.eq_ignore_ascii_case(&self.sender_pubkey)
+                    && inner.recipient_pubkey.eq_ignore_ascii_case(&my_pub)
+                    && inner.verify()
+                {
+                    return Ok(inner);
+                }
+            }
         }
 
-        Ok(inner)
+        // 2. Se falhou, tenta as chaves anteriores do histórico arquivadas em identity.json
+        for hist in recipient_identity.previous_encryption_keys().iter().rev() {
+            let shared = hist.secret.diffie_hellman(&eph_pub);
+            let aead_key = derive_aead_key(shared.as_bytes(), DM_SEALED_HKDF_INFO);
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&aead_key));
+            if let Ok(plaintext) = cipher.decrypt(Nonce::from_slice(&self.nonce), self.ciphertext.as_ref()) {
+                if let Ok(inner) = postcard::from_bytes::<SignedDmPayload>(&plaintext) {
+                    if inner.sender_pubkey.eq_ignore_ascii_case(&self.sender_pubkey)
+                        && inner.recipient_pubkey.eq_ignore_ascii_case(&my_pub)
+                        && inner.verify()
+                    {
+                        return Ok(inner);
+                    }
+                }
+            }
+        }
+
+        Err(DmError::DecryptionFailed)
     }
 
     /// Tamanho estimado ocupado pelo envelope em bytes
@@ -1540,5 +1631,95 @@ mod tests {
             3025,
         );
         assert_eq!(for_dave.len(), 1);
+    }
+
+    #[test]
+    fn test_e2ee_dm_with_encryption_key_rotation() {
+        let mut alice = UserIdentity::generate_with_nick("Alice");
+        let mut bob = UserIdentity::generate_with_nick("Bob");
+
+        let bob_uid = bob.public_key_hex();
+        alice.add_friend(&bob_uid, Some("Bob")).unwrap();
+
+        // 1. Mensagem inicial antes da rotação (usa chave inicial)
+        let env1 = DirectMessageEnvelope::seal(&alice, &bob_uid, "Olá Bob antes da rotação", 1000, None).unwrap();
+        let dec1 = env1.open(&bob, None).unwrap();
+        assert_eq!(dec1.text, "Olá Bob antes da rotação");
+
+        // 2. Bob rotaciona sua chave de criptografia
+        let ad = bob.rotate_encryption_key();
+        assert_eq!(bob.encryption_epoch(), 1);
+
+        // Bob anuncia para Alice e Alice atualiza a chave de Bob
+        assert!(alice.update_friend_encryption_key(&ad).unwrap());
+        assert_eq!(
+            alice.friend_encryption_public_key(&bob_uid).unwrap().to_bytes(),
+            bob.encryption_public_key().to_bytes()
+        );
+
+        // 3. Alice agora envia uma nova DM cifrada com a nova chave X25519 de Bob
+        let env2 = DirectMessageEnvelope::seal(&alice, &bob_uid, "Olá Bob com chave rotacionada!", 2000, None).unwrap();
+
+        // Bob decifra com sucesso usando sua nova chave nativa
+        let dec2 = env2.open(&bob, None).unwrap();
+        assert_eq!(dec2.text, "Olá Bob com chave rotacionada!");
+        assert_eq!(dec2.sender_pubkey, alice.public_key_hex());
+    }
+
+    #[test]
+    fn test_offline_mailbox_and_dm_decrypts_with_historical_keys_after_multiple_rotations() {
+        let alice = UserIdentity::generate_with_nick("Alice");
+        let mut bob = UserIdentity::generate_with_nick("Bob");
+        let bob_uid = bob.public_key_hex();
+
+        // 1. Alice cria um StoredEnvelope offline e uma DM para Bob na época 0
+        let offline_env_epoch0 = StoredEnvelope::create_signed_and_sealed(
+            &alice,
+            &bob_uid,
+            "Mensagem offline guardada na época 0",
+            1000,
+            Some(3600),
+        ).unwrap();
+        assert_eq!(offline_env_epoch0.topic, DEFAULT_MAILBOX_TOPIC);
+        assert!(offline_env_epoch0.verify_outer());
+
+        let dm_env_epoch0 = DirectMessageEnvelope::seal(
+            &alice,
+            &bob_uid,
+            "DM em voo cifrada na época 0",
+            1000,
+            None,
+        ).unwrap();
+
+        // 2. Bob rotaciona a chave duas vezes antes de receber as mensagens (vai para época 1 e depois 2)
+        let _ad1 = bob.rotate_encryption_key();
+        assert_eq!(bob.encryption_epoch(), 1);
+        assert_eq!(bob.previous_encryption_keys().len(), 1);
+
+        let _ad2 = bob.rotate_encryption_key();
+        assert_eq!(bob.encryption_epoch(), 2);
+        assert_eq!(bob.previous_encryption_keys().len(), 2);
+
+        // 3. Bob recebe a DM em voo e o StoredEnvelope antigo da Mailbox
+        // Graças ao histórico de chaves arquivado no UserIdentity, Bob decifra ambos com sucesso!
+        let dec_dm = dm_env_epoch0.open(&bob, None).unwrap();
+        assert_eq!(dec_dm.text, "DM em voo cifrada na época 0");
+
+        let dec_offline = offline_env_epoch0.unseal_and_verify(&bob).unwrap();
+        assert_eq!(dec_offline.text, "Mensagem offline guardada na época 0");
+
+        // 4. Teste de envelope com tópico genérico personalizado (rede de guardiões agnóstica ao conteúdo)
+        let custom_env = StoredEnvelope::create_signed_and_sealed_topic(
+            &alice,
+            &bob_uid,
+            "presence_update",
+            "offline presence payload",
+            2000,
+            Some(7200),
+        ).unwrap();
+        assert_eq!(custom_env.topic, "presence_update");
+        assert!(custom_env.verify_outer());
+        let dec_custom = custom_env.unseal_and_verify(&bob).unwrap();
+        assert_eq!(dec_custom.text, "offline presence payload");
     }
 }

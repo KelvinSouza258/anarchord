@@ -25,9 +25,11 @@ pub use servers::{invite_text, parse_invite};
 // FriendStatus vem de `event::*`
 
 use crate::community::{self, e2ee::ServerGroups, ServerRegistry, Space};
+use crate::dm::{dm_topic, DmWireMessage};
 use crate::identity::UserIdentity;
 use crate::node::P2PNode;
 use crate::relay::RelayManager;
+use crate::wire;
 use libp2p::gossipsub::IdentTopic;
 use libp2p::{Multiaddr, PeerId};
 use std::collections::{HashMap, HashSet};
@@ -459,6 +461,7 @@ impl Runtime {
             CoreCommand::ListFirewall => self.list_firewall(),
             CoreCommand::UnblockPeer { target } => self.unblock_peer(&target),
             CoreCommand::Server(command) => self.run_server_command(command),
+            CoreCommand::RotateEncryptionKey => self.rotate_encryption_key(),
             CoreCommand::Shutdown => {}
         }
     }
@@ -575,6 +578,29 @@ impl Runtime {
         if let Some(path) = &self.config.identity_path {
             let _ = self.identity.save_to(path);
         }
+    }
+
+    /// Rotaciona a chave de criptografia X25519 e propaga o anúncio assinado para os amigos conectados
+    fn rotate_encryption_key(&mut self) {
+        let ad = self.identity.rotate_encryption_key();
+        self.persist_identity();
+        let epoch = ad.advertisement.epoch;
+        let pubkey = ad.advertisement.encryption_public_key.clone();
+
+        for friend in self.identity.get_friends().to_vec() {
+            if self.is_pubkey_online(&friend.public_key) {
+                let topic_str = dm_topic(&self.my_pubkey(), &friend.public_key);
+                self.subscribe_dm_with(&friend.public_key);
+                let msg = DmWireMessage::KeyAdvertisement(ad.clone());
+                let bytes = wire::encode(&msg);
+                let _ = self.publish_gossip(IdentTopic::new(topic_str), bytes);
+            }
+        }
+
+        self.emit(CoreEvent::EncryptionKeyRotated {
+            epoch,
+            public_key: pubkey,
+        });
     }
 
     /// Adiciona um amigo localmente. Aceita a pubkey completa ou o nick de um par conectado

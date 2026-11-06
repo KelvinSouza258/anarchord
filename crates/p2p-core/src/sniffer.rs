@@ -217,6 +217,21 @@ fn dissect_incoming(incoming: Incoming) -> (String, SniffedCrypto) {
                 },
             )
         }
+        Incoming::DirectMessage(DmWireMessage::KeyAdvertisement(ad)) => {
+            let sig_bytes = crate::identity::SignedEncryptionKeyAdvertisement::signing_bytes(&ad.advertisement);
+            let valid = ad.verify();
+            (
+                "DirectMessage.KeyAdvertisement".to_string(),
+                SniffedCrypto {
+                    sender_pubkey: Some(ad.advertisement.user_id),
+                    ephemeral_x25519_pubkey: Some(ad.advertisement.encryption_public_key),
+                    signing_bytes_hex: Some(hex_encode(&sig_bytes)),
+                    signature_hex: Some(hex_encode(&ad.signature)),
+                    signature_valid: Some(valid),
+                    ..Default::default()
+                },
+            )
+        }
         Incoming::DirectMessage(DmWireMessage::Message(env)) => {
             let sig_bytes = DirectMessageEnvelope::signing_bytes(
                 &env.sender_pubkey,
@@ -268,6 +283,21 @@ fn dissect_incoming(incoming: Incoming) -> (String, SniffedCrypto) {
                     envelope_id: Some(ack.envelope_id),
                     signing_bytes_hex: Some(hex_encode(&sig_bytes)),
                     signature_hex: Some(hex_encode(&ack.signature)),
+                    signature_valid: Some(valid),
+                    ..Default::default()
+                },
+            )
+        }
+        Incoming::Mailbox(MailboxMessage::KeyAdvertisement(ad)) => {
+            let sig_bytes = crate::identity::SignedEncryptionKeyAdvertisement::signing_bytes(&ad.advertisement);
+            let valid = ad.verify();
+            (
+                "Mailbox.KeyAdvertisement".to_string(),
+                SniffedCrypto {
+                    sender_pubkey: Some(ad.advertisement.user_id),
+                    ephemeral_x25519_pubkey: Some(ad.advertisement.encryption_public_key),
+                    signing_bytes_hex: Some(hex_encode(&sig_bytes)),
+                    signature_hex: Some(hex_encode(&ad.signature)),
                     signature_valid: Some(valid),
                     ..Default::default()
                 },
@@ -331,6 +361,7 @@ fn dissect_stored_envelope(env: StoredEnvelope) -> SniffedCrypto {
         &env.envelope_id,
         &env.sender_pubkey,
         &env.recipient_pubkey,
+        &env.topic,
         &env.ephemeral_pubkey,
         &env.nonce,
         &env.ciphertext,

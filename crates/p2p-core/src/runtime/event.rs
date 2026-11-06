@@ -87,6 +87,11 @@ pub enum CoreEvent {
     },
     /// Parâmetro de configuração alterado
     ConfigUpdated { key: String, value: String },
+    /// Chave de criptografia X25519 rotacionada com sucesso
+    EncryptionKeyRotated {
+        epoch: u64,
+        public_key: String,
+    },
     /// Um par foi bloqueado temporariamente pelo Firewall local (aviso único por bloqueio)
     PeerBlocked {
         pubkey: String,

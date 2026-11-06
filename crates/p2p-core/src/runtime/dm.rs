@@ -95,6 +95,17 @@ impl Runtime {
         let msg = DmWireMessage::KeyOffer(offer);
         let bytes = wire::encode(&msg);
         let _ = self.publish_gossip(IdentTopic::new(topic_str), bytes);
+        self.send_key_advertisement(&clean_pk);
+    }
+
+    /// Publica nosso anúncio assinado de chave de criptografia X25519 no tópico mútuo de DM
+    pub(super) fn send_key_advertisement(&mut self, peer_pubkey: &str) {
+        let clean_pk = peer_pubkey.trim().to_lowercase();
+        let topic_str = self.subscribe_dm_with(&clean_pk);
+        let ad = self.identity.create_key_advertisement();
+        let msg = DmWireMessage::KeyAdvertisement(ad);
+        let bytes = wire::encode(&msg);
+        let _ = self.publish_gossip(IdentTopic::new(topic_str), bytes);
     }
 
     /// Resolve um alvo (pubkey de 64 chars, apelido de amigo ou nick de par conectado) para `(pubkey_hex, display_name)`
@@ -304,6 +315,22 @@ impl Runtime {
                     self.send_ephemeral_key_offer(&sender_pk);
                 }
             }
+            DmWireMessage::KeyAdvertisement(ad) => {
+                if ad.advertisement.user_id.eq_ignore_ascii_case(&my_pk) {
+                    return;
+                }
+                if !ad.verify() {
+                    tracing::debug!("Anúncio de chave de criptografia inválido descartado");
+                    return;
+                }
+                let sender_pk = ad.advertisement.user_id.to_lowercase();
+                if let Ok(updated) = self.identity.update_friend_encryption_key(&ad) {
+                    if updated {
+                        tracing::info!(peer = %sender_pk, epoch = ad.advertisement.epoch, "Chave de criptografia X25519 do amigo atualizada");
+                        self.persist_identity();
+                    }
+                }
+            }
             DmWireMessage::Message(envelope) => {
                 if !envelope.recipient_pubkey.eq_ignore_ascii_case(&my_pk)
                     || envelope.sender_pubkey.eq_ignore_ascii_case(&my_pk)
@@ -451,6 +478,22 @@ impl Runtime {
             MailboxMessage::Ack(ack) => {
                 if self.dm.mailbox.apply_ack(&ack) {
                     tracing::debug!("Envelope {} removido da mailbox após ACK", ack.envelope_id);
+                }
+            }
+            MailboxMessage::KeyAdvertisement(ad) => {
+                if ad.advertisement.user_id.eq_ignore_ascii_case(&my_pk) {
+                    return;
+                }
+                if !ad.verify() {
+                    tracing::debug!("Anúncio de chave de criptografia recebido via Mailbox inválido");
+                    return;
+                }
+                let sender_pk = ad.advertisement.user_id.to_lowercase();
+                if let Ok(updated) = self.identity.update_friend_encryption_key(&ad) {
+                    if updated {
+                        tracing::info!(peer = %sender_pk, epoch = ad.advertisement.epoch, "Chave de criptografia atualizada via rede de guardiões da Mailbox");
+                        self.persist_identity();
+                    }
                 }
             }
         }

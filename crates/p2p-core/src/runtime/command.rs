@@ -54,6 +54,8 @@ pub enum CoreCommand {
     /// Firewall local de proteção contra spam/abuso
     ListFirewall,
     UnblockPeer { target: String },
+    /// Rotaciona a chave de criptografia X25519 (DMs E2EE) e propaga aos amigos
+    RotateEncryptionKey,
     Server(ServerCommand),
     /// Encerra o nó (desanuncia nos trackers e emite `CoreEvent::Stopped`)
     Shutdown,

@@ -88,6 +88,7 @@ pub enum ChatAction {
     SendDm { target: String, text: String, suggested_ttl: Option<u64> },
     ShowConfig,
     SetConfig { key: String, value: String },
+    RotateEncryptionKey,
     ListFirewall,
     UnblockPeer(String),
     ScreenStart { monitor_idx: usize, quality: u32 },
@@ -234,6 +235,9 @@ pub fn parse_user_input(input: &str) -> ChatAction {
     }
     if trimmed == "/config" || trimmed == "/config show" {
         return ChatAction::ShowConfig;
+    }
+    if trimmed == "/rotate-key" || trimmed == "/rotate-enc-key" {
+        return ChatAction::RotateEncryptionKey;
     }
     if let Some(rest) = trimmed.strip_prefix("/config set ").map(str::trim) {
         if let Some((key, value)) = rest.split_once(char::is_whitespace) {
@@ -555,6 +559,7 @@ impl ChatAction {
             ChatAction::SendDm { target, text, suggested_ttl } => CoreCommand::SendDm { target, text, suggested_ttl },
             ChatAction::ShowConfig => CoreCommand::ShowConfig,
             ChatAction::SetConfig { key, value } => CoreCommand::SetConfig { key, value },
+            ChatAction::RotateEncryptionKey => CoreCommand::RotateEncryptionKey,
             ChatAction::ListFirewall => CoreCommand::ListFirewall,
             ChatAction::UnblockPeer(target) => CoreCommand::UnblockPeer { target },
             ChatAction::ScreenStart { monitor_idx, quality } => CoreCommand::StartScreenShare { monitor: monitor_idx, quality },

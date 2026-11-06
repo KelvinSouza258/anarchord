@@ -162,6 +162,9 @@ pub fn describe(event: &CoreEvent) -> Vec<String> {
             one(format!("🕊️ Firewall: {} ({}) foi desbloqueado.", peer_name, short_id(pubkey)))
         }
         CoreEvent::FirewallStatus(blocks) => firewall_status(blocks),
+        CoreEvent::EncryptionKeyRotated { epoch, public_key } => {
+            one(format!("🔑 Chave de criptografia X25519 rotacionada (época {}, chave {})", epoch, short_id(public_key)))
+        }
         CoreEvent::FilePreparing { name } => one(format!("📁 Preparando '{}' para compartilhar...", name)),
         CoreEvent::Server(notice) => server(notice),
         CoreEvent::Error(e) => one(error(e)),

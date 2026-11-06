@@ -17,7 +17,10 @@ pub mod voice;
 pub mod file_transfer;
 pub mod screen;
 
-pub use identity::UserIdentity;
+pub use identity::{
+    EncryptionKeyAdvertisement, FriendEntry, IdentityKeys, KeyPairInfo,
+    SignedEncryptionKeyAdvertisement, UserIdentity,
+};
 pub use config::NodeConfig;
 pub use dm::{dm_topic, DirectMessageEnvelope, DmWireMessage, MailboxMessage, StoredEnvelope};
 pub use api::{peer_id_from_pubkey_hex, ChatMessage};
