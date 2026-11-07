@@ -380,7 +380,7 @@ async fn bridge(
                 let Some(event) = event else { break };
                 if let CoreEvent::Screen(ScreenEvent::Watching { nick, .. }) = &event {
                     if let Some(rx) = pending_viewer.take() {
-                        ScreenViewer::spawn_window(nick.clone(), 1280, 720, Arc::new(std::sync::Mutex::new(rx)), Arc::new(AtomicBool::new(true)));
+                        ScreenViewer::spawn_window(nick.clone(), 0, 0, Arc::new(std::sync::Mutex::new(rx)), Arc::new(AtomicBool::new(true)));
                     }
                 }
                 if let CoreEvent::Error(CoreError::NoStream(_)) = &event {
