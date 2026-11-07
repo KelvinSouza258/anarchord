@@ -39,7 +39,7 @@ impl ScreenViewer {
             ) {
                 Ok(w) => w,
                 Err(e) => {
-                    eprintln!("Erro ao abrir janela de vídeo: {:?}", e);
+                    tracing::error!("Erro ao abrir janela de vídeo: {:?}", e);
                     is_active.store(false, Ordering::SeqCst);
                     return;
                 }

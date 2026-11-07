@@ -348,7 +348,7 @@ impl VoiceEngine {
                             let _ = mic_tx.send(frame);
                         }
                     },
-                    |err| eprintln!("⚠️ Erro no stream de microfone: {}", err),
+                    |err| tracing::warn!("Erro no stream de microfone: {}", err),
                     None,
                 ) {
                     Ok(stream) => {
@@ -356,7 +356,7 @@ impl VoiceEngine {
                         Some(stream)
                     }
                     Err(e) => {
-                        eprintln!("⚠️ Não foi possível abrir o dispositivo de microfone: {}", e);
+                        tracing::warn!("Não foi possível abrir o dispositivo de microfone: {}", e);
                         None
                     }
                 }
@@ -408,7 +408,7 @@ impl VoiceEngine {
                         Some(stream)
                     }
                     Err(e) => {
-                        eprintln!("⚠️ Não foi possível abrir o dispositivo de saída de áudio: {}", e);
+                        tracing::warn!("Não foi possível abrir o dispositivo de saída de áudio: {}", e);
                         None
                     }
                 }
