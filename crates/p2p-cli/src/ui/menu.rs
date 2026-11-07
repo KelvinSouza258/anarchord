@@ -256,7 +256,11 @@ pub fn ban_menu(nick: &str) -> Menu {
 /// Menu de contexto de um canal do painel de canais
 pub fn channel_menu(name: &str, is_voice: bool) -> Menu {
     let items = if is_voice {
-        vec![run("🔊 Entrar na sala de voz", format!("/voice join {}", name)), run("🔇 Sair da sala de voz", "/voice leave")]
+        vec![
+            run("🔊 Entrar na sala de voz", format!("/voice join {}", name)),
+            run("# Abrir apenas o chat de texto", format!("/join {}", name)),
+            run("🔇 Sair da sala de voz", "/voice leave"),
+        ]
     } else {
         vec![run("# Entrar no canal", format!("/join {}", name))]
     };
@@ -392,7 +396,7 @@ mod tests {
         let mut menu = channel_menu("voz", true);
         assert_eq!(menu.selected, 0);
         menu.up();
-        assert_eq!(menu.selected, 1);
+        assert_eq!(menu.selected, 2);
         menu.down();
         assert_eq!(menu.selected, 0);
     }

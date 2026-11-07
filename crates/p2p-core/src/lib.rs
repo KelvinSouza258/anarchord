@@ -7,6 +7,7 @@ pub mod runtime;
 pub mod sniffer;
 pub mod wire;
 pub mod identity;
+pub mod keystore;
 pub mod community;
 pub mod api;
 pub mod protocol;
@@ -19,7 +20,7 @@ pub mod file_transfer;
 pub mod screen;
 
 pub use identity::{
-    EncryptionKeyAdvertisement, FriendEntry, FriendState, IdentityKeys, KeyPairInfo,
+    safety_number, EncryptionKeyAdvertisement, FriendEntry, FriendState, IdentityKeys, KeyPairInfo,
     SignedEncryptionKeyAdvertisement, UserIdentity,
 };
 pub use config::{FirewallConfig, NodeConfig};

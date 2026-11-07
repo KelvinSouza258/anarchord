@@ -97,5 +97,7 @@ pub enum ServerCommand {
     Open,
     /// Validade dos certificados e janela de renovação, em segundos
     Policy { validity: u64, renewal_window: u64 },
+    /// Rotaciona imediatamente a chave de época do grupo MLS atual (executado pelo líder)
+    RotateKey,
     Help,
 }

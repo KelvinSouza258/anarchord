@@ -223,6 +223,7 @@ impl Runtime {
                         self.emit(CoreEvent::Network(NetworkEvent::ConnectionClosed { peer_id: peer_id.to_string(), cause }));
                         self.publish_channel_members();
                         self.friend_presence(&pubkey, false);
+                        self.on_peer_disconnected_mls(&pubkey);
                     }
                 }
             }
@@ -395,7 +396,11 @@ impl Runtime {
             .identity
             .get_friends()
             .iter()
-            .any(|f| f.public_key.eq_ignore_ascii_case(&clean_pk));
+            .any(|f| f.public_key.eq_ignore_ascii_case(&clean_pk))
+            || self.servers.list().any(|srv| {
+                srv.chain().state().owner.eq_ignore_ascii_case(&clean_pk)
+                    || self.mls.members(&srv.server_id).contains(&clean_pk)
+            });
         let verdict = self.dm.firewall.check_packet(
             &clean_pk,
             is_friend,
@@ -473,8 +478,9 @@ impl Runtime {
                     for message in &snapshot {
                         self.publish_server_message(&server_id, message);
                     }
-                    self.last_snapshot_reply.insert(server_id, std::time::Instant::now());
+                    self.last_snapshot_reply.insert(server_id.clone(), std::time::Instant::now());
                 }
+                self.announce_mls_group(&server_id);
             }
         }
     }

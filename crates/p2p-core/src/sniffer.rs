@@ -408,6 +408,7 @@ fn dissect_incoming(incoming: Incoming) -> (String, SniffedCrypto) {
                 crate::community::ServerMessage::KeyPackage { .. } => "Server.KeyPackage",
                 crate::community::ServerMessage::Commit { .. } => "Server.Commit",
                 crate::community::ServerMessage::Welcome { .. } => "Server.Welcome",
+                crate::community::ServerMessage::GroupAnnounce { .. } => "Server.GroupAnnounce",
             };
             (sub.to_string(), SniffedCrypto::default())
         }

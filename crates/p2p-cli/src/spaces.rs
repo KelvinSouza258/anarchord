@@ -58,6 +58,7 @@ pub fn parse_server_command(rest: &str) -> ServerCommand {
         "disallow" => non_empty(args).map(ServerCommand::Disallow),
         "close" => Some(ServerCommand::Close),
         "open" => Some(ServerCommand::Open),
+        "rotate-key" | "rotate" => Some(ServerCommand::RotateKey),
         "policy" => {
             let mut parts = args.split_whitespace();
             match (parts.next().and_then(parse_duration), parts.next().and_then(parse_duration)) {
@@ -103,6 +104,8 @@ mod tests {
         assert_eq!(parse_server_command("disallow Carol"), ServerCommand::Disallow("Carol".into()));
         assert_eq!(parse_server_command("close"), ServerCommand::Close);
         assert_eq!(parse_server_command("open"), ServerCommand::Open);
+        assert_eq!(parse_server_command("rotate-key"), ServerCommand::RotateKey);
+        assert_eq!(parse_server_command("rotate"), ServerCommand::RotateKey);
         assert_eq!(parse_server_command("history"), ServerCommand::History);
         assert_eq!(parse_server_command("channel remove #jogos"), ServerCommand::RemoveChannel("jogos".into()));
         assert_eq!(

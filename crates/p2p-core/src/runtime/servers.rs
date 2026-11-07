@@ -46,8 +46,78 @@ impl Runtime {
     }
 
     fn enter_server(&mut self, server_id: String) {
+        let now = super::now_secs();
+        let me = self.my_pubkey();
+        let allowed = self
+            .servers
+            .get(&server_id)
+            .is_some_and(|s| s.has_chain() && !s.is_banned(&me, now) && s.is_allowed(&me, now));
+        if allowed && !self.mls.has_group(&server_id) {
+            // Se já há outros membros online no tópico de controle do servidor, pedimos KeyPackage
+            // para entrar no grupo deles; se não houver resposta até o próximo tick (ou estivermos sozinhos),
+            // assumimos a liderança inicial criando o grupo.
+            let ctrl_topic = IdentTopic::new(server_control_topic(&server_id));
+            let has_peers_in_ctrl = super::chat::channel_members_with_topics(
+                &self.node.swarm.behaviour().gossipsub,
+                &self.peer_metadata,
+                &self.peer_topics,
+                &ctrl_topic,
+            )
+            .is_empty()
+                == false;
+            if has_peers_in_ctrl {
+                if let Ok(key_package) = self.mls.key_package() {
+                    if self.publish_server_message(&server_id, &ServerMessage::KeyPackage { server_id: server_id.clone(), key_package }) {
+                        self.last_key_package.insert(server_id.clone(), std::time::Instant::now());
+                    }
+                }
+            } else {
+                let _ = self.mls.create_group(&server_id);
+                self.announce_mls_group(&server_id);
+            }
+        }
         let channel = self.default_channel(&server_id);
         self.enter_channel(Space::Server(server_id), channel);
+    }
+
+    /// Anuncia o grupo MLS atual (se formos o líder determinístico) para convergência
+    pub(super) fn announce_mls_group(&mut self, server_id: &str) {
+        if !self.mls.is_leader(server_id) {
+            return;
+        }
+        let Some(epoch) = self.mls.epoch(server_id) else { return };
+        let Some(leader) = self.mls.leader(server_id) else { return };
+        let members: Vec<String> = self.mls.members(server_id).into_iter().collect();
+        self.publish_server_message(
+            server_id,
+            &ServerMessage::GroupAnnounce {
+                server_id: server_id.to_string(),
+                epoch,
+                leader,
+                members,
+            },
+        );
+    }
+
+    /// Remove um par que desconectou do Swarm de todos os grupos MLS em que somos o líder atual
+    pub(super) fn on_peer_disconnected_mls(&mut self, disconnected_pubkey: &str) {
+        let ids: Vec<String> = self.servers.list().map(|s| s.server_id.clone()).collect();
+        for id in ids {
+            if self.mls.has_group(&id) && self.mls.members(&id).contains(disconnected_pubkey) {
+                // Se quem saiu era o líder antigo e agora nós somos o menor restante,
+                // ou se já éramos o líder: verificamos quem seria o líder sem o desconectado.
+                let mut remaining = self.mls.members(&id);
+                remaining.remove(disconnected_pubkey);
+                if remaining.iter().min().map(String::as_str) == Some(self.my_pubkey().as_str()) {
+                    // Força a remoção: se o desconectado tinha pubkey menor que a nossa,
+                    // removemos diretamente a folha dele para assumir a liderança na nova época!
+                    if let Ok(Some(commit)) = self.mls.remove_members_unchecked(&id, &[disconnected_pubkey.to_string()]) {
+                        self.publish_server_message(&id, &ServerMessage::Commit { server_id: id.clone(), commit });
+                        self.announce_mls_group(&id);
+                    }
+                }
+            }
+        }
     }
 
     /// Pubkey de um par por nick, prefixo da pubkey (6+ caracteres) ou a pubkey completa
@@ -69,22 +139,50 @@ impl Runtime {
             }
         }
         let now = super::now_secs();
-        // Grupo cifrado: o dono cria, admite e remove; quem não tem a chave pede entrada (no máximo a cada 15 s)
-        let ids: Vec<(String, bool)> = self.servers.list().filter(|s| s.has_chain()).map(|s| (s.server_id.clone(), s.is_owner())).collect();
-        for (id, owner) in ids {
-            if owner {
-                if !self.mls.has_group(&id) {
+        let me = self.my_pubkey();
+        // Grupo cifrado efêmero com líder determinístico (menor pubkey):
+        // O dono NÃO precisa estar online. Qualquer membro autorizado participa/lidera.
+        let ids: Vec<String> = self
+            .servers
+            .list()
+            .filter(|s| s.has_chain() && !s.is_banned(&me, now) && s.is_allowed(&me, now))
+            .map(|s| s.server_id.clone())
+            .collect();
+        for id in ids {
+            if self.mls.has_group(&id) {
+                if self.mls.is_leader(&id) {
+                    if let Ok(Some(commit)) = e2ee::enforce_membership(&mut self.mls, &self.servers, &id, now) {
+                        self.publish_server_message(&id, &commit);
+                    }
+                    if self.mls.needs_periodic_rotation(&id, e2ee::DEFAULT_KEY_ROTATION_INTERVAL) {
+                        if let Ok(commit) = self.mls.rotate_key(&id) {
+                            self.publish_server_message(&id, &ServerMessage::Commit { server_id: id.clone(), commit });
+                        }
+                    }
+                    self.announce_mls_group(&id);
+                }
+            } else {
+                // Ainda sem grupo MLS: se já pedimos KeyPackage há >= 5s e ninguém respondeu com Welcome,
+                // criamos o grupo local (somos o primeiro membro online) e anunciamos.
+                let waited_enough = self
+                    .last_key_package
+                    .get(&id)
+                    .is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(5));
+                if waited_enough {
                     let _ = self.mls.create_group(&id);
-                }
-                if let Ok(Some(commit)) = e2ee::enforce_membership(&mut self.mls, &self.servers, &id, now) {
-                    self.publish_server_message(&id, &commit);
-                }
-            } else if !self.mls.has_group(&id)
-                && self.last_key_package.get(&id).is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(15))
-            {
-                if let Ok(key_package) = self.mls.key_package() {
-                    if self.publish_server_message(&id, &ServerMessage::KeyPackage { server_id: id.clone(), key_package }) {
-                        self.last_key_package.insert(id, std::time::Instant::now());
+                    self.announce_mls_group(&id);
+                } else if self
+                    .last_key_package
+                    .get(&id)
+                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))
+                {
+                    if let Ok(key_package) = self.mls.key_package() {
+                        if self.publish_server_message(&id, &ServerMessage::KeyPackage { server_id: id.clone(), key_package }) {
+                            self.last_key_package.insert(id, std::time::Instant::now());
+                        } else {
+                            // Ninguém inscrito no tópico de controle: cria o grupo imediatamente!
+                            let _ = self.mls.create_group(&id);
+                        }
                     }
                 }
             }
@@ -218,6 +316,9 @@ impl Runtime {
                 let info = ServerInfo {
                     id: id.clone(),
                     name: server.name(),
+                    safety_number: crate::identity::safety_number(&id),
+                    mls_leader: self.mls.leader(&id).map(|pk| self.nick_for(&pk)),
+                    mls_epoch: self.mls.epoch(&id),
                     height: head.map_or(0, |b| b.body.height),
                     updated_at: head.map(|b| b.body.timestamp),
                     channels: server.channels().into_iter().map(|c| ChannelInfo { voice: c.channel_type == ChannelType::Voice, name: c.name }).collect(),
@@ -302,6 +403,18 @@ impl Runtime {
             ServerCommand::Unban(target) => self.moderate(ModKind::Unban, &target, ""),
             ServerCommand::Allow(target) => self.moderate(ModKind::Admit, &target, ""),
             ServerCommand::Disallow(target) => self.moderate(ModKind::Unadmit, &target, ""),
+            ServerCommand::RotateKey => {
+                let id = need_server!();
+                match self.mls.rotate_key(&id) {
+                    Ok(commit) => {
+                        self.publish_server_message(&id, &ServerMessage::Commit { server_id: id.clone(), commit });
+                        self.announce_mls_group(&id);
+                        let epoch = self.mls.epoch(&id).unwrap_or(0);
+                        self.notice(ServerNotice::KeyRotated { server: self.server_name(&id), epoch });
+                    }
+                    Err(e) => self.error(CoreError::Server(e.to_string())),
+                }
+            }
         }
     }
 
@@ -330,7 +443,7 @@ impl Runtime {
         let now = super::now_secs();
         let me = self.my_pubkey();
 
-        // Grupo cifrado (MLS): entrada, troca de chave e boas-vindas
+        // Grupo cifrado (MLS): entrada, troca de chave, boas-vindas e convergência de grupos
         match &message {
             ServerMessage::KeyPackage { server_id, key_package } => {
                 let Some(from) = from_pubkey else { return };
@@ -339,32 +452,99 @@ impl Runtime {
                         for m in &messages {
                             self.publish_server_message(server_id, m);
                         }
+                        self.announce_mls_group(server_id);
                         self.notice(ServerNotice::KeyGranted { to: self.nick_for(from) });
                     }
-                    Err(E2eeError::NotOwner) => {}
+                    Err(E2eeError::NotOwner | E2eeError::NotInGroup) => {}
                     Err(e) => tracing::debug!("Pedido de entrada no grupo recusado: {}", e),
                 }
                 return;
             }
             ServerMessage::Commit { server_id, commit } => {
-                let owner = self.servers.get(server_id).map(|s| s.chain().state().owner.clone()).unwrap_or_default();
-                match self.mls.process_commit(server_id, commit, &owner) {
+                let Some(server) = self.servers.get(server_id).filter(|s| s.has_chain()) else { return };
+                let owner = server.chain().state().owner.clone();
+                let current_leader = self.mls.leader(server_id);
+                let outcome = self.mls.process_commit_with_validator(server_id, commit, &owner, |pk| {
+                    !server.is_banned(pk, now) && server.is_allowed(pk, now)
+                });
+                match outcome {
+                    Ok(CommitOutcome::Applied { epoch }) => {
+                        if let Some(from) = from_pubkey {
+                            if current_leader.as_deref() == Some(from) && from != me {
+                                let name = self.server_name(server_id);
+                                self.notice(ServerNotice::KeyRotated { server: name, epoch });
+                            }
+                        }
+                    }
                     Ok(CommitOutcome::Removed) => self.notice(ServerNotice::RemovedFromGroup { server: self.server_name(server_id) }),
-                    // Perdemos algum Commit: descarta e pede entrada de novo. Um Commit de época futura
-                    // não pode ser verificado, então só vale se quem publicou for o dono.
-                    Ok(CommitOutcome::OutOfSync) if from_pubkey == Some(owner.as_str()) => self.mls.drop_group(server_id),
-                    Ok(CommitOutcome::OutOfSync) => tracing::debug!("Commit fora de sincronia de quem não é o dono ignorado"),
+                    // Perdemos algum Commit: descarta e pede entrada de novo se veio de um membro válido
+                    Ok(CommitOutcome::OutOfSync)
+                        if from_pubkey.is_some_and(|pk| {
+                            !server.is_banned(pk, now)
+                                && server.is_allowed(pk, now)
+                                && (current_leader.as_deref() == Some(pk) || pk == owner)
+                        }) =>
+                    {
+                        self.mls.drop_group(server_id);
+                        if let Ok(key_package) = self.mls.key_package() {
+                            if self.publish_server_message(server_id, &ServerMessage::KeyPackage { server_id: server_id.clone(), key_package }) {
+                                self.last_key_package.insert(server_id.clone(), std::time::Instant::now());
+                            }
+                        }
+                    }
+                    Ok(CommitOutcome::OutOfSync) => tracing::debug!("Commit fora de sincronia de não-líder ignorado"),
                     Ok(_) => {}
                     Err(e) => tracing::debug!("Commit MLS inválido: {}", e),
                 }
                 return;
             }
             ServerMessage::Welcome { server_id, target, welcome } => {
-                if *target == me && !self.mls.has_group(server_id) {
-                    let owner = self.servers.get(server_id).map(|s| s.chain().state().owner.clone()).unwrap_or_default();
-                    match self.mls.join(server_id, welcome, &owner) {
-                        Ok(()) => self.notice(ServerNotice::KeyReceived { server: self.server_name(server_id) }),
+                if *target == me {
+                    let Some(server) = self.servers.get(server_id).filter(|s| s.has_chain()) else { return };
+                    let had_group = self.mls.has_group(server_id);
+                    let res = self.mls.join_with_validator(server_id, welcome, |sender_pk, members| {
+                        !server.is_banned(sender_pk, now)
+                            && server.is_allowed(sender_pk, now)
+                            && members.iter().all(|pk| !server.is_banned(pk, now) && server.is_allowed(pk, now))
+                    });
+                    match res {
+                        Ok(()) => {
+                            if !had_group {
+                                self.notice(ServerNotice::KeyReceived { server: self.server_name(server_id) });
+                            }
+                        }
                         Err(e) => tracing::debug!("Welcome MLS recusado: {}", e),
+                    }
+                }
+                return;
+            }
+            ServerMessage::GroupAnnounce { server_id, leader, members, .. } => {
+                let Some(from) = from_pubkey else { return };
+                let Some(server) = self.servers.get(server_id).filter(|s| s.has_chain()) else { return };
+                if from != leader
+                    || server.is_banned(&me, now)
+                    || !server.is_allowed(&me, now)
+                    || server.is_banned(from, now)
+                    || !server.is_allowed(from, now)
+                {
+                    return;
+                }
+                let candidate_set: std::collections::BTreeSet<String> = members
+                    .iter()
+                    .filter(|pk| !server.is_banned(pk, now) && server.is_allowed(pk, now))
+                    .cloned()
+                    .collect();
+                if candidate_set.iter().min().map(String::as_str) != Some(leader.as_str()) {
+                    return;
+                }
+                let current_set = self.mls.members(server_id);
+                // Se não estamos no grupo anunciado (ou se nosso grupo local perder na convergência),
+                // enviamos KeyPackage para convergir para o grupo vencedor!
+                if !current_set.contains(&me) || (!candidate_set.contains(&me) && e2ee::should_adopt_group(&current_set, &candidate_set)) {
+                    if let Ok(key_package) = self.mls.key_package() {
+                        if self.publish_server_message(server_id, &ServerMessage::KeyPackage { server_id: server_id.clone(), key_package }) {
+                            self.last_key_package.insert(server_id.clone(), std::time::Instant::now());
+                        }
                     }
                 }
                 return;

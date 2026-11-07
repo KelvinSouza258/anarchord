@@ -256,9 +256,11 @@ pub enum ServerNotice {
     BanStatus { server: String, banned: bool },
     /// Nível de moderador deste usuário mudou
     Role { server: String, level: Option<u8> },
-    /// (dono) entregou a chave do grupo cifrado a alguém
+    /// (líder) entregou a chave do grupo cifrado a alguém
     KeyGranted { to: String },
     KeyReceived { server: String },
+    /// Chave do grupo MLS rotacionada para uma nova época
+    KeyRotated { server: String, epoch: u64 },
     RemovedFromGroup { server: String },
     InviteSent { server: String },
     /// Ninguém no Lobby para receber o convite: id para mandar à mão
@@ -305,6 +307,15 @@ pub enum Role {
 pub struct ServerInfo {
     pub id: String,
     pub name: String,
+    /// Número de segurança verificável da chave de governança do servidor (e do dono)
+    #[serde(default)]
+    pub safety_number: String,
+    /// Pubkey (hex) ou nick do líder determinístico atual do grupo MLS efêmero (menor pubkey online)
+    #[serde(default)]
+    pub mls_leader: Option<String>,
+    /// Época atual do grupo MLS efêmero
+    #[serde(default)]
+    pub mls_epoch: Option<u64>,
     pub height: u64,
     pub updated_at: Option<UtcSecs>,
     pub channels: Vec<ChannelInfo>,

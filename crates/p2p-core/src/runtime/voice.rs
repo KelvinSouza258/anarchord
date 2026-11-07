@@ -73,8 +73,14 @@ impl Runtime {
         }
         self.voice.channel = Some(channel.clone());
         self.voice.topic = Some(topic);
-        self.emit(CoreEvent::Voice(VoiceEvent::Joined(channel)));
+        self.emit(CoreEvent::Voice(VoiceEvent::Joined(channel.clone())));
         self.emit_voice_members();
+        // Todo canal de voz também é um canal de texto com o mesmo nome (no Lobby e em servidores):
+        // sincroniza o canal de texto ativo ao entrar na sala de voz.
+        if self.active.channel != channel {
+            let space = self.active.space.clone();
+            self.enter_channel(space, channel);
+        }
     }
 
     pub(super) fn leave_voice(&mut self) {

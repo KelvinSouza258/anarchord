@@ -129,7 +129,7 @@ pub enum ServerMessage {
         #[serde(with = "crate::b64")]
         key_package: Vec<u8>,
     },
-    /// Commit MLS do dono (adiciona ou remove membros e troca a chave do grupo)
+    /// Commit MLS do líder (adiciona/remove membros ou rotaciona a chave do grupo)
     Commit {
         server_id: String,
         #[serde(with = "crate::b64")]
@@ -141,6 +141,13 @@ pub enum ServerMessage {
         target: String,
         #[serde(with = "crate::b64")]
         welcome: Vec<u8>,
+    },
+    /// Anúncio de presença do grupo MLS ativo (líder, época e membros) para convergência determinística
+    GroupAnnounce {
+        server_id: String,
+        epoch: u64,
+        leader: String,
+        members: Vec<String>,
     },
 }
 
@@ -223,9 +230,18 @@ impl KnownServer {
         self.chain.state().channels.iter().any(|c| c.name == name && c.channel_type == kind)
     }
 
+    /// Verifica se existe qualquer canal (texto ou voz) com este nome no servidor
+    pub fn has_any_channel(&self, name: &str) -> bool {
+        self.chain.state().channels.iter().any(|c| c.name == name)
+    }
+
     /// Primeiro canal de texto (onde o usuário cai ao entrar no servidor)
     pub fn default_text_channel(&self) -> Option<String> {
-        self.channels().into_iter().find(|c| c.channel_type == ChannelType::Text).map(|c| c.name)
+        self.channels()
+            .into_iter()
+            .find(|c| c.channel_type == ChannelType::Text)
+            .or_else(|| self.channels().into_iter().next())
+            .map(|c| c.name)
     }
 
     pub fn pending_actions(&self) -> impl Iterator<Item = &ModAction> {
@@ -481,7 +497,10 @@ impl ServerRegistry {
                 }
                 vec![ServerEvent::Reply { messages: server.sync_messages(from_height), server_id }]
             }
-            ServerMessage::KeyPackage { .. } | ServerMessage::Commit { .. } | ServerMessage::Welcome { .. } => {
+            ServerMessage::KeyPackage { .. }
+            | ServerMessage::Commit { .. }
+            | ServerMessage::Welcome { .. }
+            | ServerMessage::GroupAnnounce { .. } => {
                 vec![ServerEvent::Ignored("mensagem do grupo cifrado (tratada por e2ee)".into())]
             }
             ServerMessage::Action(action) => {

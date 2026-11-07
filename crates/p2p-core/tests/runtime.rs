@@ -106,8 +106,16 @@ async fn test_two_cores_server_lifecycle() {
             let (mut bob, bob_task) = start("Bob", Some(alice_port));
             tokio::task::spawn_local(bob_task.run());
 
-            alice.wait("Alice identificar Bob", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Bob")).await;
-            bob.wait("Bob identificar Alice", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Alice")).await;
+            let CoreEvent::PeerIdentified { pubkey: bob_pk, .. } =
+                alice.wait("Alice identificar Bob", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Bob")).await
+            else {
+                unreachable!()
+            };
+            let CoreEvent::PeerIdentified { pubkey: alice_pk, .. } =
+                bob.wait("Bob identificar Alice", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Alice")).await
+            else {
+                unreachable!()
+            };
 
             // Alice cria o servidor e entra nele
             alice.server(ServerCommand::Create("Rust Guild".into()));
@@ -158,8 +166,39 @@ async fn test_two_cores_server_lifecycle() {
             bob.server(ServerCommand::Ban { target: "Alice".into(), duration: None, reason: String::new() });
             bob.wait("ban recusado sem certificado", |e| matches!(e, CoreEvent::Error(CoreError::Server(m)) if m.contains("não tem certificado"))).await;
 
-            // Alice cria um canal e certifica Bob como moderador nível 1
+            // O líder determinístico atual (menor pubkey entre Alice e Bob) gira a chave MLS (/server rotate-key)
+            if alice_pk < bob_pk {
+                alice.server(ServerCommand::RotateKey);
+                alice.wait("Alice rotacionar chave MLS", |e| matches!(e, CoreEvent::Server(ServerNotice::KeyRotated { .. }))).await;
+            } else {
+                bob.server(ServerCommand::RotateKey);
+                bob.wait("Bob rotacionar chave MLS", |e| matches!(e, CoreEvent::Server(ServerNotice::KeyRotated { .. }))).await;
+            }
+
+            // Alice cria um canal de texto e um canal de voz (que também é canal de texto com o mesmo nome!)
             alice.server(ServerCommand::AddChannel { name: "jogos".into(), voice: false });
+            alice.server(ServerCommand::AddChannel { name: "taverna".into(), voice: true });
+            alice.wait("canal taverna adicionado", |e| {
+                matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::ChannelAdded { name, voice: true }, .. }) if name == "taverna")
+            }).await;
+
+            // Entrar por /join num canal de voz (taverna) deve ser aceito porque todo canal de voz é também de texto
+            alice.send(CoreCommand::JoinChannel("taverna".into()));
+            alice.wait("Alice entrar no chat de texto do canal de voz taverna", |e| {
+                matches!(e, CoreEvent::ChannelEntered { channel, .. } if channel == "taverna")
+            }).await;
+
+            // Entrar por /voice join num canal de voz também deve trocar o canal de texto ativo automaticamente
+            alice.send(CoreCommand::JoinChannel("geral".into()));
+            alice.wait("Alice voltar para #geral", |e| matches!(e, CoreEvent::ChannelEntered { channel, .. } if channel == "geral")).await;
+            alice.send(CoreCommand::JoinVoice("taverna".into()));
+            alice.wait("Alice entrar na voz e texto de taverna", |e| {
+                matches!(e, CoreEvent::ChannelEntered { channel, .. } if channel == "taverna")
+            }).await;
+            alice.send(CoreCommand::LeaveVoice);
+            alice.send(CoreCommand::JoinChannel("geral".into()));
+
+            // Alice certifica Bob como moderador nível 1
             alice.server(ServerCommand::AddModerator { target: "Bob".into(), level: 1 });
             alice
                 .wait("Bob certificado", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::ModeratorAdded { level: 1, .. }, .. })))

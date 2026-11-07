@@ -206,6 +206,14 @@ async def server_lifecycle(lab):
             continue
     await bob.wait("ChatMessage", where=lambda m: m["text"] == "segredo")
 
+    lab.step("rotação de chave MLS (/server rotate-key) pelo líder atual avança a época sem interromper o chat")
+    leader = alice if alice.pubkey < bob.pubkey else bob
+    follower = bob if leader is alice else alice
+    leader.server("RotateKey")
+    await leader.wait("Server.KeyRotated", timeout=30)
+    leader.send({"SendMessage": "nova epoca mls"})
+    await follower.wait("ChatMessage", where=lambda m: m["text"] == "nova epoca mls", timeout=20)
+
     lab.step("moderação por níveis")
     alice.server({"AddModerator": {"target": "Bob", "level": 1}})
     await bob.wait("Server.Role", where=lambda r: r["level"] == 1)

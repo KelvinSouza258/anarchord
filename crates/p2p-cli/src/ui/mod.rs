@@ -887,7 +887,7 @@ impl TerminalUi {
         } else {
             for (name, is_voice) in &self.space_channels {
                 let active = if *is_voice {
-                    self.current_voice_channel.as_deref() == Some(name.as_str())
+                    self.current_voice_channel.as_deref() == Some(name.as_str()) || *name == self.current_channel
                 } else {
                     *name == self.current_channel
                 };

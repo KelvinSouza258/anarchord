@@ -13,7 +13,7 @@ use p2p_core::runtime::{
 pub const SERVER_HELP: &str = "Comandos: /server create <nome> | join <id> | accept | list | switch <nome|id|lobby> | info | history \
 | invite | channel add <nome> [voz] | channel remove <nome> | mod add <par> [nível] | mod remove <par> \
 | ban <par> [30m|12h|3d|2w|perm] [motivo] | unban <par> | allow <par> | disallow <par> | close | open \
-| policy <validade> <janela> (ex.: 7d 2d) | leave  (atalho: /lobby)";
+| policy <validade> <janela> (ex.: 7d 2d) | rotate-key | leave  (atalho: /lobby)";
 
 pub fn space_label(space: &SpaceInfo) -> String {
     match space {
@@ -73,9 +73,10 @@ pub fn describe(event: &CoreEvent) -> Vec<String> {
                     p.capabilities.join(",")
                 };
                 lines.push(format!(
-                    "   • {} ({}) · protocolo {} ({}) · app {} · caps: [{}]",
+                    "   • {} ({}) · nº seg: {} · protocolo {} ({}) · app {} · caps: [{}]",
                     p.nick,
                     short_id(&p.pubkey),
+                    p2p_core::identity::safety_number(&p.pubkey),
                     p.announced_versions,
                     neg,
                     p.app_version,
@@ -390,6 +391,9 @@ fn server(notice: &ServerNotice) -> Vec<String> {
         ServerNotice::KeyReceived { server } => {
             one(format!("🔐 Chave do grupo de '{}' recebida: chat, voz e tela cifrados de ponta a ponta.", server))
         }
+        ServerNotice::KeyRotated { server, epoch } => {
+            one(format!("🔄 Chave do grupo MLS de '{}' rotacionada (época {}).", server, epoch))
+        }
         ServerNotice::RemovedFromGroup { server } => {
             one(format!("🔐 Você foi removido do grupo cifrado de '{}': não recebe mais o conteúdo do servidor.", server))
         }
@@ -457,8 +461,18 @@ fn server_info(info: &ServerInfo) -> Vec<String> {
         })
         .collect();
     let none_or = |list: Vec<String>| if list.is_empty() { "nenhum".to_string() } else { list.join(", ") };
+    let mls_str = match (&info.mls_leader, info.mls_epoch) {
+        (Some(leader), Some(epoch)) => format!("líder MLS: {} (época {})", leader, epoch),
+        _ => "grupo MLS: aguardando sincronização".to_string(),
+    };
+    let safety_str = if info.safety_number.is_empty() {
+        p2p_core::identity::safety_number(&info.id)
+    } else {
+        info.safety_number.clone()
+    };
     vec![
         format!("🏰 {} | bloco {} ({}) | id {}", info.name, info.height, info.updated_at.map(fmt_utc).unwrap_or_default(), info.id),
+        format!("   🔐 Nº de Segurança: {} | {}", safety_str, mls_str),
         format!("   Canais: {}", channels.join(", ")),
         format!("   Você: {} | Acesso: {}", role, access),
         format!("   Moderadores: {}", none_or(mods)),
@@ -498,10 +512,11 @@ fn friends(list: &[FriendStatus]) -> Vec<String> {
             ),
         };
         lines.push(format!(
-            "   {} {} · {} · {}",
+            "   {} {} · {} · nº seg: {} · {}",
             icon,
             name,
             short_id(&f.public_key),
+            p2p_core::identity::safety_number(&f.public_key),
             status_label
         ));
     }
@@ -578,7 +593,7 @@ fn error(error: &CoreError) -> String {
         CoreError::NoSuchChannel { name, voice: true } => format!("❌ Não há sala de voz '{}' neste servidor. Veja o painel de canais.", name),
         CoreError::NoSuchChannel { name, voice: false } => format!("❌ #{} não existe neste servidor. Veja o painel de canais.", name),
         CoreError::NoGroupKey => {
-            "🔐 Aguardando a chave do grupo deste servidor (o dono precisa estar online para admitir você).".to_string()
+            "🔐 Aguardando a chave do grupo cifrado deste servidor (sincronizando com o líder presente na sala).".to_string()
         }
         CoreError::BannedHere => "⛔ Você está banido deste servidor: os outros membros ignoram suas mensagens.".to_string(),
         CoreError::NotOnAllowList => "🔒 Servidor fechado e você não está na allow-list: suas mensagens são ignoradas.".to_string(),

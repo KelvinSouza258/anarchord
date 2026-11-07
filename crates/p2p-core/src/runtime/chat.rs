@@ -91,9 +91,9 @@ impl Runtime {
     }
 
     pub(super) fn join_text_channel(&mut self, channel: String) {
-        // No Lobby qualquer nome vira canal; num servidor, só os canais da configuração
+        // No Lobby qualquer nome vira canal; num servidor, qualquer canal existente (texto ou voz, pois todo canal de voz também tem chat de texto)
         if let Some(server) = self.active.server_id().and_then(|id| self.servers.get(id)) {
-            if !server.has_channel(&channel, ChannelType::Text) {
+            if !server.has_any_channel(&channel) {
                 return self.error(CoreError::NoSuchChannel { name: channel, voice: false });
             }
         }

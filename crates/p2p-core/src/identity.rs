@@ -4,7 +4,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -246,11 +246,15 @@ impl UserIdentity {
     pub fn load_or_create<P: AsRef<Path>>(path: P) -> Result<Self, IdentityError> {
         let path = path.as_ref();
         if path.exists() {
-            let data = fs::read(path)?;
+            let (data, was_protected) = crate::keystore::read_protected_or_plaintext(path)?;
 
             // 1. Tentar ler como JSON estruturado moderno (v2 com chaves separadas)
             if let Ok(doc) = serde_json::from_slice::<IdentityDocument>(&data) {
-                return Self::from_document(&doc);
+                let identity = Self::from_document(&doc)?;
+                if !was_protected && crate::keystore::is_native_keystore_available() {
+                    let _ = identity.save_to(path);
+                }
+                return Ok(identity);
             }
 
             // 2. Retrocompatibilidade: ler como JSON v1 (chave única Ed25519) e migrar automaticamente para v2
@@ -452,7 +456,7 @@ impl UserIdentity {
         })
     }
 
-    /// Salva a identidade no disco em formato JSON legível e formatado
+    /// Salva a identidade no disco protegida pelo cofre nativo do SO quando disponível (fallback: JSON formatado)
     pub fn save_to<P: AsRef<Path>>(&self, path: P) -> Result<(), IdentityError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -462,7 +466,7 @@ impl UserIdentity {
         }
         let doc = self.to_document()?;
         let json_text = serde_json::to_string_pretty(&doc)?;
-        fs::write(path, json_text)?;
+        crate::keystore::write_protected(path, json_text.as_bytes())?;
         Ok(())
     }
 
@@ -599,6 +603,11 @@ impl UserIdentity {
     /// Retorna a chave pública (UserID) em formato Hexadecimal legível
     pub fn public_key_hex(&self) -> String {
         hex::encode(self.verifying_key.to_bytes())
+    }
+
+    /// Retorna o Número de Segurança (Safety Number) verificável para esta identidade
+    pub fn safety_number(&self) -> String {
+        safety_number(&self.public_key_hex())
     }
 
     /// Retorna a chave pública X25519 de criptografia
@@ -771,6 +780,27 @@ pub(crate) fn hex_decode_32(s: &str) -> Result<[u8; 32], ()> {
     Ok(bytes)
 }
 
+/// Calcula um Número de Segurança (*Safety Number* / Fingerprint) curto e verificável por humanos
+/// (4 blocos de 5 dígitos numéricos, ex.: `"48291-03948-71625-90412"`) a partir de uma `pubkey` Ed25519.
+/// Permite que usuários comparem por voz/fora de banda a identidade de um amigo ou a chave de um servidor.
+pub fn safety_number(pubkey_hex: &str) -> String {
+    let clean = pubkey_hex.trim().to_lowercase();
+    let mut hasher = Sha256::new();
+    hasher.update(b"anarchord-safety-number-v1:");
+    if let Ok(bytes) = hex_decode_32(&clean) {
+        hasher.update(bytes);
+    } else {
+        hasher.update(clean.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut groups = Vec::with_capacity(4);
+    for chunk in digest.chunks_exact(4).take(4) {
+        let val = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) % 100_000;
+        groups.push(format!("{:05}", val));
+    }
+    groups.join("-")
+}
+
 /// Verifica uma assinatura Ed25519 feita pela pubkey em hexadecimal
 pub(crate) fn verify_signature_hex(pubkey_hex: &str, message: &[u8], signature: &[u8]) -> bool {
     use ed25519_dalek::{Signature, Verifier};
@@ -818,8 +848,14 @@ mod tests {
         id1.profile.bio = Some("Testando identidade P2P v2".to_string());
         id1.save_to(&key_file).unwrap();
 
-        // Verificar que o arquivo é JSON válido e tem chaves separadas v2
-        let content = fs::read_to_string(&key_file).unwrap();
+        // Verificar que no disco o arquivo está cifrado pelo cofre nativo (se disponível) e ao abrir tem chaves v2
+        let raw_on_disk = fs::read_to_string(&key_file).unwrap();
+        if crate::keystore::is_native_keystore_available() {
+            assert!(raw_on_disk.contains("\"keystore\""));
+            assert!(!raw_on_disk.contains("BEGIN PRIVATE KEY"));
+        }
+        let (unsealed_bytes, _) = crate::keystore::read_protected_or_plaintext(&key_file).unwrap();
+        let content = String::from_utf8(unsealed_bytes).unwrap();
         assert!(content.contains("BEGIN PRIVATE KEY"));
         assert!(content.contains("BEGIN PUBLIC KEY"));
         assert!(content.contains("\"algorithm\": \"Ed25519\""));
@@ -884,8 +920,9 @@ mod tests {
         let montgomery_expected = ed25519_pub_hex_to_x25519(&old_uid).unwrap();
         assert_eq!(migrated_id.encryption_public_key().to_bytes(), montgomery_expected.to_bytes());
 
-        // Verificar que agora o arquivo foi reescrito no formato v2 com as duas chaves
-        let updated_content = fs::read_to_string(&key_file).unwrap();
+        // Verificar que agora o arquivo foi reescrito no formato v2 com as duas chaves (e protegido pelo cofre)
+        let (unsealed_bytes, _) = crate::keystore::read_protected_or_plaintext(&key_file).unwrap();
+        let updated_content = String::from_utf8(unsealed_bytes).unwrap();
         assert!(updated_content.contains("\"version\": 2"));
         assert!(updated_content.contains("\"algorithm\": \"X25519\""));
 
@@ -910,13 +947,30 @@ mod tests {
             hex::encode(old_signing_key.verifying_key().to_bytes())
         );
 
-        // Verificar que agora o arquivo virou JSON com PEM e X25519 v2
-        let updated_content = fs::read_to_string(&key_file).unwrap();
+        // Verificar que agora o arquivo virou JSON com PEM e X25519 v2 (protegido pelo cofre nativo)
+        let (unsealed_bytes, _) = crate::keystore::read_protected_or_plaintext(&key_file).unwrap();
+        let updated_content = String::from_utf8(unsealed_bytes).unwrap();
         assert!(updated_content.contains("BEGIN PRIVATE KEY"));
         assert!(updated_content.contains("\"version\": 2"));
         assert!(updated_content.contains("\"algorithm\": \"X25519\""));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_safety_number_is_deterministic_and_formatted() {
+        let alice = UserIdentity::generate_with_nick("Alice");
+        let bob = UserIdentity::generate_with_nick("Bob");
+        let sn_alice_1 = alice.safety_number();
+        let sn_alice_2 = safety_number(&alice.public_key_hex().to_uppercase());
+        assert_eq!(sn_alice_1, sn_alice_2);
+        assert_eq!(sn_alice_1.len(), 23); // "12345-67890-12345-67890"
+        assert_eq!(sn_alice_1.split('-').count(), 4);
+        for group in sn_alice_1.split('-') {
+            assert_eq!(group.len(), 5);
+            assert!(group.chars().all(|c| c.is_ascii_digit()));
+        }
+        assert_ne!(sn_alice_1, bob.safety_number());
     }
 
     #[test]
