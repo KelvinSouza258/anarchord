@@ -121,100 +121,11 @@ While inside the chat console, you can use built-in slash commands:
 
 ## 🗺️ Project Roadmap
 
-### Phase 1: Core Network & Discovery ✅ (Completed)
-- [x] Cryptographic Identity generation & persistence (`Ed25519Dalek`).
-- [x] Transport layers: **QUIC** (UDP) and **TCP** with **Yamux** and **Noise Protocol**.
-- [x] Dual-engine Auto-Discovery:
-  - [x] IPFS Amino DHT Bootstrap.
-  - [x] BitTorrent UDP Open Trackers Client (BEP 15) with compact peer parsing.
-- [x] Connection deduplication via `close_connection`.
-- [x] OS dynamic port allocation (`port = 0`).
-- [x] Periodic 10s Tracker re-announcement and continuous peer re-discovery.
-- [x] Distributed Docker test lab with real NAT routers (`lab/run.py`).
+O desenvolvimento do Anarchord é gerenciado de forma transparente e orientada a issues no GitHub:
 
-### Phase 2: Decentralized Text Mesh, TUI & File Swarm ✅ (Completed)
-- [x] GossipSub channel routing (e.g. `p2p-anarchord/channel/<channel>`).
-- [x] Cryptographic verification: All messages signed by author's private key.
-- [x] Interactive Terminal User Interface (**Ratatui**) with dynamic online peers, blinking input cursor, and mouse click interactions.
-- [x] Direct P2P File Swarm subsystem (`CIDv1`, `/anarchord/files/1`, seeder promotion, resume, server encryption).
-- [x] Offline 1:1 DM delivery via Friend Guardians ([#37](https://github.com/VictorGerin/anarchord/issues/37)); channel/server history synchronization tracked in v0.4 ([#26](https://github.com/VictorGerin/anarchord/issues/26), [#39](https://github.com/VictorGerin/anarchord/issues/39)).
-
-### Phase 3: Real-Time P2P Voice (Opus) ✅ (Completed)
-- [x] `VoicePacket` 20ms protocol specification with VAD energy calculation.
-- [x] `JitterBuffer` with sequence sorting and duplicate/late packet dropping.
-- [x] Native audio capture & playback via `cpal` (WASAPI, ALSA).
-- [x] Opus audio compression & decompression (`opus1` VoIP mode @ 48kHz).
-- [x] Multi-peer audio mixing and active speaker indicators (`[FALANDO]`).
-- [x] Headless synthetic audio generator (`anarchord-agent --synth-audio`) for automated testing.
-
-### Phase 4: Screen Sharing & Native Video Streaming ✅ (Completed)
-- [x] Cross-platform screen and window capture engine via `xcap`.
-- [x] Real-time H.264 video codec integration (`openh264` 30 FPS) with periodic SPS/PPS intra-frames and high-speed downscaling.
-- [x] Pure Rust JPEG fallback encoder (`jpeg-encoder`).
-- [x] Real-time P2P video frame distribution (`ScreenPacket`) across Gossipsub mesh.
-- [x] Ultra-lightweight native graphical viewer window via `minifb` (`/screen watch <peer>`) with real-time FPS, bitrate, and data metrics.
-- [x] Automated loop video transmission (`anarchord-agent --synth-video`) for server/bot testing.
-- [x] Scenario-based multi-peer lab (`lab/scenarios.py`) driving 2+ nodes behind separate NATs.
-
-### Phase 5: Servers, Moderation & End-to-End Encryption ✅ (Completed)
-- [x] Servers with a signed configuration chain (channels, rules, bans, allow-list) and moderator certificates.
-- [x] Server content (chat, voice, screen, file offers) end-to-end encrypted with **MLS** (RFC 9420, `openmls`).
-
-### Phase 6: Friends, 1:1 E2EE Direct Messages, Offline Guardian Mailbox & DM Firewall ✅ (Completed)
-- [x] Friends list in `identity.json` with real-time online/offline presence and TUI context menus ([#34](https://github.com/VictorGerin/anarchord/issues/34), [#35](https://github.com/VictorGerin/anarchord/issues/35)).
-- [x] 1:1 E2EE Direct Messages (`X25519` + `HKDF-SHA256` + `ChaCha20-Poly1305`) with Ephemeral Session Keys (Forward Secrecy) and dedicated `@Friend` TUI spaces ([#36](https://github.com/VictorGerin/anarchord/issues/36)).
-- [x] Decentralized Offline Store-and-Forward Mailbox via Friend Guardians (`Sign-then-Seal` envelopes, 100% event-driven guardian delegation, sovereign TTL negotiation, and persistent `ReceiptAck` deduplication across restarts) ([#37](https://github.com/VictorGerin/anarchord/issues/37)).
-- [x] OS-agnostic configuration system (`config.json` / `/config`) for mailbox quotas, TTLs, and DM policies ([#38](https://github.com/VictorGerin/anarchord/issues/38)).
-- [x] Asymmetric DM Application Firewall (Friends vs. Strangers limits, progressive blocking `1m → 5m → 30m → 24h`, single E2EE courtesy block notice, `/firewall`) ([#48](https://github.com/VictorGerin/anarchord/issues/48)).
-- [x] Raw Application Packet Sniffer (`sniffer.rs`) & cryptographic wire dissector in `anarlab` (`packets.jsonl` / `packets.log`).
-
-### Phase 7: Swarm Optimization, Dynamic Resume & Protocol Engine ✅ (Completed)
-- [x] Protocol versioning & cross-version compatibility engine (`v1..=v2`) with Identify negotiation ([#51](https://github.com/VictorGerin/anarchord/issues/51), [#61](https://github.com/VictorGerin/anarchord/issues/61)).
-- [x] Swarm traffic isolation via dedicated per-file Gossipsub topics (`anarchord/file/<cid>`) ([#66](https://github.com/VictorGerin/anarchord/issues/66)).
-- [x] Download resume and automatic provider reconnection across application restarts ([#68](https://github.com/VictorGerin/anarchord/issues/68)).
-- [x] Re-download support for deleted files using OS-level filesystem events (`notify`) ([#64](https://github.com/VictorGerin/anarchord/issues/64)).
-- [x] Terminal QoL: auto-complete for file CIDs in `/get`, interactive popup in `/files` ([#63](https://github.com/VictorGerin/anarchord/issues/63)), and chronological timestamp sorting ([#62](https://github.com/VictorGerin/anarchord/issues/62)).
-
-### Upcoming milestones
-Tracked as [GitHub milestones](https://github.com/VictorGerin/anarchord/milestones); every item is an issue with acceptance criteria. Design principles and threat model: [wiki](https://github.com/VictorGerin/anarchord/wiki/Principios-e-Modelo-de-Ameacas).
-
-**v0.2 Core, Friends & File Swarm** ⏳
-- [x] Protocol versioning & cross-version compatibility engine [#51](https://github.com/VictorGerin/anarchord/issues/51), [#61](https://github.com/VictorGerin/anarchord/issues/61)
-- [x] Swarm traffic isolation & download resume across restarts [#66](https://github.com/VictorGerin/anarchord/issues/66), [#68](https://github.com/VictorGerin/anarchord/issues/68)
-- [x] Separation of Identity (Signing) and Encryption (X25519) keys with rotation [#69](https://github.com/VictorGerin/anarchord/issues/69)
-- [x] Mutual friend request protocol with offline guardian support [#70](https://github.com/VictorGerin/anarchord/issues/70)
-- [x] Mailbox optimization (Base64 for binary arrays) and reliable message pruning [#71](https://github.com/VictorGerin/anarchord/issues/71)
-- [x] Mailbox metadata protection: move topic to encrypted payload [#72](https://github.com/VictorGerin/anarchord/issues/72)
-- [ ] Retention of friend requests in outbox under firewall cooldown & mutual auto-resolution [#73](https://github.com/VictorGerin/anarchord/issues/73)
-- [ ] Handle unshared or unavailable downloads gracefully (prevent 0% stalls) [#67](https://github.com/VictorGerin/anarchord/issues/67)
-- [ ] Bandwidth and rate limiting configuration for file transfers [#65](https://github.com/VictorGerin/anarchord/issues/65)
-- [ ] Encrypted space indicator 🔐 in TUI [#16](https://github.com/VictorGerin/anarchord/issues/16)
-- [ ] Clean up terminal logging and hole punching noise in System tab [#40](https://github.com/VictorGerin/anarchord/issues/40), [#28](https://github.com/VictorGerin/anarchord/issues/28)
-
-**v0.3 Servers & Moderation**
-- [ ] Certified moderators can admit/remove MLS members without owner online [#42](https://github.com/VictorGerin/anarchord/issues/42)
-- [ ] Signed invites (expiry, recipient, message) [#43](https://github.com/VictorGerin/anarchord/issues/43), direct invites [#44](https://github.com/VictorGerin/anarchord/issues/44), usage limits [#50](https://github.com/VictorGerin/anarchord/issues/50)
-- [ ] Server crypto hardening & keys encrypted at rest [#45](https://github.com/VictorGerin/anarchord/issues/45)
-- [ ] Configuration chain consolidation [#52](https://github.com/VictorGerin/anarchord/issues/52)
-- [ ] MLS & control-topic scaling [#53](https://github.com/VictorGerin/anarchord/issues/53), control topic split by function [#58](https://github.com/VictorGerin/anarchord/issues/58)
-- [ ] Server discovery: open directory and tag search [#60](https://github.com/VictorGerin/anarchord/issues/60)
-- [ ] Metadata leakage review (topics, DHT) [#47](https://github.com/VictorGerin/anarchord/issues/47)
-
-**v0.4 Channels, History & Room Presence**
-- [x] 1:1 DMs with ephemeral session keys [#36](https://github.com/VictorGerin/anarchord/issues/36) and offline delivery via guardians [#37](https://github.com/VictorGerin/anarchord/issues/37)
-- [x] Configurable node & mailbox limits (`config.json` / `/config`) [#38](https://github.com/VictorGerin/anarchord/issues/38)
-- [ ] Cooperative channel/server history synchronization for offline members [#39](https://github.com/VictorGerin/anarchord/issues/39), [#26](https://github.com/VictorGerin/anarchord/issues/26)
-- [ ] Per-channel encryption: ephemeral MLS groups with elected room leader [#46](https://github.com/VictorGerin/anarchord/issues/46)
-- [ ] Room presence by join/leave, no polling [#55](https://github.com/VictorGerin/anarchord/issues/55)
-- [ ] Topic subscriptions only for active rooms [#56](https://github.com/VictorGerin/anarchord/issues/56)
-
-**v0.5 Distribution, Release & Clients**
-- [ ] Signed and verifiable binary releases & auto-update [#49](https://github.com/VictorGerin/anarchord/issues/49)
-- [ ] Git-based SemVer automation (`release.py`, `build.rs`) [#19](https://github.com/VictorGerin/anarchord/issues/19)
-- [ ] Lab performance metrics [#57](https://github.com/VictorGerin/anarchord/issues/57) and automated lab in GitHub Actions CI [#18](https://github.com/VictorGerin/anarchord/issues/18)
-- [ ] Media relay protocol for large voice/screen rooms [#54](https://github.com/VictorGerin/anarchord/issues/54)
-- [ ] Light nodes [#59](https://github.com/VictorGerin/anarchord/issues/59) and mobile apps [#27](https://github.com/VictorGerin/anarchord/issues/27)
-- [ ] Desktop GUI with **Tauri** [#25](https://github.com/VictorGerin/anarchord/issues/25)
+- 🎯 **[Milestones do Projeto](https://github.com/VictorGerin/anarchord/milestones)**: Acompanhe o progresso das versões macro (`v0.2`, `v0.3`, `v0.4`, `v0.5`) com porcentagem de conclusão e entregas.
+- 📋 **[Quadro de Tarefas & Issues Abertas](https://github.com/VictorGerin/anarchord/issues)**: Todas as tarefas técnicas, critérios de aceitação e discussões ativas de arquitetura.
+- 📖 **[Princípios de Design & Modelo de Ameaças](https://github.com/VictorGerin/anarchord/wiki/Principios-e-Modelo-de-Ameacas)**: Documentação conceitual, limites criptográficos e premissas de segurança.
 
 ---
 
