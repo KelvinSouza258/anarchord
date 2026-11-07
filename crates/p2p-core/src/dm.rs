@@ -460,6 +460,18 @@ impl FriendResponse {
     }
 }
 
+/// Notificação de bloqueio / rate-limiting temporário enviada por cortesia pelo firewall (Issue #73)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BlockNotice {
+    pub sender_pubkey: String,
+    pub sender_nick: String,
+    pub recipient_pubkey: String,
+    pub duration_secs: u64,
+    pub blocked_until: u64,
+    pub reason: String,
+    pub timestamp: u64,
+}
+
 /// Mensagens que circulam no tópico de DM
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum DmWireMessage {
@@ -468,6 +480,7 @@ pub enum DmWireMessage {
     KeyAdvertisement(crate::identity::SignedEncryptionKeyAdvertisement),
     FriendRequest(FriendRequest),
     FriendResponse(FriendResponse),
+    BlockNotice(BlockNotice),
 }
 
 impl wire::WireMessage for DmWireMessage {
@@ -1023,6 +1036,9 @@ struct PersistedMailbox {
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
     delivered_ids: HashMap<String, u64>,
+    /// Tópicos internos dos envelopes criados por este nó (outbox local) para filtragem e descarte seletivo
+    #[serde(default)]
+    own_topics: HashMap<String, String>,
 }
 
 /// Armazenamento local do Guardião (Carol/Bob) e Outbox do Remetente (Alice)
@@ -1035,6 +1051,8 @@ pub struct MailboxStore {
     acks: HashMap<String, ReceiptAck>,
     /// Controle orientado a eventos da Outbox: `envelope_id` -> `HashSet<guardian_pubkey>` para os quais já pedimos guarda
     delegated_guardians: HashMap<String, HashSet<String>>,
+    /// Tópico interno dos envelopes gerados localmente: `envelope_id` -> `topic`
+    own_topics: HashMap<String, String>,
 }
 
 impl MailboxStore {
@@ -1042,6 +1060,7 @@ impl MailboxStore {
         let mut envelopes = HashMap::new();
         let mut acks = HashMap::new();
         let mut delegated_guardians = HashMap::new();
+        let mut own_topics = HashMap::new();
         const MAX_ACK_RETENTION_SECS: u64 = 7 * 86_400;
         if let Some(ref path) = storage_path {
             if let Ok(bytes) = fs::read(path) {
@@ -1065,6 +1084,11 @@ impl MailboxStore {
                             );
                         }
                     }
+                    for (id, top) in persisted.own_topics {
+                        if envelopes.contains_key(&id) {
+                            own_topics.insert(id, top);
+                        }
+                    }
                 } else if let Ok(legacy_list) = serde_json::from_slice::<Vec<StoredEnvelope>>(&bytes) {
                     for env in legacy_list {
                         if env.expires_at > now {
@@ -1079,6 +1103,7 @@ impl MailboxStore {
             envelopes,
             acks,
             delegated_guardians,
+            own_topics,
         }
     }
 
@@ -1094,6 +1119,7 @@ impl MailboxStore {
                 acks: self.acks.values().cloned().collect(),
                 delegated_guardians: self.delegated_guardians.clone(),
                 delivered_ids: HashMap::new(),
+                own_topics: self.own_topics.clone(),
             };
             if let Ok(json) = serde_json::to_string_pretty(&data) {
                 let _ = fs::write(path, json);
@@ -1102,11 +1128,23 @@ impl MailboxStore {
     }
 
     /// Guarda um envelope enviado pelo próprio nó (outbox local para reentrega direta ou a guardiões)
-    pub fn insert_own(&mut self, mut envelope: StoredEnvelope, config: &NodeConfig, now: u64) {
+    pub fn insert_own(&mut self, envelope: StoredEnvelope, config: &NodeConfig, now: u64) {
+        self.insert_own_with_topic(envelope, DEFAULT_MAILBOX_TOPIC, config, now);
+    }
+
+    /// Guarda um envelope enviado pelo próprio nó com um tópico específico na outbox local
+    pub fn insert_own_with_topic(&mut self, mut envelope: StoredEnvelope, topic: &str, config: &NodeConfig, now: u64) {
         let effective_ttl = config.calculate_effective_ttl(envelope.suggested_ttl);
         envelope.expires_at = now.saturating_add(effective_ttl);
-        self.envelopes.insert(envelope.envelope_id.clone(), envelope);
+        let id = envelope.envelope_id.clone();
+        self.own_topics.insert(id.clone(), topic.to_string());
+        self.envelopes.insert(id, envelope);
         self.persist();
+    }
+
+    /// Retorna o tópico interno de um envelope de outbox criado por este nó, se conhecido
+    pub fn get_own_topic(&self, envelope_id: &str) -> Option<&str> {
+        self.own_topics.get(envelope_id).map(|s| s.as_str())
     }
 
     /// Guardião (Carol) avalia e armazena um envelope enviado por um amigo (Alice)
@@ -1180,6 +1218,49 @@ impl MailboxStore {
             .collect()
     }
 
+    /// Retorna todos os envelopes na outbox local criados por `sender_pubkey` destinados a `recipient_pubkey`
+    pub fn pending_outbox_for(&self, sender_pubkey: &str, recipient_pubkey: &str) -> Vec<StoredEnvelope> {
+        let r_clean = recipient_pubkey.trim().to_lowercase();
+        self.envelopes
+            .values()
+            .filter(|e| {
+                e.sender_pubkey.eq_ignore_ascii_case(sender_pubkey)
+                    && e.recipient_pubkey.eq_ignore_ascii_case(&r_clean)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Descarta envelopes na outbox local destinados a `recipient_pubkey` (opcionalmente filtrado por tópico, ex.: pedidos de amizade)
+    pub fn discard_outbox_for(
+        &mut self,
+        sender_pubkey: &str,
+        recipient_pubkey: &str,
+        topic_filter: Option<&str>,
+    ) -> usize {
+        let r_clean = recipient_pubkey.trim().to_lowercase();
+        let before = self.envelopes.len();
+        let own_topics = &mut self.own_topics;
+        let delegated = &mut self.delegated_guardians;
+        self.envelopes.retain(|id, env| {
+            let matches = env.sender_pubkey.eq_ignore_ascii_case(sender_pubkey)
+                && env.recipient_pubkey.eq_ignore_ascii_case(&r_clean)
+                && topic_filter.map_or(true, |t| own_topics.get(id).map_or(false, |top| top == t));
+            if matches {
+                delegated.remove(id);
+                own_topics.remove(id);
+                false
+            } else {
+                true
+            }
+        });
+        let removed = before.saturating_sub(self.envelopes.len());
+        if removed > 0 {
+            self.persist();
+        }
+        removed
+    }
+
     /// Retorna apenas os envelopes enviados por `sender_pubkey` que AINDA NÃO foram delegados ao amigo `guardian_pubkey`
     pub fn undelegated_for_guardian(
         &self,
@@ -1244,6 +1325,7 @@ impl MailboxStore {
         let is_new_ack = !self.acks.contains_key(&ack.envelope_id);
         self.acks.insert(ack.envelope_id.clone(), ack.clone());
         self.delegated_guardians.remove(&ack.envelope_id);
+        self.own_topics.remove(&ack.envelope_id);
         let removed = self.envelopes.remove(&ack.envelope_id).is_some();
         if removed || is_new_ack {
             self.persist();
@@ -1256,6 +1338,8 @@ impl MailboxStore {
         let before = self.envelopes.len();
         self.envelopes.retain(|_, env| env.expires_at > now);
         self.delegated_guardians
+            .retain(|id, _| self.envelopes.contains_key(id));
+        self.own_topics
             .retain(|id, _| self.envelopes.contains_key(id));
         let removed = before.saturating_sub(self.envelopes.len());
 
@@ -1525,6 +1609,23 @@ impl DmFirewall {
         } else {
             false
         }
+    }
+
+    /// Limpa bloqueios expirados e retorna a lista de pubkeys que foram desbloqueadas
+    pub fn purge_expired_blocks(&mut self, now: u64) -> Vec<String> {
+        let mut unblocked = Vec::new();
+        for (pk, state) in self.peers.iter_mut() {
+            if let Some(until) = state.blocked_until {
+                if now >= until {
+                    state.blocked_until = None;
+                    state.courtesy_sent_for_current_block = false;
+                    state.online_timestamps.clear();
+                    state.offline_timestamps.clear();
+                    unblocked.push(pk.clone());
+                }
+            }
+        }
+        unblocked
     }
 
     /// Retorna se o par está bloqueado ativamente neste instante
@@ -2119,5 +2220,76 @@ mod tests {
         // Se passar mais de 7 dias (ex.: 8 dias), ACK é expurgado
         store.purge_expired(1_000_100 + 8 * 86_400);
         assert_eq!(store.acks.len(), 0, "ACK com mais de 7 dias deve ser expurgado");
+    }
+
+    #[test]
+    fn test_outbox_retention_and_topic_discard() {
+        let alice = UserIdentity::generate_with_nick("Alice");
+        let bob = UserIdentity::generate_with_nick("Bob");
+        let cfg = NodeConfig::default();
+        let mut store = MailboxStore::load(None, 1000);
+
+        let env_dm = StoredEnvelope::create_signed_and_sealed(
+            &alice,
+            &bob.public_key_hex(),
+            "DM text",
+            1000,
+            None,
+        ).unwrap();
+        let env_req = StoredEnvelope::create_signed_and_sealed_topic(
+            &alice,
+            &bob.public_key_hex(),
+            FRIEND_REQUEST_MAILBOX_TOPIC,
+            "Req text",
+            1000,
+            None,
+        ).unwrap();
+
+        store.insert_own_with_topic(env_dm.clone(), DEFAULT_MAILBOX_TOPIC, &cfg, 1000);
+        store.insert_own_with_topic(env_req.clone(), FRIEND_REQUEST_MAILBOX_TOPIC, &cfg, 1000);
+
+        let pending = store.pending_outbox_for(&alice.public_key_hex(), &bob.public_key_hex());
+        assert_eq!(pending.len(), 2);
+        assert_eq!(store.get_own_topic(&env_dm.envelope_id), Some(DEFAULT_MAILBOX_TOPIC));
+        assert_eq!(store.get_own_topic(&env_req.envelope_id), Some(FRIEND_REQUEST_MAILBOX_TOPIC));
+
+        // Descarta apenas o pedido de amizade
+        let discarded = store.discard_outbox_for(&alice.public_key_hex(), &bob.public_key_hex(), Some(FRIEND_REQUEST_MAILBOX_TOPIC));
+        assert_eq!(discarded, 1);
+
+        let remaining = store.pending_outbox_for(&alice.public_key_hex(), &bob.public_key_hex());
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].envelope_id, env_dm.envelope_id);
+    }
+
+    #[test]
+    fn test_firewall_purge_expired_blocks() {
+        let mut fw = DmFirewall::new();
+        let alice_pk = "a".repeat(64);
+        let bob_pk = "b".repeat(64);
+
+        // Bloqueia Alice até t=1050 e Bob até t=2000
+        fw.peers.entry(alice_pk.clone()).or_default().blocked_until = Some(1050);
+        fw.peers.entry(bob_pk.clone()).or_default().blocked_until = Some(2000);
+
+        assert!(fw.is_blocked(&alice_pk, 1000));
+        assert!(fw.is_blocked(&bob_pk, 1000));
+
+        // Em t=1000 nada é purgado
+        let unblocked = fw.purge_expired_blocks(1000);
+        assert!(unblocked.is_empty());
+
+        // Em t=1100 Alice é purgada e desbloqueada
+        let unblocked = fw.purge_expired_blocks(1100);
+        assert_eq!(unblocked.len(), 1);
+        assert_eq!(unblocked[0], alice_pk);
+        assert!(!fw.is_blocked(&alice_pk, 1100));
+        assert!(fw.is_blocked(&bob_pk, 1100));
+
+        // Em t=2005 Bob é purgado e desbloqueado
+        let unblocked = fw.purge_expired_blocks(2005);
+        assert_eq!(unblocked.len(), 1);
+        assert_eq!(unblocked[0], bob_pk);
+        assert!(!fw.is_blocked(&bob_pk, 2005));
     }
 }

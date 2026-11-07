@@ -4,9 +4,10 @@ use super::{CoreError, CoreEvent, Runtime};
 use crate::community::{format_duration, short_id};
 use crate::config::NodeConfig;
 use crate::dm::{
-    dm_topic, DirectMessageEnvelope, DmFirewall, DmFirewallVerdict, DmPeerSession, DmWireMessage,
-    EphemeralKeyOffer, FriendRequest, FriendResponse, MailboxMessage, MailboxStore, ReceiptAck,
-    StoredEnvelope, FRIEND_REQUEST_MAILBOX_TOPIC, FRIEND_RESPONSE_MAILBOX_TOPIC, MAILBOX_TOPIC,
+    dm_topic, BlockNotice, DirectMessageEnvelope, DmFirewall, DmFirewallVerdict, DmPeerSession,
+    DmWireMessage, EphemeralKeyOffer, FriendRequest, FriendResponse, MailboxMessage, MailboxStore,
+    ReceiptAck, StoredEnvelope, FRIEND_REQUEST_MAILBOX_TOPIC, FRIEND_RESPONSE_MAILBOX_TOPIC,
+    MAILBOX_TOPIC,
 };
 use crate::identity::FriendState;
 use crate::wire;
@@ -26,6 +27,8 @@ pub(super) struct DmState {
     pub active_dm_peer: Option<String>,
     /// Firewall de aplicação local para DMs (políticas diferenciadas para Amigos vs Desconhecidos)
     pub firewall: DmFirewall,
+    /// Cooldowns temporários impostos por outros pares contra nós (pubkey -> unblock_timestamp_secs) (Issue #73)
+    pub peer_cooldowns: HashMap<String, u64>,
 }
 
 impl DmState {
@@ -40,7 +43,23 @@ impl DmState {
             subscribed_topics: HashSet::new(),
             active_dm_peer: None,
             firewall: DmFirewall::new(),
+            peer_cooldowns: HashMap::new(),
         }
+    }
+
+    pub fn is_under_cooldown(&self, peer_pubkey: &str, now: u64) -> Option<u64> {
+        let clean = peer_pubkey.trim().to_lowercase();
+        self.peer_cooldowns.get(&clean).copied().filter(|&until| until > now)
+    }
+
+    pub fn set_peer_cooldown(&mut self, peer_pubkey: &str, blocked_until: u64) {
+        let clean = peer_pubkey.trim().to_lowercase();
+        self.peer_cooldowns.insert(clean, blocked_until);
+    }
+
+    pub fn remove_peer_cooldown(&mut self, peer_pubkey: &str) -> Option<u64> {
+        let clean = peer_pubkey.trim().to_lowercase();
+        self.peer_cooldowns.remove(&clean)
     }
 }
 
@@ -199,6 +218,40 @@ impl Runtime {
         }
         let now = super::now_secs();
         let now_ms = super::now_millis();
+
+        // Issue #73: Se estiver sob cooldown com o destinatário, retém na outbox local
+        if let Some(until) = self.dm.is_under_cooldown(&peer_pk, now) {
+            let remaining = until.saturating_sub(now);
+            match StoredEnvelope::create_signed_and_sealed(
+                &self.identity,
+                &peer_pk,
+                text,
+                now_ms,
+                suggested_ttl,
+            ) {
+                Ok(stored) => {
+                    self.dm
+                        .mailbox
+                        .insert_own(stored, &self.dm.node_config, now);
+                    let rem_fmt = format_duration(Some(remaining));
+                    self.emit(CoreEvent::DirectMessage {
+                        peer_pubkey: peer_pk,
+                        peer_name,
+                        author: "Sistema".to_string(),
+                        author_pubkey: String::new(),
+                        text: format!(
+                            "⏳ Você está sob cooldown temporário com este par (restam {}). Sua mensagem foi retida na outbox e será enviada automaticamente após o término.",
+                            rem_fmt
+                        ),
+                        timestamp: now_ms,
+                        offline_delivery: false,
+                    });
+                }
+                Err(e) => self.error(CoreError::Friend(e.to_string())),
+            }
+            return;
+        }
+
         let topic_str = self.subscribe_dm_with(&peer_pk);
         let online = self.is_pubkey_online(&peer_pk);
 
@@ -244,33 +297,7 @@ impl Runtime {
             ) {
                 Ok(stored) => {
                     let env_id = stored.envelope_id.clone();
-                    self.dm
-                        .mailbox
-                        .insert_own(stored.clone(), &self.dm.node_config, now);
-                    let msg = MailboxMessage::Store(stored);
-                    let bytes = wire::encode(&msg);
-                    if self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes).is_ok() {
-                        // Marca apenas os amigos conectados que já estão inscritos em MAILBOX_TOPIC agora
-                        let mailbox_hash = IdentTopic::new(MAILBOX_TOPIC).hash();
-                        let subscribed_friends: Vec<String> = self
-                            .node
-                            .swarm
-                            .behaviour()
-                            .gossipsub
-                            .all_peers()
-                            .filter(|(_, topics)| topics.contains(&&mailbox_hash))
-                            .filter_map(|(peer, _)| self.peer_metadata.get(peer).map(|(_, pk)| pk.to_lowercase()))
-                            .filter(|pk| {
-                                self.identity
-                                    .get_friends()
-                                    .iter()
-                                    .any(|f| f.public_key.eq_ignore_ascii_case(pk))
-                            })
-                            .collect();
-                        for friend_pk in subscribed_friends {
-                            self.dm.mailbox.mark_delegated_to_guardian(&env_id, &friend_pk);
-                        }
-                    }
+                    self.broadcast_mailbox_store(stored, None);
 
                     self.emit(CoreEvent::DirectMessage {
                         peer_pubkey: peer_pk.clone(),
@@ -356,6 +383,53 @@ impl Runtime {
                     self.persist_identity();
                     return;
                 }
+
+                // Issue #73: Resolução de pedidos mútuos (Cross-Friend Requests) online
+                if current_state == Some(FriendState::PendingOutgoing) {
+                    let _ = self.identity.add_or_update_friend(&sender_pk, Some(&sender_nick), FriendState::Confirmed);
+                    let _ = self.identity.update_friend_encryption_key(&req.encryption_advertisement);
+                    self.persist_identity();
+                    self.dm.firewall.unblock(&sender_pk);
+                    self.subscribe_dm_with(&sender_pk);
+
+                    // Responde com confirmação mútua online e offline via mailbox
+                    let resp = FriendResponse::new_signed(&self.identity, &sender_pk, true, now);
+                    let dm_top = IdentTopic::new(dm_topic(&my_pk, &sender_pk));
+                    let _ = self.publish_gossip(dm_top, wire::encode(&DmWireMessage::FriendResponse(resp)));
+                    if let Ok(stored) = StoredEnvelope::create_signed_and_sealed_topic(
+                        &self.identity,
+                        &sender_pk,
+                        FRIEND_RESPONSE_MAILBOX_TOPIC,
+                        "ACCEPTED",
+                        super::now_millis(),
+                        None,
+                    ) {
+                        self.broadcast_mailbox_store(stored, Some(FRIEND_RESPONSE_MAILBOX_TOPIC));
+                    }
+
+                    // Descarta da outbox nosso pedido de amizade que estava pendente
+                    self.dm.mailbox.discard_outbox_for(&my_pk, &sender_pk, Some(FRIEND_REQUEST_MAILBOX_TOPIC));
+
+                    let peer_name = self.friendly_name(&sender_pk);
+                    self.emit(CoreEvent::FriendRequestAccepted {
+                        pubkey: sender_pk.clone(),
+                        peer_name,
+                        offline_delivery: false,
+                    });
+                    self.emit(CoreEvent::FriendUpdated {
+                        pubkey: sender_pk.clone(),
+                        alias: self.identity.get_friend(&sender_pk).and_then(|f| f.alias.clone()),
+                        removed: false,
+                    });
+                    self.list_friends();
+                    self.on_peer_unblocked(&sender_pk);
+                    if self.is_pubkey_online(&sender_pk) {
+                        self.send_ephemeral_key_offer(&sender_pk);
+                        self.delegate_pending_to_friend(&sender_pk);
+                    }
+                    return;
+                }
+
                 let _ = self.identity.add_or_update_friend(&sender_pk, Some(&sender_nick), FriendState::PendingIncoming);
                 let _ = self.identity.update_friend_encryption_key(&req.encryption_advertisement);
                 self.persist_identity();
@@ -387,6 +461,8 @@ impl Runtime {
                     self.persist_identity();
                     self.dm.firewall.unblock(&sender_pk);
                     self.subscribe_dm_with(&sender_pk);
+                    self.on_peer_unblocked(&sender_pk);
+                    self.dm.mailbox.discard_outbox_for(&my_pk, &sender_pk, Some(FRIEND_REQUEST_MAILBOX_TOPIC));
                     if self.is_pubkey_online(&sender_pk) {
                         self.send_ephemeral_key_offer(&sender_pk);
                         self.delegate_pending_to_friend(&sender_pk);
@@ -411,6 +487,33 @@ impl Runtime {
                     });
                 }
                 self.list_friends();
+            }
+            DmWireMessage::BlockNotice(notice) => {
+                if !notice.recipient_pubkey.eq_ignore_ascii_case(&my_pk)
+                    || notice.sender_pubkey.eq_ignore_ascii_case(&my_pk)
+                {
+                    return;
+                }
+                let sender_pk = notice.sender_pubkey.to_lowercase();
+                let now = super::now_secs();
+                if notice.blocked_until > now {
+                    self.dm.set_peer_cooldown(&sender_pk, notice.blocked_until);
+                    let rem = notice.blocked_until.saturating_sub(now);
+                    let rem_fmt = format_duration(Some(rem));
+                    let peer_name = self.friendly_name(&sender_pk);
+                    self.emit(CoreEvent::DirectMessage {
+                        peer_pubkey: sender_pk,
+                        peer_name,
+                        author: "Firewall Remoto".to_string(),
+                        author_pubkey: notice.sender_pubkey,
+                        text: format!(
+                            "🛡️ Notificação de Firewall: Você foi temporariamente bloqueado por {} por {} (Motivo: {}). Mensagens futuras para este par serão retidas na outbox e enviadas automaticamente após o término.",
+                            notice.sender_nick, rem_fmt, notice.reason
+                        ),
+                        timestamp: notice.timestamp,
+                        offline_delivery: false,
+                    });
+                }
             }
             DmWireMessage::Message(envelope) => {
                 if !envelope.recipient_pubkey.eq_ignore_ascii_case(&my_pk)
@@ -581,6 +684,7 @@ impl Runtime {
     }
 
     fn receive_sealed_envelope(&mut self, envelope: StoredEnvelope, now: u64) {
+        let my_pk = self.my_pubkey();
         let ack = self
             .dm
             .mailbox
@@ -598,7 +702,46 @@ impl Runtime {
                     let sender_pk = payload.sender_pubkey.to_lowercase();
                     if !self.dm.firewall.is_blocked(&sender_pk, now) {
                         let current_state = self.identity.get_friend_state(&sender_pk);
-                        if current_state != Some(FriendState::Confirmed) {
+                        if current_state == Some(FriendState::PendingOutgoing) {
+                            // Issue #73: Resolução de pedidos mútuos via Mailbox offline
+                            let _ = self.identity.add_or_update_friend(&sender_pk, Some(&payload.sender_nick), FriendState::Confirmed);
+                            self.persist_identity();
+                            self.dm.firewall.unblock(&sender_pk);
+                            self.subscribe_dm_with(&sender_pk);
+
+                            let resp = FriendResponse::new_signed(&self.identity, &sender_pk, true, now);
+                            let dm_top = IdentTopic::new(dm_topic(&my_pk, &sender_pk));
+                            let _ = self.publish_gossip(dm_top, wire::encode(&DmWireMessage::FriendResponse(resp)));
+                            if let Ok(stored) = StoredEnvelope::create_signed_and_sealed_topic(
+                                &self.identity,
+                                &sender_pk,
+                                FRIEND_RESPONSE_MAILBOX_TOPIC,
+                                "ACCEPTED",
+                                super::now_millis(),
+                                None,
+                            ) {
+                                self.broadcast_mailbox_store(stored, Some(FRIEND_RESPONSE_MAILBOX_TOPIC));
+                            }
+
+                            self.dm.mailbox.discard_outbox_for(&my_pk, &sender_pk, Some(FRIEND_REQUEST_MAILBOX_TOPIC));
+                            let peer_name = self.friendly_name(&sender_pk);
+                            self.emit(CoreEvent::FriendRequestAccepted {
+                                pubkey: sender_pk.clone(),
+                                peer_name,
+                                offline_delivery: true,
+                            });
+                            self.emit(CoreEvent::FriendUpdated {
+                                pubkey: sender_pk.clone(),
+                                alias: self.identity.get_friend(&sender_pk).and_then(|f| f.alias.clone()),
+                                removed: false,
+                            });
+                            self.list_friends();
+                            self.on_peer_unblocked(&sender_pk);
+                            if self.is_pubkey_online(&sender_pk) {
+                                self.send_ephemeral_key_offer(&sender_pk);
+                                self.delegate_pending_to_friend(&sender_pk);
+                            }
+                        } else if current_state != Some(FriendState::Confirmed) {
                             let _ = self.identity.add_or_update_friend(&sender_pk, Some(&payload.sender_nick), FriendState::PendingIncoming);
                             self.persist_identity();
                             let msg = if payload.text.is_empty() { None } else { Some(payload.text) };
@@ -623,6 +766,8 @@ impl Runtime {
                         self.persist_identity();
                         self.dm.firewall.unblock(&sender_pk);
                         self.subscribe_dm_with(&sender_pk);
+                        self.on_peer_unblocked(&sender_pk);
+                        self.dm.mailbox.discard_outbox_for(&my_pk, &sender_pk, Some(FRIEND_REQUEST_MAILBOX_TOPIC));
                         if self.is_pubkey_online(&sender_pk) {
                             self.send_ephemeral_key_offer(&sender_pk);
                             self.delegate_pending_to_friend(&sender_pk);
@@ -719,9 +864,25 @@ impl Runtime {
         }
     }
 
-    /// Envia 1 única mensagem de cortesia E2EE avisando o remetente de que ele foi bloqueado temporariamente pelo firewall local
-    fn send_courtesy_block_notice(&mut self, recipient_pubkey: &str, reason: &str, duration_secs: u64, _now: u64) {
+    /// Envia 1 única mensagem de cortesia E2EE avisando o remetente de que ele foi bloqueado temporariamente pelo firewall local (Issue #73)
+    fn send_courtesy_block_notice(&mut self, recipient_pubkey: &str, reason: &str, duration_secs: u64, now: u64) {
         let topic_str = self.subscribe_dm_with(recipient_pubkey);
+        let blocked_until = now.saturating_add(duration_secs);
+
+        // 1. Notificação estruturada Wire para o nó remoto configurar timer e reter mensagens na outbox
+        let notice = BlockNotice {
+            sender_pubkey: self.my_pubkey(),
+            sender_nick: self.nick.clone(),
+            recipient_pubkey: recipient_pubkey.to_string(),
+            duration_secs,
+            blocked_until,
+            reason: reason.to_string(),
+            timestamp: super::now_millis(),
+        };
+        let wire_notice = DmWireMessage::BlockNotice(notice);
+        let _ = self.publish_gossip(IdentTopic::new(topic_str.clone()), wire::encode(&wire_notice));
+
+        // 2. Mensagem em texto claro E2EE para o usuário ler no chat
         let courtesy_text = format!(
             "🛡️ [Aviso Automático do Firewall de {}]: Suas mensagens diretas foram temporariamente limitadas por {} ({}). Caso seja um engano, aguarde ou peça para {} te adicionar aos amigos.",
             self.nick,
@@ -747,6 +908,108 @@ impl Runtime {
         let msg = MailboxMessage::Ack(ack);
         let bytes = wire::encode(&msg);
         let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
+    }
+
+    /// Enfileira um envelope na outbox local e distribui via MailboxMessage::Store aos amigos guardiões online
+    pub(super) fn broadcast_mailbox_store(&mut self, stored: StoredEnvelope, topic: Option<&str>) {
+        let now = super::now_secs();
+        let env_id = stored.envelope_id.clone();
+        if let Some(t) = topic {
+            self.dm
+                .mailbox
+                .insert_own_with_topic(stored.clone(), t, &self.dm.node_config, now);
+        } else {
+            self.dm
+                .mailbox
+                .insert_own(stored.clone(), &self.dm.node_config, now);
+        }
+        let msg = MailboxMessage::Store(stored);
+        let bytes = wire::encode(&msg);
+        if self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes).is_ok() {
+            let mailbox_hash = IdentTopic::new(MAILBOX_TOPIC).hash();
+            let subscribed_friends: Vec<String> = self
+                .node
+                .swarm
+                .behaviour()
+                .gossipsub
+                .all_peers()
+                .filter(|(_, topics)| topics.contains(&&mailbox_hash))
+                .filter_map(|(peer, _)| self.peer_metadata.get(peer).map(|(_, pk)| pk.to_lowercase()))
+                .filter(|pk| {
+                    self.identity
+                        .get_friends()
+                        .iter()
+                        .any(|f| f.public_key.eq_ignore_ascii_case(pk))
+                })
+                .collect();
+            for friend_pk in subscribed_friends {
+                self.dm.mailbox.mark_delegated_to_guardian(&env_id, &friend_pk);
+            }
+        }
+    }
+
+    /// Reage ao término de cooldown ou desbloqueio de um par (Issue #73):
+    /// Limpa cooldowns locais e descarrega envelopes retidos na Outbox para guardiões ou entrega direta.
+    pub(super) fn on_peer_unblocked(&mut self, peer_pubkey: &str) {
+        let clean_pk = peer_pubkey.trim().to_lowercase();
+        self.dm.remove_peer_cooldown(&clean_pk);
+        let my_pk = self.identity.public_key_hex();
+        let pending = self.dm.mailbox.pending_outbox_for(&my_pk, &clean_pk);
+        if pending.is_empty() {
+            return;
+        }
+        let now = super::now_secs();
+        let peer_name = self.friendly_name(&clean_pk);
+        let count = pending.len();
+        tracing::info!(peer = %short_id(&clean_pk), count, "Descarregando envelopes retidos na outbox após desbloqueio");
+
+        for env in pending {
+            if self.dm.mailbox.get_own_topic(&env.envelope_id) == Some(FRIEND_REQUEST_MAILBOX_TOPIC) && self.is_pubkey_online(&clean_pk) {
+                let req = FriendRequest::new_signed(&self.identity, &clean_pk, None, now);
+                let dm_top = IdentTopic::new(dm_topic(&my_pk, &clean_pk));
+                let _ = self.publish_gossip(dm_top, wire::encode(&DmWireMessage::FriendRequest(req)));
+                self.send_ephemeral_key_offer(&clean_pk);
+            }
+
+            if self.is_peer_subscribed_to_mailbox(&clean_pk) {
+                let msg = MailboxMessage::Deliver(env.clone());
+                let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), wire::encode(&msg));
+            }
+
+            let env_id = env.envelope_id.clone();
+            let msg = MailboxMessage::Store(env);
+            if self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), wire::encode(&msg)).is_ok() {
+                let mailbox_hash = IdentTopic::new(MAILBOX_TOPIC).hash();
+                let subscribed_friends: Vec<String> = self
+                    .node
+                    .swarm
+                    .behaviour()
+                    .gossipsub
+                    .all_peers()
+                    .filter(|(_, topics)| topics.contains(&&mailbox_hash))
+                    .filter_map(|(peer, _)| self.peer_metadata.get(peer).map(|(_, pk)| pk.to_lowercase()))
+                    .filter(|pk| {
+                        self.identity
+                            .get_friends()
+                            .iter()
+                            .any(|f| f.public_key.eq_ignore_ascii_case(pk))
+                    })
+                    .collect();
+                for friend_pk in subscribed_friends {
+                    self.dm.mailbox.mark_delegated_to_guardian(&env_id, &friend_pk);
+                }
+            }
+        }
+
+        self.emit(CoreEvent::DirectMessage {
+            peer_pubkey: clean_pk,
+            peer_name,
+            author: "Sistema".to_string(),
+            author_pubkey: String::new(),
+            text: format!("🚀 Par desbloqueado: {} mensagem(ns) retida(s) na outbox foram despachadas com sucesso.", count),
+            timestamp: super::now_millis(),
+            offline_delivery: false,
+        });
     }
 
     /// Chamado quando um par Anarchord é identificado no Swarm:
@@ -860,10 +1123,33 @@ impl Runtime {
         }
     }
 
-    /// Tick periódico da Mailbox: apenas purga envelopes expirados do disco (sem inundar a rede com republicações!)
+    /// Tick periódico da Mailbox: purga envelopes expirados do disco e desbloqueios do firewall (Issue #73)
     pub(super) fn mailbox_tick(&mut self) {
         let now = super::now_secs();
         self.dm.mailbox.purge_expired(now);
+
+        // Purga bloqueios do firewall local expirados e notifica
+        let unblocked_peers = self.dm.firewall.purge_expired_blocks(now);
+        for pk in unblocked_peers {
+            let peer_name = self.friendly_name(&pk);
+            self.emit(CoreEvent::PeerUnblocked {
+                pubkey: pk.clone(),
+                peer_name,
+            });
+            self.on_peer_unblocked(&pk);
+        }
+
+        // Purga cooldowns remotos expirados
+        let expired_cooldowns: Vec<String> = self
+            .dm
+            .peer_cooldowns
+            .iter()
+            .filter(|(_, &until)| now >= until)
+            .map(|(pk, _)| pk.clone())
+            .collect();
+        for pk in expired_cooldowns {
+            self.on_peer_unblocked(&pk);
+        }
     }
 
     /// Exibe a configuração atual e o uso da mailbox
@@ -903,8 +1189,11 @@ impl Runtime {
             .map(|(pk, _)| pk)
             .unwrap_or_else(|| target.trim().to_lowercase());
         let peer_name = self.friendly_name(&pubkey);
-        if self.dm.firewall.unblock(&pubkey) {
-            self.emit(CoreEvent::PeerUnblocked { pubkey, peer_name });
+        let unblocked_fw = self.dm.firewall.unblock(&pubkey);
+        let unblocked_cd = self.dm.remove_peer_cooldown(&pubkey).is_some();
+        if unblocked_fw || unblocked_cd {
+            self.emit(CoreEvent::PeerUnblocked { pubkey: pubkey.clone(), peer_name });
+            self.on_peer_unblocked(&pubkey);
         } else {
             self.error(CoreError::Friend(format!("'{}' não está bloqueado no firewall", target)));
         }
@@ -954,6 +1243,43 @@ impl Runtime {
         self.dm.firewall.unblock(&pubkey);
         self.subscribe_dm_with(&pubkey);
 
+        // Issue #73: Se estiver sob cooldown com o destinatário, retém na outbox local sem transmitir ainda
+        if let Some(until) = self.dm.is_under_cooldown(&pubkey, now) {
+            let remaining = until.saturating_sub(now);
+            let intro_msg = message.unwrap_or("");
+            if let Ok(stored) = StoredEnvelope::create_signed_and_sealed_topic(
+                &self.identity,
+                &pubkey,
+                FRIEND_REQUEST_MAILBOX_TOPIC,
+                intro_msg,
+                now_ms,
+                None,
+            ) {
+                self.dm.mailbox.insert_own_with_topic(stored, FRIEND_REQUEST_MAILBOX_TOPIC, &self.dm.node_config, now);
+                let rem_fmt = format_duration(Some(remaining));
+                let peer_name = self.friendly_name(&pubkey);
+                self.emit(CoreEvent::DirectMessage {
+                    peer_pubkey: pubkey.clone(),
+                    peer_name,
+                    author: "Sistema".to_string(),
+                    author_pubkey: String::new(),
+                    text: format!(
+                        "⏳ Você está sob cooldown temporário com este par (restam {}). Seu pedido de amizade foi retido na outbox e será enviado automaticamente após o término.",
+                        rem_fmt
+                    ),
+                    timestamp: now_ms,
+                    offline_delivery: false,
+                });
+            }
+            self.emit(CoreEvent::FriendUpdated {
+                pubkey: pubkey.to_lowercase(),
+                alias: inferred_alias,
+                removed: false,
+            });
+            self.list_friends();
+            return;
+        }
+
         // 2. Envia online via tópico mútuo
         let req = FriendRequest::new_signed(&self.identity, &pubkey, message, now);
         let dm_top = IdentTopic::new(dm_topic(&self.my_pubkey(), &pubkey));
@@ -975,31 +1301,7 @@ impl Runtime {
             now_ms,
             None,
         ) {
-            let env_id = stored.envelope_id.clone();
-            self.dm.mailbox.insert_own(stored.clone(), &self.dm.node_config, now);
-            let msg = MailboxMessage::Store(stored);
-            let bytes = wire::encode(&msg);
-            if self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes).is_ok() {
-                let mailbox_hash = IdentTopic::new(MAILBOX_TOPIC).hash();
-                let subscribed_friends: Vec<String> = self
-                    .node
-                    .swarm
-                    .behaviour()
-                    .gossipsub
-                    .all_peers()
-                    .filter(|(_, topics)| topics.contains(&&mailbox_hash))
-                    .filter_map(|(peer, _)| self.peer_metadata.get(peer).map(|(_, pk)| pk.to_lowercase()))
-                    .filter(|pk| {
-                        self.identity
-                            .get_friends()
-                            .iter()
-                            .any(|f| f.public_key.eq_ignore_ascii_case(pk))
-                    })
-                    .collect();
-                for friend_pk in subscribed_friends {
-                    self.dm.mailbox.mark_delegated_to_guardian(&env_id, &friend_pk);
-                }
-            }
+            self.broadcast_mailbox_store(stored, Some(FRIEND_REQUEST_MAILBOX_TOPIC));
         }
 
         self.emit(CoreEvent::FriendUpdated {
@@ -1033,6 +1335,7 @@ impl Runtime {
         self.persist_identity();
         self.dm.firewall.unblock(&pubkey);
         self.subscribe_dm_with(&pubkey);
+        self.on_peer_unblocked(&pubkey);
 
         // Envia resposta positiva online
         let resp = FriendResponse::new_signed(&self.identity, &pubkey, true, now);
@@ -1054,10 +1357,7 @@ impl Runtime {
             now_ms,
             None,
         ) {
-            self.dm.mailbox.insert_own(stored.clone(), &self.dm.node_config, now);
-            let msg = MailboxMessage::Store(stored);
-            let bytes = wire::encode(&msg);
-            let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
+            self.broadcast_mailbox_store(stored, Some(FRIEND_RESPONSE_MAILBOX_TOPIC));
         }
 
         self.emit(CoreEvent::FriendUpdated {
@@ -1105,10 +1405,7 @@ impl Runtime {
             now_ms,
             None,
         ) {
-            self.dm.mailbox.insert_own(stored.clone(), &self.dm.node_config, now);
-            let msg = MailboxMessage::Store(stored);
-            let bytes = wire::encode(&msg);
-            let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), bytes);
+            self.broadcast_mailbox_store(stored, Some(FRIEND_RESPONSE_MAILBOX_TOPIC));
         }
 
         self.emit(CoreEvent::FriendUpdated {
@@ -1122,5 +1419,194 @@ impl Runtime {
     /// Reenvia pedido de amizade a um contato
     pub(super) fn resend_friend_request(&mut self, target: &str, message: Option<&str>) {
         self.send_friend_request(target, None, message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::CoreConfig;
+    use crate::UserIdentity;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    #[tokio::test]
+    async fn test_dm_outbox_retention_under_cooldown_and_unblock_flush() {
+        let (tx, mut rx) = unbounded_channel();
+        let temp = std::env::temp_dir().join(format!("test_dm_cooldown_{}", rand::random::<u32>()));
+        let config = CoreConfig::new(
+            UserIdentity::generate_with_nick("Alice"),
+            temp.join("servers"),
+            temp.join("downloads"),
+        );
+        let mut runtime = Runtime::new(config, tx).unwrap();
+        let alice_pk = runtime.my_pubkey();
+
+        let bob = UserIdentity::generate_with_nick("Bob");
+        let bob_pk = bob.public_key_hex();
+
+        // 1. Configura cooldown para Bob
+        let now = super::super::now_secs();
+        runtime.dm.set_peer_cooldown(&bob_pk, now + 100);
+        assert!(runtime.dm.is_under_cooldown(&bob_pk, now).is_some());
+
+        // 2. Alice tenta enviar uma DM para Bob -> retida na outbox
+        runtime.send_dm(&bob_pk, "Mensagem retida para Bob", None);
+
+        let pending = runtime.dm.mailbox.pending_outbox_for(&alice_pk, &bob_pk);
+        assert_eq!(pending.len(), 1, "Mensagem deve ser retida na outbox local");
+        assert_eq!(runtime.dm.mailbox.get_own_topic(&pending[0].envelope_id), Some(crate::dm::DEFAULT_MAILBOX_TOPIC));
+
+        // 3. Alice tenta enviar pedido de amizade para Bob enquanto sob cooldown -> também retido
+        runtime.send_friend_request(&bob_pk, Some("Bobby"), Some("Olá Bob!"));
+        let pending = runtime.dm.mailbox.pending_outbox_for(&alice_pk, &bob_pk);
+        assert_eq!(pending.len(), 2, "Ambos envelopes devem estar na outbox");
+
+        // 4. Dispara on_peer_unblocked -> cooldown é removido e outbox é descarregada
+        runtime.on_peer_unblocked(&bob_pk);
+        assert!(runtime.dm.is_under_cooldown(&bob_pk, now).is_none());
+
+        // Consome eventos emitidos
+        let mut got_cooldown_notice = false;
+        let mut got_unblocked_flush = false;
+        while let Ok(evt) = rx.try_recv() {
+            if let CoreEvent::DirectMessage { text, .. } = evt {
+                if text.contains("cooldown temporário") {
+                    got_cooldown_notice = true;
+                }
+                if text.contains("Par desbloqueado") && text.contains("2 mensagem(ns)") {
+                    got_unblocked_flush = true;
+                }
+            }
+        }
+        assert!(got_cooldown_notice);
+        assert!(got_unblocked_flush);
+    }
+
+    #[tokio::test]
+    async fn test_mutual_cross_friend_request_resolution_online() {
+        let (tx, mut rx) = unbounded_channel();
+        let temp = std::env::temp_dir().join(format!("test_cross_freq_{}", rand::random::<u32>()));
+        let config = CoreConfig::new(
+            UserIdentity::generate_with_nick("Alice"),
+            temp.join("servers"),
+            temp.join("downloads"),
+        );
+        let mut runtime = Runtime::new(config, tx).unwrap();
+        let alice_pk = runtime.my_pubkey();
+
+        let bob = UserIdentity::generate_with_nick("Bob");
+        let bob_pk = bob.public_key_hex();
+
+        // 1. Alice envia pedido de amizade para Bob (fica PendingOutgoing)
+        runtime.send_friend_request(&bob_pk, Some("Bob"), None);
+        assert_eq!(runtime.identity.get_friend_state(&bob_pk), Some(FriendState::PendingOutgoing));
+        assert_eq!(runtime.dm.mailbox.pending_outbox_for(&alice_pk, &bob_pk).len(), 1);
+
+        // 2. Bob envia pedido mútuo (Cross-Friend Request) para Alice via Wire
+        let req = FriendRequest::new_signed(&bob, &alice_pk, Some("Olá Alice, também quero ser seu amigo!"), 1000);
+        runtime.on_dm_wire_message(DmWireMessage::FriendRequest(req));
+
+        // 3. Resolução automática imediata para Confirmed!
+        assert_eq!(runtime.identity.get_friend_state(&bob_pk), Some(FriendState::Confirmed));
+
+        // 4. Pedido de amizade na Outbox foi descartado (resta apenas a resposta FRIEND_RESPONSE com ACCEPTED para Bob)
+        let pending = runtime.dm.mailbox.pending_outbox_for(&alice_pk, &bob_pk);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(runtime.dm.mailbox.get_own_topic(&pending[0].envelope_id), Some(FRIEND_RESPONSE_MAILBOX_TOPIC));
+
+        // 5. Verifica se FriendRequestAccepted foi emitido
+        let mut accepted_emitted = false;
+        while let Ok(evt) = rx.try_recv() {
+            if let CoreEvent::FriendRequestAccepted { pubkey, offline_delivery, .. } = evt {
+                if pubkey == bob_pk && !offline_delivery {
+                    accepted_emitted = true;
+                }
+            }
+        }
+        assert!(accepted_emitted);
+    }
+
+    #[tokio::test]
+    async fn test_mutual_cross_friend_request_resolution_offline_mailbox() {
+        let (tx, mut rx) = unbounded_channel();
+        let temp = std::env::temp_dir().join(format!("test_cross_offline_{}", rand::random::<u32>()));
+        let config = CoreConfig::new(
+            UserIdentity::generate_with_nick("Alice"),
+            temp.join("servers"),
+            temp.join("downloads"),
+        );
+        let mut runtime = Runtime::new(config, tx).unwrap();
+        let alice_pk = runtime.my_pubkey();
+
+        let bob = UserIdentity::generate_with_nick("Bob");
+        let bob_pk = bob.public_key_hex();
+
+        // 1. Alice tem pedido enviado para Bob (PendingOutgoing)
+        runtime.send_friend_request(&bob_pk, Some("Bob"), None);
+        assert_eq!(runtime.identity.get_friend_state(&bob_pk), Some(FriendState::PendingOutgoing));
+
+        // 2. Bob envia pedido offline via Mailbox
+        let offline_env = StoredEnvelope::create_signed_and_sealed_topic(
+            &bob,
+            &alice_pk,
+            FRIEND_REQUEST_MAILBOX_TOPIC,
+            "Pedido de Bob via Mailbox",
+            1000,
+            None,
+        ).unwrap();
+
+        // 3. Alice recebe o envelope
+        runtime.receive_sealed_envelope(offline_env, 1000);
+
+        // 4. Transição automática para Confirmed e outbox de pedido limpa (resta apenas a resposta FRIEND_RESPONSE)
+        assert_eq!(runtime.identity.get_friend_state(&bob_pk), Some(FriendState::Confirmed));
+        let pending = runtime.dm.mailbox.pending_outbox_for(&alice_pk, &bob_pk);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(runtime.dm.mailbox.get_own_topic(&pending[0].envelope_id), Some(FRIEND_RESPONSE_MAILBOX_TOPIC));
+
+        let mut accepted_emitted = false;
+        while let Ok(evt) = rx.try_recv() {
+            if let CoreEvent::FriendRequestAccepted { pubkey, offline_delivery, .. } = evt {
+                if pubkey == bob_pk && offline_delivery {
+                    accepted_emitted = true;
+                }
+            }
+        }
+        assert!(accepted_emitted);
+    }
+
+    #[tokio::test]
+    async fn test_block_notice_triggers_cooldown_and_unblock_by_friend_add() {
+        let (tx, _rx) = unbounded_channel();
+        let temp = std::env::temp_dir().join(format!("test_block_notice_{}", rand::random::<u32>()));
+        let config = CoreConfig::new(
+            UserIdentity::generate_with_nick("Alice"),
+            temp.join("servers"),
+            temp.join("downloads"),
+        );
+        let mut runtime = Runtime::new(config, tx).unwrap();
+        let alice_pk = runtime.my_pubkey();
+
+        let bob = UserIdentity::generate_with_nick("Bob");
+        let bob_pk = bob.public_key_hex();
+
+        let now = super::super::now_secs();
+        let notice = BlockNotice {
+            sender_pubkey: bob_pk.clone(),
+            sender_nick: "Bob".to_string(),
+            recipient_pubkey: alice_pk.clone(),
+            duration_secs: 60,
+            blocked_until: now + 60,
+            reason: "Rate limit excedido".to_string(),
+            timestamp: super::super::now_millis(),
+        };
+
+        // Alice recebe BlockNotice de Bob
+        runtime.on_dm_wire_message(DmWireMessage::BlockNotice(notice));
+        assert!(runtime.dm.is_under_cooldown(&bob_pk, now).is_some());
+
+        // Alice desbloqueia Bob manualmente via unblock_peer
+        runtime.unblock_peer(&bob_pk);
+        assert!(runtime.dm.is_under_cooldown(&bob_pk, now).is_none());
     }
 }

@@ -307,6 +307,22 @@ fn dissect_incoming(incoming: Incoming) -> (String, SniffedCrypto) {
                 },
             )
         }
+        Incoming::DirectMessage(DmWireMessage::BlockNotice(notice)) => (
+            "DirectMessage.BlockNotice".to_string(),
+            SniffedCrypto {
+                sender_pubkey: Some(notice.sender_pubkey),
+                recipient_pubkey: Some(notice.recipient_pubkey),
+                ephemeral_x25519_pubkey: None,
+                uses_session_key: None,
+                envelope_id: None,
+                nonce_hex: None,
+                ciphertext_hex: None,
+                signing_bytes_hex: None,
+                signature_hex: None,
+                signature_valid: None,
+                cleartext_preview: Some(format!("dur={}s: {}", notice.duration_secs, notice.reason)),
+            },
+        ),
         Incoming::Mailbox(MailboxMessage::Store(env)) => (
             "Mailbox.Store".to_string(),
             dissect_stored_envelope(env),
