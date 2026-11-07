@@ -104,6 +104,52 @@ impl Default for DmPolicyConfig {
     }
 }
 
+/// Configuração do Firewall unificado do nó (`NodeFirewall` - Issue #48)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct FirewallConfig {
+    /// Isentar amigos (na sua lista local) dos limites de taxa de chat, controle e chunks
+    pub exempt_friends: bool,
+    /// Quando o nó atua como servidor de Circuit Relay v2, aceitar reservas e circuitos apenas de amigos
+    pub relay_friends_only: bool,
+    /// Limite de mensagens de chat por 10s para um amigo
+    pub friend_chat_per_10s: u32,
+    /// Limite de mensagens de chat por 10s para um desconhecido
+    pub stranger_chat_per_10s: u32,
+    /// Limite de mensagens de controle (ChainRequest, KeyPackage, Subscribe, FileOffer, Peers) por 10s para amigo
+    pub friend_control_per_10s: u32,
+    /// Limite de mensagens de controle por 10s para desconhecido
+    pub stranger_control_per_10s: u32,
+    /// Limite de pedidos de pedaços de arquivo (ChunkRequest) por 10s para amigo
+    pub friend_chunk_reqs_per_10s: u32,
+    /// Limite de pedidos de pedaços de arquivo (ChunkRequest) por 10s para desconhecido
+    pub stranger_chunk_reqs_per_10s: u32,
+    /// Limite de pacotes inválidos (assinatura falsa, formato corrompido ou tamanho excessivo) por minuto
+    pub invalid_packets_per_min: u32,
+    /// Disjuntor global (Under Attack): limite máximo de pacotes por 10s somando todos os desconhecidos
+    pub stranger_global_msgs_per_10s: u32,
+    /// Limite máximo de conexões simultâneas vindas do mesmo IP externo para desconhecidos
+    pub max_connections_per_ip: usize,
+}
+
+impl Default for FirewallConfig {
+    fn default() -> Self {
+        Self {
+            exempt_friends: false,
+            relay_friends_only: false,
+            friend_chat_per_10s: 60,
+            stranger_chat_per_10s: 15,
+            friend_control_per_10s: 60,
+            stranger_control_per_10s: 15,
+            friend_chunk_reqs_per_10s: 500,
+            stranger_chunk_reqs_per_10s: 150,
+            invalid_packets_per_min: 3,
+            stranger_global_msgs_per_10s: 200,
+            max_connections_per_ip: 8,
+        }
+    }
+}
+
 /// Configuração completa do nó Anarchord
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
@@ -112,6 +158,7 @@ pub struct NodeConfig {
     pub network: NetworkConfig,
     pub mailbox: MailboxConfig,
     pub dm: DmPolicyConfig,
+    pub firewall: FirewallConfig,
 }
 
 impl Default for NodeConfig {
@@ -121,6 +168,7 @@ impl Default for NodeConfig {
             network: NetworkConfig::default(),
             mailbox: MailboxConfig::default(),
             dm: DmPolicyConfig::default(),
+            firewall: FirewallConfig::default(),
         }
     }
 }
@@ -317,9 +365,86 @@ impl NodeConfig {
                 }
                 self.dm.stranger_offline_limit_per_hour = n;
             }
+            "firewall.exempt_friends" => {
+                self.firewall.exempt_friends = match val {
+                    "true" | "1" | "on" | "sim" => true,
+                    "false" | "0" | "off" | "nao" | "não" => false,
+                    _ => return Err(ConfigError::InvalidSetting(format!("booleano inválido: {}", val))),
+                };
+            }
+            "firewall.relay_friends_only" => {
+                self.firewall.relay_friends_only = match val {
+                    "true" | "1" | "on" | "sim" => true,
+                    "false" | "0" | "off" | "nao" | "não" => false,
+                    _ => return Err(ConfigError::InvalidSetting(format!("booleano inválido: {}", val))),
+                };
+            }
+            "firewall.friend_chat_per_10s" => {
+                let n: u32 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("friend_chat_per_10s deve ser > 0".into()));
+                }
+                self.firewall.friend_chat_per_10s = n;
+            }
+            "firewall.stranger_chat_per_10s" => {
+                let n: u32 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("stranger_chat_per_10s deve ser > 0".into()));
+                }
+                self.firewall.stranger_chat_per_10s = n;
+            }
+            "firewall.friend_control_per_10s" => {
+                let n: u32 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("friend_control_per_10s deve ser > 0".into()));
+                }
+                self.firewall.friend_control_per_10s = n;
+            }
+            "firewall.stranger_control_per_10s" => {
+                let n: u32 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("stranger_control_per_10s deve ser > 0".into()));
+                }
+                self.firewall.stranger_control_per_10s = n;
+            }
+            "firewall.friend_chunk_reqs_per_10s" => {
+                let n: u32 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("friend_chunk_reqs_per_10s deve ser > 0".into()));
+                }
+                self.firewall.friend_chunk_reqs_per_10s = n;
+            }
+            "firewall.stranger_chunk_reqs_per_10s" => {
+                let n: u32 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("stranger_chunk_reqs_per_10s deve ser > 0".into()));
+                }
+                self.firewall.stranger_chunk_reqs_per_10s = n;
+            }
+            "firewall.invalid_packets_per_min" => {
+                let n: u32 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("invalid_packets_per_min deve ser > 0".into()));
+                }
+                self.firewall.invalid_packets_per_min = n;
+            }
+            "firewall.stranger_global_msgs_per_10s" => {
+                let n: u32 = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("stranger_global_msgs_per_10s deve ser > 0".into()));
+                }
+                self.firewall.stranger_global_msgs_per_10s = n;
+            }
+            "firewall.max_connections_per_ip" => {
+                let n: usize = val.parse().map_err(|_| ConfigError::InvalidSetting(val.to_string()))?;
+                if n == 0 {
+                    return Err(ConfigError::InvalidSetting("max_connections_per_ip deve ser > 0".into()));
+                }
+                self.firewall.max_connections_per_ip = n;
+            }
             other => {
                 return Err(ConfigError::InvalidSetting(format!(
-                    "chave desconhecida '{}'. Chaves válidas: mailbox.*, network.*, dm.allow_strangers, dm.send_courtesy_notice, dm.friend_rate_limit_per_min, dm.stranger_rate_limit_per_min, dm.friend_max_message_bytes, dm.stranger_max_message_bytes, dm.stranger_offline_limit_per_hour",
+                    "chave desconhecida '{}'. Chaves válidas: mailbox.*, network.*, dm.*, firewall.*",
                     other
                 )));
             }

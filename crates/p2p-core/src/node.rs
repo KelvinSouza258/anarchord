@@ -128,6 +128,11 @@ pub struct NodeOptions {
     pub mdns: bool,
     /// Capacidades e versões de protocolo anunciadas no Identify (None = padrão local `v1..=v2`)
     pub capabilities: Option<crate::wire::ProtocolCapabilities>,
+    /// Exige validação explícita de mensagens Gossipsub pela aplicação (`report_message_validation_result`)
+    /// antes de repassar para a malha (ativado no `Runtime` pelo `NodeFirewall`).
+    pub validate_messages: bool,
+    /// Controlador de acesso ao servidor Circuit Relay v2 integrado ao `NodeFirewall` e lista de amigos
+    pub relay_access: Option<crate::firewall::RelayAccessControl>,
 }
 
 impl Default for NodeOptions {
@@ -139,6 +144,8 @@ impl Default for NodeOptions {
             lab: false,
             mdns: !cfg!(test),
             capabilities: None,
+            validate_messages: false,
+            relay_access: None,
         }
     }
 }
@@ -177,7 +184,8 @@ impl P2PNode {
                 let kademlia = kad::Behaviour::with_config(key.public().to_peer_id(), kad_store, kad_config);
 
                 // 2. GossipSub (Chat de Texto em Malha, Áudio e Vídeo P2P)
-                let gossip_config = gossipsub::ConfigBuilder::default()
+                let mut gossip_builder = gossipsub::ConfigBuilder::default();
+                gossip_builder
                     .heartbeat_interval(Duration::from_millis(500))
                     // Strict: toda mensagem precisa de autor (source) e assinatura válidos. É o que permite
                     // ligar o autor de uma ChatMessage a quem de fato a publicou (ChatMessage::verify)
@@ -187,7 +195,11 @@ impl P2PNode {
                     .mesh_n_low(1)       // Mínimo D_lo = 1 (enxerta par assim que houver 1 conectado)
                     .mesh_n_high(12)     // Máximo D_hi
                     .mesh_outbound_min(0)// D_out = 0 (permite malhas com apenas 1 nó sem forçar outbound)
-                    .flood_publish(true) // Publica para todos os pares inscritos no tópico imediatamente!
+                    .flood_publish(true); // Publica para todos os pares inscritos no tópico imediatamente!
+                if options.validate_messages {
+                    gossip_builder.validate_messages();
+                }
+                let gossip_config = gossip_builder
                     .build()
                     .map_err(|e| NodeError::SwarmInit(e.to_string()))
                     .expect("Configuração GossipSub válida");
@@ -250,11 +262,25 @@ impl P2PNode {
                     .then(|| {
                         // O padrão do libp2p (128 KB e 2 min por circuito) só serve para sinalização;
                         // nossos relays carregam chat, voz e arquivos de quem não consegue hole punching
-                        let config = libp2p::relay::Config {
+                        let mut config = libp2p::relay::Config {
                             max_circuit_duration: Duration::from_secs(3600),
                             max_circuit_bytes: 1 << 30,
                             ..Default::default()
                         };
+                        if let Some(relay_access) = options.relay_access.clone() {
+                            let ra_res = relay_access.clone();
+                            config.reservation_rate_limiters.push(Box::new(
+                                move |peer: PeerId, addr: &Multiaddr, _now: std::time::Instant| {
+                                    ra_res.check_relay_access(&peer, addr)
+                                },
+                            ));
+                            let ra_circ = relay_access;
+                            config.circuit_src_rate_limiters.push(Box::new(
+                                move |peer: PeerId, addr: &Multiaddr, _now: std::time::Instant| {
+                                    ra_circ.check_relay_access(&peer, addr)
+                                },
+                            ));
+                        }
                         libp2p::relay::Behaviour::new(key.public().to_peer_id(), config)
                     })
                     .into();

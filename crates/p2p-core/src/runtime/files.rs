@@ -228,8 +228,27 @@ impl Runtime {
         let actions = match event {
             request_response::Event::Message { peer, message, .. } => match message {
                 request_response::Message::Request { request, channel, .. } => {
-                    // Arquivo de servidor: só responde a membros do grupo cifrado
                     let requester = pubkey_hex_from_peer_id(&peer);
+                    let requester_pk = requester
+                        .clone()
+                        .unwrap_or_else(|| peer.to_string())
+                        .to_lowercase();
+                    if self.check_node_firewall(
+                        Some(peer),
+                        &requester_pk,
+                        crate::firewall::FirewallCategory::ChunkRequest,
+                        super::now_secs(),
+                    ) != crate::firewall::FirewallVerdict::Allowed
+                    {
+                        let _ = self
+                            .node
+                            .swarm
+                            .behaviour_mut()
+                            .files
+                            .send_response(channel, swarm_files::FileResponse::NotFound);
+                        return;
+                    }
+                    // Arquivo de servidor: só responde a membros do grupo cifrado
                     let mls = &self.mls;
                     let allow = |topic: &str| match community::parse_server_content_topic(topic) {
                         Some(server_id) => requester.as_ref().is_some_and(|pk| mls.members(server_id).contains(pk)),

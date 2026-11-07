@@ -568,3 +568,77 @@ async def dm_asymmetric_firewall(lab):
             desc=f"Carol receber DM {i}/5 da amiga Alice sem bloqueio",
         )
 
+
+@scenario("NodeFirewall no Lobby: Flood de Chat Bloqueado sem Degradar Nós Honestos")
+async def lobby_firewall_flood(lab):
+    alice = lab.public("alice")
+    bob = lab.public("bob")
+    mallory = lab.public("mallory")
+    await lab.up()
+
+    await bob.start("--no-discovery")
+    await alice.start("--no-discovery", "--connect", bob.address)
+    await mallory.start("--no-discovery", "--connect", bob.address)
+
+    await bob.wait("PeerIdentified", where=lambda p: p["nick"] == "Alice", desc="Bob ver Alice")
+    await bob.wait("PeerIdentified", where=lambda p: p["nick"] == "Mallory", desc="Bob ver Mallory")
+
+    lab.step("Bob configura firewall.stranger_chat_per_10s = 4")
+    bob.send({"SetConfig": {"key": "firewall.stranger_chat_per_10s", "value": "4"}})
+    await bob.wait("ConfigUpdated", where=lambda c: c["key"] == "firewall.stranger_chat_per_10s")
+
+    lab.step("Mallory inunda o Lobby com 7 mensagens seguidas; Bob aceita 4 e bloqueia Mallory na 5ª")
+    since_flood = bob.mark()
+    for i in range(1, 8):
+        mallory.send({"SendMessage": f"spam lobby {i}"})
+
+    for i in range(1, 5):
+        await bob.wait(
+            "ChatMessage",
+            where=lambda m, i=i: m["author"] == "Mallory" and m["text"] == f"spam lobby {i}",
+            since=since_flood,
+            desc=f"Bob receber mensagem {i}/4 antes do limite",
+        )
+
+    blocked = await bob.wait(
+        "PeerBlocked",
+        where=lambda b: b["pubkey"] == mallory.pubkey and b["offense_level"] == 1,
+        since=since_flood,
+        desc="NodeFirewall de Bob bloquear Mallory no flood de chat",
+    )
+    if blocked["duration_secs"] != 60:
+        raise StepFailed(f"Duração do bloqueio nível 1 deveria ser 60s: {blocked}")
+
+    lab.step("Enquanto Mallory está bloqueado, Alice conversa normalmente com Bob no Lobby sem degradação")
+    since_after_block = bob.mark()
+    mallory.send({"SendMessage": "spam bloqueado invisivel"})
+    alice.send({"SendMessage": "mensagem honesta da Alice"})
+
+    await bob.wait(
+        "ChatMessage",
+        where=lambda m: m["author"] == "Alice" and m["text"] == "mensagem honesta da Alice",
+        since=since_after_block,
+        desc="Bob receber mensagem de Alice normalmente durante ataque de Mallory",
+    )
+    await bob.expect_none(
+        "ChatMessage",
+        where=lambda m: m["text"] == "spam bloqueado invisivel",
+        during=2,
+        since=since_after_block,
+        desc="mensagem de Mallory bloqueado",
+    )
+
+    lab.step("Bob desbloqueia Mallory manualmente (/firewall unblock) e Mallory volta a falar")
+    bob.send({"UnblockPeer": "Mallory"})
+    await bob.wait("PeerUnblocked", where=lambda u: u["pubkey"] == mallory.pubkey, desc="Mallory desbloqueado")
+
+    since_unblocked = bob.mark()
+    mallory.send({"SendMessage": "desculpa pessoal"})
+    await bob.wait(
+        "ChatMessage",
+        where=lambda m: m["author"] == "Mallory" and m["text"] == "desculpa pessoal",
+        since=since_unblocked,
+        desc="Bob voltar a receber mensagem de Mallory após desbloqueio",
+    )
+
+

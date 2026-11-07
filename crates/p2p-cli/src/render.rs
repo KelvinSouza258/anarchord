@@ -534,6 +534,14 @@ fn config_status(cfg: &NodeConfig, used_bytes: u64, envelope_count: usize) -> Ve
             dm.friend_max_message_bytes, dm.stranger_max_message_bytes, dm.stranger_offline_limit_per_hour
         ),
         format!(
+            "   firewall.exempt_friends = {} | firewall.relay_friends_only = {} | firewall.invalid_packets_per_min = {} | firewall.stranger_global_msgs_per_10s = {}",
+            cfg.firewall.exempt_friends, cfg.firewall.relay_friends_only, cfg.firewall.invalid_packets_per_min, cfg.firewall.stranger_global_msgs_per_10s
+        ),
+        format!(
+            "   firewall.friend_chat_per_10s = {} | firewall.stranger_chat_per_10s = {} | firewall.friend_control_per_10s = {} | firewall.stranger_control_per_10s = {}",
+            cfg.firewall.friend_chat_per_10s, cfg.firewall.stranger_chat_per_10s, cfg.firewall.friend_control_per_10s, cfg.firewall.stranger_control_per_10s
+        ),
+        format!(
             "   network.default_channel = {} | network.auto_bootstrap = {} | network.max_peers = {} | network.listen_port = {}",
             net.default_channel, net.auto_bootstrap, net.max_peers, net.listen_port
         ),

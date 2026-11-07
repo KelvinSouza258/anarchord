@@ -2,6 +2,7 @@ pub mod b64;
 pub mod config;
 pub mod dm;
 pub mod files;
+pub mod firewall;
 pub mod runtime;
 pub mod sniffer;
 pub mod wire;
@@ -21,7 +22,10 @@ pub use identity::{
     EncryptionKeyAdvertisement, FriendEntry, FriendState, IdentityKeys, KeyPairInfo,
     SignedEncryptionKeyAdvertisement, UserIdentity,
 };
-pub use config::NodeConfig;
+pub use config::{FirewallConfig, NodeConfig};
+pub use firewall::{
+    FirewallBlockEntry, FirewallCategory, FirewallVerdict, NodeFirewall, RelayAccessControl,
+};
 pub use dm::{
     dm_topic, DirectMessageEnvelope, DmWireMessage, FriendRequest, FriendResponse, MailboxMessage,
     StoredEnvelope,

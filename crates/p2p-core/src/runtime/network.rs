@@ -161,6 +161,27 @@ impl Runtime {
             SwarmEvent::NewListenAddr { address, .. } => self.emit(CoreEvent::Network(NetworkEvent::Listening(address.to_string()))),
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                 let address = endpoint.get_remote_address().clone();
+                let peer_pk = pubkey_hex_from_peer_id(&peer_id);
+                let is_friend = peer_pk.as_deref().is_some_and(|pk| {
+                    self.identity
+                        .get_friends()
+                        .iter()
+                        .any(|f| f.public_key.eq_ignore_ascii_case(pk))
+                });
+                let verdict = self.dm.firewall.check_incoming_connection(
+                    &peer_id,
+                    peer_pk.as_deref(),
+                    &address,
+                    is_friend,
+                    &self.dm.node_config.firewall,
+                    super::now_secs(),
+                );
+                if verdict != crate::firewall::FirewallVerdict::Allowed {
+                    tracing::debug!("Conexão recusada pelo NodeFirewall para {} ({}): {:?}", peer_id, address, verdict);
+                    self.node.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
+                    let _ = self.node.swarm.disconnect_peer_id(peer_id);
+                    return;
+                }
                 // Do lado de quem recebe, o endereço de uma conexão relayada é só /p2p/<id>
                 let relayed = endpoint.is_relayed();
                 // Guarda a primeira conexão e a primeira direta (ex.: depois do hole punching). Só
@@ -185,6 +206,7 @@ impl Runtime {
                     self.dialed_open.remove(address);
                 }
                 if num_established == 0 {
+                    self.dm.firewall.on_connection_closed(&peer_id);
                     self.connected_peers.remove(&peer_id);
                     self.links.remove(&peer_id);
                     self.discovery.addresses.remove(&peer_id);
@@ -272,7 +294,11 @@ impl Runtime {
                     self.publish_channel_members();
                 }
             }
-            SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => self.on_gossip_message(message),
+            SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                propagation_source,
+                message_id,
+                message,
+            })) => self.on_gossip_message(propagation_source, message_id, message),
             SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(list))) => {
                 // Um par anuncia vários endereços: disca uma vez por par, com todos eles,
                 // e só se não houver conexão nem discagem em andamento
@@ -355,8 +381,74 @@ impl Runtime {
         }
     }
 
+    /// Avalia um pacote/evento no `NodeFirewall` unificado e, se resultar em novo bloqueio,
+    /// emite `CoreEvent::PeerBlocked` e adiciona o par à blacklist do Gossipsub.
+    pub(super) fn check_node_firewall(
+        &mut self,
+        peer_id_opt: Option<PeerId>,
+        pubkey: &str,
+        category: crate::firewall::FirewallCategory,
+        now: u64,
+    ) -> crate::firewall::FirewallVerdict {
+        let clean_pk = pubkey.trim().to_lowercase();
+        let is_friend = self
+            .identity
+            .get_friends()
+            .iter()
+            .any(|f| f.public_key.eq_ignore_ascii_case(&clean_pk));
+        let verdict = self.dm.firewall.check_packet(
+            &clean_pk,
+            is_friend,
+            category,
+            &self.dm.node_config.firewall,
+            now,
+        );
+        if let crate::firewall::FirewallVerdict::NewlyBlocked {
+            ref reason,
+            duration_secs,
+            blocked_until,
+            offense_level,
+            send_courtesy,
+        } = verdict
+        {
+            if let Some(pid) = peer_id_opt.or_else(|| crate::api::peer_id_from_pubkey_hex(&clean_pk)) {
+                self.node.swarm.behaviour_mut().gossipsub.blacklist_peer(&pid);
+            }
+            let peer_name = self.friendly_name(&clean_pk);
+            self.emit(CoreEvent::PeerBlocked {
+                pubkey: clean_pk,
+                peer_name,
+                is_friend,
+                reason: reason.clone(),
+                duration_secs,
+                blocked_until,
+                offense_level,
+                courtesy_sent: send_courtesy,
+            });
+        }
+        verdict
+    }
+
+    fn report_gossip_validation(
+        &mut self,
+        message_id: &gossipsub::MessageId,
+        propagation_source: &PeerId,
+        acceptance: gossipsub::MessageAcceptance,
+    ) {
+        let _ = self
+            .node
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .report_message_validation_result(message_id, propagation_source, acceptance);
+    }
+
     /// Alguém entrou num tópico: presença, keyframe para quem começou a assistir, cadeia de servidor e mailbox offline
     fn on_subscribed(&mut self, peer_id: PeerId, topic: gossipsub::TopicHash) {
+        let peer_pk = pubkey_hex_from_peer_id(&peer_id).unwrap_or_else(|| peer_id.to_string());
+        if self.dm.firewall.is_blocked(&peer_pk, super::now_secs()) {
+            return;
+        }
         if topic.as_str() == crate::dm::MAILBOX_TOPIC {
             self.on_peer_subscribed_mailbox(peer_id);
         }
@@ -389,15 +481,66 @@ impl Runtime {
 
     /// Mensagem num tópico. O tipo vem no envelope; conteúdo de servidor chega cifrado com MLS
     /// (que também autentica quem enviou: quem não está no grupo não produz nada que decifre).
-    fn on_gossip_message(&mut self, message: gossipsub::Message) {
+    fn on_gossip_message(
+        &mut self,
+        propagation_source: PeerId,
+        message_id: gossipsub::MessageId,
+        message: gossipsub::Message,
+    ) {
         let topic = message.topic.as_str().to_string();
+        let sender_peer_id = message.source.unwrap_or(propagation_source);
+        let sender_pubkey = pubkey_hex_from_peer_id(&sender_peer_id)
+            .unwrap_or_else(|| sender_peer_id.to_string())
+            .to_lowercase();
+        let now = super::now_secs();
+
+        // Portão Estágio 1 (Pré-decodificação O(1)):
+        // 1.1: Par já bloqueado no NodeFirewall -> descarta e não repassa na malha
+        if self.dm.firewall.is_blocked(&sender_pubkey, now) {
+            self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
+            return;
+        }
+        // 1.2: Filtro estrito de tamanho máximo por tópico e discriminador Wire
+        let max_bytes = crate::firewall::NodeFirewall::max_packet_bytes_for_topic(&topic, &message.data);
+        if message.data.len() > max_bytes {
+            tracing::debug!(
+                "Pacote excedeu tamanho máximo do tópico {} ({} > {}B) de {}",
+                topic,
+                message.data.len(),
+                max_bytes,
+                sender_peer_id
+            );
+            self.check_node_firewall(
+                Some(sender_peer_id),
+                &sender_pubkey,
+                crate::firewall::FirewallCategory::InvalidPacket,
+                now,
+            );
+            self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
+            return;
+        }
+
         let src_str = message.source.as_ref().map(|p| p.to_string());
         if let Some(server_id) = community::parse_server_control_topic(&topic).map(str::to_string) {
             self.sniff_packet("RX", &topic, src_str, &message.data, None);
             let from = message.source.as_ref().and_then(pubkey_hex_from_peer_id);
             return match wire::decode_as(&message.data) {
-                Ok(server_message) => self.handle_server_network_message(&server_id, server_message, from.as_deref()),
+                Ok(server_message) => {
+                    if self.check_node_firewall(
+                        Some(sender_peer_id),
+                        &sender_pubkey,
+                        crate::firewall::FirewallCategory::Control,
+                        now,
+                    ) == crate::firewall::FirewallVerdict::Allowed
+                    {
+                        self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Accept);
+                        self.handle_server_network_message(&server_id, server_message, from.as_deref());
+                    } else {
+                        self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
+                    }
+                }
                 Err(wire::WireError::Version(ver)) => {
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
                     if let Some(peer_id) = message.source {
                         if self.warned_incompatible.insert(peer_id) {
                             let (nick, pubkey) = self
@@ -416,7 +559,16 @@ impl Runtime {
                     }
                     tracing::debug!("Mensagem de servidor em versão incompatível (v{}) descartada", ver);
                 }
-                Err(e) => tracing::debug!("Mensagem de servidor ilegível: {}", e),
+                Err(e) => {
+                    self.check_node_firewall(
+                        Some(sender_peer_id),
+                        &sender_pubkey,
+                        crate::firewall::FirewallCategory::InvalidPacket,
+                        now,
+                    );
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
+                    tracing::debug!("Mensagem de servidor ilegível: {}", e);
+                }
             };
         }
         let raw_data = message.data.clone();
@@ -431,6 +583,7 @@ impl Runtime {
                 }
                 Err(e) => {
                     self.sniff_packet("RX", &topic, src_str, &raw_data, None);
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
                     return tracing::debug!("Conteúdo de servidor não decifrado: {}", e);
                 }
             }
@@ -442,6 +595,7 @@ impl Runtime {
         let incoming = match wire::decode(&data) {
             Ok(incoming) => incoming,
             Err(wire::WireError::Version(ver)) => {
+                self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
                 if let Some(peer_id) = message.source {
                     if self.warned_incompatible.insert(peer_id) {
                         let (nick, pubkey) = self
@@ -468,17 +622,57 @@ impl Runtime {
                 }
                 return tracing::debug!("Mensagem descartada em {} (versão v{} incompatível)", topic, ver);
             }
-            Err(e) => return tracing::debug!("Mensagem descartada em {}: {}", topic, e),
+            Err(e) => {
+                self.check_node_firewall(
+                    Some(sender_peer_id),
+                    &sender_pubkey,
+                    crate::firewall::FirewallCategory::InvalidPacket,
+                    now,
+                );
+                self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
+                return tracing::debug!("Mensagem descartada em {}: {}", topic, e);
+            }
         };
         let source = message.source;
         match incoming {
             Incoming::Chat(chat) => {
                 let matches = sender_matches(&chat.author_pubkey);
-                self.on_chat_message(chat, source.as_ref(), matches)
+                if !matches || !chat.verify(source.as_ref()) {
+                    // Anti-Incriminação: pune exclusivamente o `sender_pubkey` autenticado pelo transporte (`message.source`)
+                    self.check_node_firewall(
+                        Some(sender_peer_id),
+                        &sender_pubkey,
+                        crate::firewall::FirewallCategory::InvalidPacket,
+                        now,
+                    );
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
+                    return;
+                }
+                if self.check_node_firewall(
+                    Some(sender_peer_id),
+                    &sender_pubkey,
+                    crate::firewall::FirewallCategory::Chat,
+                    now,
+                ) == crate::firewall::FirewallVerdict::Allowed
+                {
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Accept);
+                    self.on_chat_message(chat, source.as_ref(), matches);
+                } else {
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
+                }
             }
             Incoming::Voice(packet) => {
                 if sender_matches(&packet.sender_pubkey) {
-                    self.on_voice_packet(packet)
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Accept);
+                    self.on_voice_packet(packet);
+                } else {
+                    self.check_node_firewall(
+                        Some(sender_peer_id),
+                        &sender_pubkey,
+                        crate::firewall::FirewallCategory::InvalidPacket,
+                        now,
+                    );
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
                 }
             }
             Incoming::Swarm(swarm) => {
@@ -491,26 +685,93 @@ impl Runtime {
                     }
                     _ => true,
                 };
-                if let (true, Some(source)) = (authentic, source) {
-                    let actions = self.files.engine.on_gossip(source, &topic, swarm, std::time::Instant::now());
-                    self.apply_file_actions(actions);
+                if !authentic {
+                    self.check_node_firewall(
+                        Some(sender_peer_id),
+                        &sender_pubkey,
+                        crate::firewall::FirewallCategory::InvalidPacket,
+                        now,
+                    );
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
+                    return;
+                }
+                if self.check_node_firewall(
+                    Some(sender_peer_id),
+                    &sender_pubkey,
+                    crate::firewall::FirewallCategory::Control,
+                    now,
+                ) == crate::firewall::FirewallVerdict::Allowed
+                {
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Accept);
+                    if let Some(source) = source {
+                        let actions = self.files.engine.on_gossip(source, &topic, swarm, std::time::Instant::now());
+                        self.apply_file_actions(actions);
+                    }
+                } else {
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
                 }
             }
             Incoming::ScreenFrame(packet) => {
                 if sender_matches(&packet.sender_pubkey) {
-                    self.on_screen_frame(packet)
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Accept);
+                    self.on_screen_frame(packet);
+                } else {
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
                 }
             }
             Incoming::ScreenAnnounce(announce) => {
-                if sender_matches(&announce.sender_pubkey) {
-                    self.on_screen_announce(announce, &topic)
+                if sender_matches(&announce.sender_pubkey)
+                    && self.check_node_firewall(
+                        Some(sender_peer_id),
+                        &sender_pubkey,
+                        crate::firewall::FirewallCategory::Control,
+                        now,
+                    ) == crate::firewall::FirewallVerdict::Allowed
+                {
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Accept);
+                    self.on_screen_announce(announce, &topic);
+                } else {
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
                 }
             }
-            Incoming::Peers(list) => self.on_peer_list(source, list),
-            Incoming::Server(_) => tracing::debug!("Mensagem de servidor fora do tópico de controle descartada"),
-            Incoming::DirectMessage(dm_msg) => self.on_dm_wire_message(dm_msg),
-            Incoming::Mailbox(mb_msg) => self.on_mailbox_message(mb_msg),
+            Incoming::Peers(list) => {
+                if self.check_node_firewall(
+                    Some(sender_peer_id),
+                    &sender_pubkey,
+                    crate::firewall::FirewallCategory::Control,
+                    now,
+                ) == crate::firewall::FirewallVerdict::Allowed
+                {
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Accept);
+                    self.on_peer_list(source, list);
+                } else {
+                    self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
+                }
+            }
+            Incoming::Server(_) => {
+                self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Reject);
+                tracing::debug!("Mensagem de servidor fora do tópico de controle descartada");
+            }
+            Incoming::DirectMessage(dm_msg) => {
+                self.on_dm_wire_message(dm_msg);
+                let acceptance = if self.dm.firewall.is_blocked(&sender_pubkey, now) {
+                    gossipsub::MessageAcceptance::Ignore
+                } else {
+                    gossipsub::MessageAcceptance::Accept
+                };
+                self.report_gossip_validation(&message_id, &propagation_source, acceptance);
+            }
+            Incoming::Mailbox(mb_msg) => {
+                self.on_mailbox_message(mb_msg);
+                let acceptance = if self.dm.firewall.is_blocked(&sender_pubkey, now) {
+                    gossipsub::MessageAcceptance::Ignore
+                } else {
+                    gossipsub::MessageAcceptance::Accept
+                };
+                self.report_gossip_validation(&message_id, &propagation_source, acceptance);
+            }
             Incoming::Unknown { version, kind, len } => {
+                self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
                 tracing::debug!(
                     "Tipo de mensagem desconhecido ignorado com segurança em {} (v{}, kind={}, {}B)",
                     topic,

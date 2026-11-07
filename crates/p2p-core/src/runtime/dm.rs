@@ -254,8 +254,9 @@ impl Runtime {
 
         let topic_str = self.subscribe_dm_with(&peer_pk);
         let online = self.is_pubkey_online(&peer_pk);
+        let subscribed_dm = self.is_peer_subscribed_to_dm(&peer_pk);
 
-        if online {
+        if online && subscribed_dm {
             // Garante envio de oferta de chave efêmera e cifra a DM
             self.send_ephemeral_key_offer(&peer_pk);
             let session_key = self
@@ -274,6 +275,48 @@ impl Runtime {
                     let wire_msg = DmWireMessage::Message(envelope);
                     let bytes = wire::encode(&wire_msg);
                     let _ = self.publish_gossip(IdentTopic::new(topic_str), bytes);
+                    self.emit(CoreEvent::DirectMessage {
+                        peer_pubkey: peer_pk,
+                        peer_name,
+                        author: self.nick.clone(),
+                        author_pubkey: self.my_pubkey(),
+                        text: text.to_string(),
+                        timestamp: now_ms,
+                        offline_delivery: false,
+                    });
+                }
+                Err(e) => self.error(CoreError::Friend(e.to_string())),
+            }
+        } else if online {
+            // O par está conectado no Swarm, mas ainda não completou o Gossipsub Subscribe do tópico mútuo de DM:
+            // envia via MailboxMessage::Deliver no MAILBOX_TOPIC (no qual todo nó se inscreve no boot) e também no tópico de DM!
+            self.send_ephemeral_key_offer(&peer_pk);
+            let session_key = self
+                .dm
+                .sessions
+                .get(&peer_pk)
+                .and_then(|s| s.shared_session_key);
+            match DirectMessageEnvelope::seal(
+                &self.identity,
+                &peer_pk,
+                text,
+                now_ms,
+                session_key.as_ref(),
+            ) {
+                Ok(envelope) => {
+                    let wire_msg = DmWireMessage::Message(envelope);
+                    let bytes = wire::encode(&wire_msg);
+                    let _ = self.publish_gossip(IdentTopic::new(topic_str), bytes);
+                    if let Ok(stored) = StoredEnvelope::create_signed_and_sealed(
+                        &self.identity,
+                        &peer_pk,
+                        text,
+                        now_ms,
+                        suggested_ttl,
+                    ) {
+                        let mb_msg = MailboxMessage::Deliver(stored);
+                        let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), wire::encode(&mb_msg));
+                    }
                     self.emit(CoreEvent::DirectMessage {
                         peer_pubkey: peer_pk,
                         peer_name,
@@ -589,6 +632,9 @@ impl Runtime {
                                 if send_courtesy {
                                     self.send_courtesy_block_notice(&sender_pk, &reason, duration_secs, now);
                                 }
+                                if let Some(pid) = crate::api::peer_id_from_pubkey_hex(&sender_pk) {
+                                    self.node.swarm.behaviour_mut().gossipsub.blacklist_peer(&pid);
+                                }
                             }
                         }
                     }
@@ -802,6 +848,7 @@ impl Runtime {
                     .get_friends()
                     .iter()
                     .any(|f| f.public_key.eq_ignore_ascii_case(&sender_pk));
+                let sender_online = self.is_pubkey_online(&sender_pk);
                 let peer_name = self
                     .identity
                     .get_friends()
@@ -815,7 +862,7 @@ impl Runtime {
                     &sender_pk,
                     is_my_friend,
                     payload.text.len(),
-                    true,
+                    !sender_online,
                     &self.dm.node_config.dm,
                     now,
                 ) {
@@ -827,7 +874,7 @@ impl Runtime {
                             author_pubkey: payload.sender_pubkey,
                             text: payload.text,
                             timestamp: payload.timestamp,
-                            offline_delivery: true,
+                            offline_delivery: !sender_online,
                         });
                     }
                     DmFirewallVerdict::DroppedSilently { .. } => {
@@ -850,8 +897,11 @@ impl Runtime {
                             offense_level,
                             courtesy_sent: send_courtesy,
                         });
-                        if send_courtesy && self.is_pubkey_online(&sender_pk) {
+                        if send_courtesy && sender_online {
                             self.send_courtesy_block_notice(&sender_pk, &reason, duration_secs, now);
+                        }
+                        if let Some(pid) = crate::api::peer_id_from_pubkey_hex(&sender_pk) {
+                            self.node.swarm.behaviour_mut().gossipsub.blacklist_peer(&pid);
                         }
                     }
                 }
@@ -890,17 +940,29 @@ impl Runtime {
             reason,
             self.nick
         );
+        let now_ms = super::now_millis();
         // Usa Sealed Box direto (None para session_key) para que mesmo um desconhecido sem handshake de sessão completo decifre na hora!
-        if let Ok(envelope) = DirectMessageEnvelope::seal(
+        if self.is_peer_subscribed_to_dm(recipient_pubkey) {
+            if let Ok(envelope) = DirectMessageEnvelope::seal(
+                &self.identity,
+                recipient_pubkey,
+                &courtesy_text,
+                now_ms,
+                None,
+            ) {
+                let wire_msg = DmWireMessage::Message(envelope);
+                let bytes = wire::encode(&wire_msg);
+                let _ = self.publish_gossip(IdentTopic::new(topic_str), bytes);
+            }
+        } else if let Ok(stored) = StoredEnvelope::create_signed_and_sealed(
             &self.identity,
             recipient_pubkey,
             &courtesy_text,
-            super::now_millis(),
+            now_ms,
             None,
         ) {
-            let wire_msg = DmWireMessage::Message(envelope);
-            let bytes = wire::encode(&wire_msg);
-            let _ = self.publish_gossip(IdentTopic::new(topic_str), bytes);
+            let mb_msg = MailboxMessage::Deliver(stored);
+            let _ = self.publish_gossip(IdentTopic::new(MAILBOX_TOPIC), wire::encode(&mb_msg));
         }
     }
 
@@ -949,9 +1011,16 @@ impl Runtime {
     }
 
     /// Reage ao término de cooldown ou desbloqueio de um par (Issue #73):
-    /// Limpa cooldowns locais e descarrega envelopes retidos na Outbox para guardiões ou entrega direta.
+    /// Limpa cooldowns locais, remove da blacklist do Gossipsub e descarrega envelopes retidos na Outbox.
     pub(super) fn on_peer_unblocked(&mut self, peer_pubkey: &str) {
         let clean_pk = peer_pubkey.trim().to_lowercase();
+        if let Some(pid) = crate::api::peer_id_from_pubkey_hex(&clean_pk) {
+            self.node
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .remove_blacklisted_peer(&pid);
+        }
         self.dm.remove_peer_cooldown(&clean_pk);
         let my_pk = self.identity.public_key_hex();
         let pending = self.dm.mailbox.pending_outbox_for(&my_pk, &clean_pk);
@@ -1037,6 +1106,28 @@ impl Runtime {
 
         // Entrega oportunista se guardamos envelopes destinados a este par (mesmo sem ser nosso amigo!)
         self.deliver_pending_for(&clean_pk);
+    }
+
+    /// Verifica se o par `pubkey` está inscrito no tópico determinístico de DM conosco
+    fn is_peer_subscribed_to_dm(&self, pubkey: &str) -> bool {
+        let topic_str = dm_topic(&self.my_pubkey(), pubkey);
+        let dm_hash = IdentTopic::new(&topic_str).hash();
+        self.node
+            .swarm
+            .behaviour()
+            .gossipsub
+            .all_peers()
+            .filter(|(_, topics)| topics.contains(&&dm_hash))
+            .any(|(peer, _)| {
+                self.peer_metadata
+                    .get(peer)
+                    .map(|(_, pk)| pk.eq_ignore_ascii_case(pubkey))
+                    .or_else(|| {
+                        crate::api::pubkey_hex_from_peer_id(peer)
+                            .map(|pk| pk.eq_ignore_ascii_case(pubkey))
+                    })
+                    .unwrap_or(false)
+            })
     }
 
     /// Verifica se o par `pubkey` está conectado E já anunciou inscrição no tópico `MAILBOX_TOPIC` do Gossipsub
@@ -1165,6 +1256,10 @@ impl Runtime {
     pub(super) fn set_config(&mut self, key: &str, value: &str) {
         match self.dm.node_config.set_key(key, value) {
             Ok(()) => {
+                self.dm
+                    .firewall
+                    .relay_access()
+                    .set_friends_only(self.dm.node_config.firewall.relay_friends_only);
                 let _ = self.dm.node_config.save(self.dm.config_path.as_deref());
                 self.emit(CoreEvent::ConfigUpdated {
                     key: key.trim().to_string(),

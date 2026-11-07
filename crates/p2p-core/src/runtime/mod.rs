@@ -264,6 +264,11 @@ impl Runtime {
             .protocol_capabilities
             .clone()
             .unwrap_or_else(crate::wire::ProtocolCapabilities::local);
+        let now = now_secs();
+        let dm = dm::DmState::new(config.config_path.clone(), Some(config.servers_dir.join("mailbox.json")), now);
+        let relay_access = dm.firewall.relay_access();
+        relay_access.set_friends_only(dm.node_config.firewall.relay_friends_only);
+        relay_access.update_friends(identity.get_friends().iter().map(|f| f.public_key.clone()));
         let mut node = P2PNode::with_options(
             identity.clone(),
             crate::node::NodeOptions {
@@ -273,14 +278,14 @@ impl Runtime {
                 lab: config.lab,
                 mdns: config.mdns,
                 capabilities: Some(local_capabilities.clone()),
+                validate_messages: true,
+                relay_access: Some(relay_access),
             },
         )?;
         let mut relay_manager = RelayManager::new();
         relay_manager.allow_private(config.lab);
-        let now = now_secs();
         let servers = ServerRegistry::load(config.servers_dir.clone(), now)?;
         let mls = ServerGroups::new(&identity, Some(config.servers_dir.join("mls-state.json")));
-        let dm = dm::DmState::new(config.config_path.clone(), Some(config.servers_dir.join("mailbox.json")), now);
         let active = ActiveChannel::new(Space::Lobby, config.channel.clone());
         node.swarm.behaviour_mut().gossipsub.subscribe(&active.topic).map_err(|e| CoreStartError::Subscribe(format!("{:?}", e)))?;
         let screen = screen::ScreenState::new(&mut node);
@@ -606,8 +611,12 @@ impl Runtime {
         })
     }
 
-    /// Salva a identidade no disco se houver caminho configurado
+    /// Salva a identidade no disco se houver caminho configurado e sincroniza a lista de amigos no `RelayAccessControl`
     fn persist_identity(&self) {
+        self.dm
+            .firewall
+            .relay_access()
+            .update_friends(self.identity.get_friends().iter().map(|f| f.public_key.clone()));
         if let Some(path) = &self.config.identity_path {
             let _ = self.identity.save_to(path);
         }
