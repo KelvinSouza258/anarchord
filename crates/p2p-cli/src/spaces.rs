@@ -32,11 +32,7 @@ pub fn parse_server_command(rest: &str) -> ServerCommand {
         "mod" => {
             let mut parts = args.split_whitespace();
             match (parts.next(), parts.next(), parts.next()) {
-                (Some("add"), Some(target), level) => match level.map(str::parse::<u8>) {
-                    None => Some(ServerCommand::AddModerator { target: target.to_string(), level: 1 }),
-                    Some(Ok(level)) if level >= 1 => Some(ServerCommand::AddModerator { target: target.to_string(), level }),
-                    _ => None,
-                },
+                (Some("add"), Some(target), None) => Some(ServerCommand::AddModerator { target: target.to_string() }),
                 (Some("remove"), Some(target), None) => Some(ServerCommand::RemoveModerator(target.to_string())),
                 _ => None,
             }
@@ -54,8 +50,17 @@ pub fn parse_server_command(rest: &str) -> ServerCommand {
             non_empty(target).map(|target| ServerCommand::Ban { target, duration, reason })
         }
         "unban" => non_empty(args).map(ServerCommand::Unban),
-        "allow" => non_empty(args).map(ServerCommand::Allow),
-        "disallow" => non_empty(args).map(ServerCommand::Disallow),
+        "revoke" => non_empty(args).map(ServerCommand::Revoke),
+        "tsa" => {
+            let mut parts = args.split_whitespace();
+            match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some("add"), Some(name), Some(url), Some(key)) => {
+                    Some(ServerCommand::AddTsa { name: name.to_string(), url: url.to_string(), public_key_b64: key.to_string() })
+                }
+                (Some("remove"), Some(name), None, None) => Some(ServerCommand::RemoveTsa(name.to_string())),
+                _ => None,
+            }
+        }
         "close" => Some(ServerCommand::Close),
         "open" => Some(ServerCommand::Open),
         "rotate-key" | "rotate" => Some(ServerCommand::RotateKey),
@@ -64,9 +69,16 @@ pub fn parse_server_command(rest: &str) -> ServerCommand {
             match parts.next() {
                 Some("issue") => {
                     let target = parts.next().unwrap_or_default();
-                    let level = parts.next().and_then(|l| l.parse::<u8>().ok()).unwrap_or(255);
-                    let duration = parts.next().and_then(parse_duration).flatten();
-                    non_empty(target).map(|target| ServerCommand::IssuePassport { target, level, duration })
+                    let mut moderator = false;
+                    let mut duration = None;
+                    for arg in parts {
+                        match arg {
+                            "mod" | "moderador" => moderator = true,
+                            "membro" | "member" => moderator = false,
+                            other => duration = parse_duration(other).flatten(),
+                        }
+                    }
+                    non_empty(target).map(|target| ServerCommand::IssuePassport { target, moderator, duration })
                 }
                 Some("show") => Some(ServerCommand::ShowPassport),
                 Some("flatten") => Some(ServerCommand::FlattenPassport),
@@ -100,8 +112,7 @@ mod tests {
         assert_eq!(parse_server_command("switch lobby"), ServerCommand::Switch("lobby".into()));
         assert_eq!(parse_server_command("channel add #jogos"), ServerCommand::AddChannel { name: "jogos".into(), voice: false });
         assert_eq!(parse_server_command("channel add papo voz"), ServerCommand::AddChannel { name: "papo".into(), voice: true });
-        assert_eq!(parse_server_command("mod add Bob"), ServerCommand::AddModerator { target: "Bob".into(), level: 1 });
-        assert_eq!(parse_server_command("mod add Bob 2"), ServerCommand::AddModerator { target: "Bob".into(), level: 2 });
+        assert_eq!(parse_server_command("mod add Bob"), ServerCommand::AddModerator { target: "Bob".into() });
         assert_eq!(parse_server_command("mod remove Bob"), ServerCommand::RemoveModerator("Bob".into()));
         assert_eq!(
             parse_server_command("ban Bob spam no canal"),
@@ -114,8 +125,12 @@ mod tests {
         assert_eq!(parse_server_command("ban Bob perm"), ServerCommand::Ban { target: "Bob".into(), duration: None, reason: String::new() });
         assert_eq!(parse_server_command("ban Bob"), ServerCommand::Ban { target: "Bob".into(), duration: None, reason: String::new() });
         assert_eq!(parse_server_command("unban Bob"), ServerCommand::Unban("Bob".into()));
-        assert_eq!(parse_server_command("allow Carol"), ServerCommand::Allow("Carol".into()));
-        assert_eq!(parse_server_command("disallow Carol"), ServerCommand::Disallow("Carol".into()));
+        assert_eq!(parse_server_command("revoke Carol"), ServerCommand::Revoke("Carol".into()));
+        assert_eq!(
+            parse_server_command("tsa add Minha https://tsa.exemplo/tsr MHYw"),
+            ServerCommand::AddTsa { name: "Minha".into(), url: "https://tsa.exemplo/tsr".into(), public_key_b64: "MHYw".into() }
+        );
+        assert_eq!(parse_server_command("tsa remove FreeTSA"), ServerCommand::RemoveTsa("FreeTSA".into()));
         assert_eq!(parse_server_command("close"), ServerCommand::Close);
         assert_eq!(parse_server_command("open"), ServerCommand::Open);
         assert_eq!(parse_server_command("rotate-key"), ServerCommand::RotateKey);
@@ -127,12 +142,12 @@ mod tests {
             ServerCommand::Policy { validity: 7 * 86_400, renewal_window: 2 * 86_400 }
         );
         assert_eq!(
-            parse_server_command("passport issue Carol 255 3d"),
-            ServerCommand::IssuePassport { target: "Carol".into(), level: 255, duration: Some(3 * 86_400) }
+            parse_server_command("passport issue Carol 3d"),
+            ServerCommand::IssuePassport { target: "Carol".into(), moderator: false, duration: Some(3 * 86_400) }
         );
         assert_eq!(
-            parse_server_command("passport issue Bob 2"),
-            ServerCommand::IssuePassport { target: "Bob".into(), level: 2, duration: None }
+            parse_server_command("passport issue Bob mod"),
+            ServerCommand::IssuePassport { target: "Bob".into(), moderator: true, duration: None }
         );
         assert_eq!(parse_server_command("passport show"), ServerCommand::ShowPassport);
         assert_eq!(parse_server_command("passport flatten"), ServerCommand::FlattenPassport);
@@ -140,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_incomplete_commands_show_help() {
-        for input in ["", "create", "join", "channel", "channel add", "mod", "mod add", "mod add Bob 0", "ban", "policy 2d 7d", "policy 7d", "xyz"] {
+        for input in ["", "create", "join", "channel", "channel add", "mod", "mod add", "mod add Bob 2", "tsa add x", "ban", "policy 2d 7d", "policy 7d", "xyz"] {
             assert_eq!(parse_server_command(input), ServerCommand::Help, "entrada: {:?}", input);
         }
     }

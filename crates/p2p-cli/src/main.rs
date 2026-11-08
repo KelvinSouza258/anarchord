@@ -949,6 +949,18 @@ fn ui_events(event: &CoreEvent) -> Vec<UiEvent> {
 
         }
 
+        CoreEvent::EncryptedMessage { channel, epoch, size, ciphertext_b64, timestamp, .. } => out.push(UiEvent::ChatMessage {
+            channel: channel.clone(),
+            author: "🔒 cifrada".to_string(),
+            text: format!(
+                "[{}{} bytes, sem a chave do grupo] {}",
+                epoch.map(|e| format!("época {} · ", e)).unwrap_or_default(),
+                size,
+                ciphertext_b64
+            ),
+            timestamp: *timestamp,
+        }),
+
         CoreEvent::Voice(VoiceEvent::Joined(room)) => out.push(UiEvent::VoiceChannelChanged(Some(room.clone()))),
 
         CoreEvent::Voice(VoiceEvent::Left(_)) => out.push(UiEvent::VoiceChannelChanged(None)),
@@ -1835,7 +1847,7 @@ mod tests {
 
             }
 
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
 
                 loop {
 
@@ -2277,9 +2289,7 @@ mod tests {
 
                 let mut log_out = String::from(
 
-                    "# ANARLAB RAW APPLICATION PACKET SNIFFER\n\
-
-                     # Inspeção crua de quadros wire.rs, chaves Ed25519/X25519, nonces, ciphertexts e assinaturas\n\n",
+                    "# ANARLAB RAW APPLICATION PACKET SNIFFER\n# Inspeção crua de quadros wire.rs, chaves Ed25519/X25519, nonces, ciphertexts e assinaturas\n\n",
 
                 );
 

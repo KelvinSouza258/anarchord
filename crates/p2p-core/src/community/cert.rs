@@ -1,9 +1,11 @@
-//! Certificados de moderador e ações de moderação assinadas.
+//! Ações de moderação assinadas.
 //!
-//! O dono (chave do servidor) emite certificados dizendo "a pubkey X é moderadora, nível N,
-//! com estas permissões, até tal data". O moderador anexa o certificado a cada ação que assina,
-//! então qualquer membro valida a ação sem precisar da configuração mais recente.
+//! Quem modera anexa o próprio passaporte a cada ação que assina, então qualquer membro valida a
+//! ação sem precisar falar com o dono. A ordem entre ações vem do tempo atestado (#84): a data
+//! declarada `created_at` só vale se um carimbo de terceiro confirmar que ela não foi recuada.
 
+use super::passport::{PassportPermission, ServerPassport};
+use super::timestamp::TimestampAttestation;
 use crate::identity::{verify_signature_hex, UserIdentity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,150 +13,62 @@ use sha2::{Digest, Sha256};
 /// Segundos Unix (UTC)
 pub type UtcSecs = u64;
 
-/// O que um certificado permite fazer
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Permission {
-    /// Banir e desbanir
-    Ban,
-    /// Admitir e remover pessoas da allow-list (servidor fechado)
-    Admit,
-}
-
-/// Permissões padrão de um moderador
-pub fn default_permissions() -> Vec<Permission> {
-    vec![Permission::Ban, Permission::Admit]
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct CertBody {
-    /// Identificador único do certificado (usado para revogar)
-    pub serial: String,
-    pub server_id: String,
-    /// Pubkey do moderador
-    pub subject: String,
-    /// 0 é o dono; certificados têm nível 1 ou maior (número maior = menos autoridade)
-    pub level: u8,
-    pub permissions: Vec<Permission>,
-    pub issued_at: UtcSecs,
-    pub expires_at: UtcSecs,
-}
-
-/// Certificado de moderador assinado pela chave do servidor
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct ModeratorCert {
-    pub body: CertBody,
-    #[serde(with = "crate::b64")]
-    pub signature: Vec<u8>,
-}
-
-impl ModeratorCert {
-    /// Emite um certificado (assinado pela chave do servidor)
-    pub fn issue(
-        server_key: &UserIdentity,
-        subject: &str,
-        level: u8,
-        permissions: Vec<Permission>,
-        issued_at: UtcSecs,
-        validity_secs: u64,
-    ) -> Self {
-        let body = CertBody {
-            serial: random_serial(),
-            server_id: server_key.public_key_hex(),
-            subject: subject.to_string(),
-            level: level.max(1),
-            permissions,
-            issued_at,
-            expires_at: issued_at + validity_secs,
-        };
-        let signature = server_key.sign(&crate::wire::signing_bytes("cert", &body));
-        Self { body, signature }
-    }
-
-    /// Mesmo moderador, nível e permissões, com validade nova a partir de `now`
-    pub fn renewed(&self, server_key: &UserIdentity, now: UtcSecs, validity_secs: u64) -> Self {
-        Self::issue(server_key, &self.body.subject, self.body.level, self.body.permissions.clone(), now, validity_secs)
-    }
-
-    /// Assinatura válida da chave do servidor `server_id`
-    pub fn verify(&self, server_id: &str) -> bool {
-        self.body.server_id == server_id
-            && self.body.level >= 1
-            && verify_signature_hex(server_id, &crate::wire::signing_bytes("cert", &self.body), &self.signature)
-    }
-
-    /// Dentro do período de validade em `at` (tolerando relógios um pouco adiantados)
-    pub fn valid_at(&self, at: UtcSecs) -> bool {
-        self.body.issued_at <= at + super::chain::CLOCK_SKEW_SECS && at < self.body.expires_at
-    }
-
-    pub fn allows(&self, permission: Permission) -> bool {
-        self.body.permissions.contains(&permission)
-    }
-}
-
 /// O que uma ação de moderação faz
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ModKind {
     /// Ban até `until` (UTC); `None` = permanente
     Ban { until: Option<UtcSecs> },
+    /// Desfaz bans aplicados **pelo próprio autor** (correção de acidente)
     Unban,
-    /// Inclui na allow-list (servidor fechado)
-    Admit,
-    /// Remove da allow-list
-    Unadmit,
+    /// Revoga um passaporte específico do alvo
+    Revoke { serial: String },
 }
 
 impl ModKind {
-    pub fn permission(&self) -> Permission {
-        match self {
-            ModKind::Ban { .. } | ModKind::Unban => Permission::Ban,
-            ModKind::Admit | ModKind::Unadmit => Permission::Admit,
-        }
+    pub fn permission(&self) -> PassportPermission {
+        PassportPermission::Ban
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ModActionBody {
     pub server_id: String,
-    pub cert_serial: String,
+    /// Serial do passaporte do autor (anexado em `ModAction::passport`)
+    pub passport_serial: String,
     pub kind: ModKind,
     pub target: String,
-    /// Data declarada pelo moderador. Só serve para prazos e desempate: a ordem que vale é a da cadeia.
+    /// Data declarada pelo autor. Só é aceita como início da ação se um carimbo a confirmar.
     pub created_at: UtcSecs,
     pub reason: String,
 }
 
-/// Ação de moderação assinada pelo moderador, com o certificado dele anexado
+/// Ação de moderação assinada pelo titular do passaporte anexado
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ModAction {
     pub body: ModActionBody,
-    pub cert: ModeratorCert,
+    pub passport: ServerPassport,
     #[serde(with = "crate::b64")]
     pub signature: Vec<u8>,
+    /// Carimbos de tempo sobre [`ModAction::imprint`] (chegam depois da ação)
+    #[serde(default)]
+    pub stamps: Vec<TimestampAttestation>,
 }
 
 impl ModAction {
-    pub fn create(
-        moderator: &UserIdentity,
-        cert: &ModeratorCert,
-        kind: ModKind,
-        target: &str,
-        reason: &str,
-        created_at: UtcSecs,
-    ) -> Self {
+    pub fn create(actor: &UserIdentity, passport: &ServerPassport, kind: ModKind, target: &str, reason: &str, created_at: UtcSecs) -> Self {
         let body = ModActionBody {
-            server_id: cert.body.server_id.clone(),
-            cert_serial: cert.body.serial.clone(),
+            server_id: passport.body.server_id.clone(),
+            passport_serial: passport.body.serial.clone(),
             kind,
             target: target.to_string(),
             created_at,
             reason: reason.to_string(),
         };
-        let signature = moderator.sign(&crate::wire::signing_bytes("modaction", &body));
-        Self { body, cert: cert.clone(), signature }
+        let signature = actor.sign(&crate::wire::signing_bytes("modaction", &body));
+        Self { body, passport: passport.clone(), signature, stamps: Vec::new() }
     }
 
-    /// Identificador da ação (para não aplicar duas vezes)
+    /// Identificador da ação (para não aplicar duas vezes). Não muda quando chegam carimbos.
     pub fn id(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(crate::wire::to_bytes(&self.body));
@@ -162,21 +76,31 @@ impl ModAction {
         hasher.finalize()[..16].iter().map(|b| format!("{:02x}", b)).collect()
     }
 
-    /// Certificado emitido pelo servidor e ação assinada pelo dono do certificado
+    /// Hash carimbado da ação (corpo + assinatura)
+    pub fn imprint(&self) -> [u8; 32] {
+        super::timestamp::imprint("modaction", &crate::wire::signing_bytes("modaction", &self.body), &self.signature)
+    }
+
+    /// Ação assinada pelo titular do passaporte anexado, do mesmo servidor
     pub fn verify_signatures(&self, server_id: &str) -> bool {
         self.body.server_id == server_id
-            && self.cert.verify(server_id)
-            && self.cert.body.serial == self.body.cert_serial
-            && verify_signature_hex(&self.cert.body.subject, &crate::wire::signing_bytes("modaction", &self.body), &self.signature)
+            && self.passport.body.server_id == server_id
+            && self.passport.body.serial == self.body.passport_serial
+            && verify_signature_hex(&self.passport.body.holder, &crate::wire::signing_bytes("modaction", &self.body), &self.signature)
     }
 
     pub fn actor(&self) -> &str {
-        &self.cert.body.subject
+        &self.passport.body.holder
     }
-}
 
-fn random_serial() -> String {
-    rand::random::<[u8; 8]>().iter().map(|b| format!("{:02x}", b)).collect()
+    /// Acrescenta um carimbo (sem duplicar). Devolve `true` se era novo.
+    pub fn add_stamp(&mut self, stamp: TimestampAttestation) -> bool {
+        if self.stamps.contains(&stamp) {
+            return false;
+        }
+        self.stamps.push(stamp);
+        true
+    }
 }
 
 /// Lê uma duração: `30m`, `12h`, `3d`, `2w` ou `perm`/`permanente`.
@@ -213,44 +137,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cert_issued_by_server_verifies() {
-        let server = UserIdentity::generate();
-        let moderator = UserIdentity::generate();
-        let cert = ModeratorCert::issue(&server, &moderator.public_key_hex(), 1, default_permissions(), 1000, 7 * 86_400);
-        assert!(cert.verify(&server.public_key_hex()));
-        assert!(cert.valid_at(1000) && cert.valid_at(1000 + 7 * 86_400 - 1));
-        assert!(!cert.valid_at(1000 + 7 * 86_400), "expira");
-        assert!(cert.allows(Permission::Ban));
-    }
-
-    #[test]
-    fn test_forged_or_tampered_cert_fails() {
-        let server = UserIdentity::generate();
-        let attacker = UserIdentity::generate();
-        let forged = ModeratorCert::issue(&attacker, &attacker.public_key_hex(), 1, default_permissions(), 0, 100);
-        assert!(!forged.verify(&server.public_key_hex()), "emitido por outra chave");
-
-        let mut tampered = ModeratorCert::issue(&server, &attacker.public_key_hex(), 2, default_permissions(), 0, 100);
-        tampered.body.level = 1;
-        assert!(!tampered.verify(&server.public_key_hex()), "nível alterado depois de assinado");
-    }
-
-    #[test]
-    fn test_action_needs_cert_subject_signature() {
+    fn test_action_needs_passport_holder_signature() {
         let server = UserIdentity::generate();
         let moderator = UserIdentity::generate();
         let thief = UserIdentity::generate();
-        let cert = ModeratorCert::issue(&server, &moderator.public_key_hex(), 1, default_permissions(), 0, 100);
+        let passport = ServerPassport::issue_root(&server, &moderator.public_key_hex(), PassportPermission::default_moderator(), 0, Some(100));
         let sid = server.public_key_hex();
 
-        let ok = ModAction::create(&moderator, &cert, ModKind::Unban, "alvo", "", 10);
+        let ok = ModAction::create(&moderator, &passport, ModKind::Unban, "alvo", "", 10);
         assert!(ok.verify_signatures(&sid));
         assert_eq!(ok.actor(), moderator.public_key_hex());
 
-        // Certificado roubado sem a chave do moderador não serve
-        let stolen = ModAction::create(&thief, &cert, ModKind::Unban, "alvo", "", 10);
+        // Passaporte roubado sem a chave do titular não serve
+        let stolen = ModAction::create(&thief, &passport, ModKind::Unban, "alvo", "", 10);
         assert!(!stolen.verify_signatures(&sid));
         assert_ne!(ok.id(), stolen.id());
+
+        let mut stamped = ok.clone();
+        assert!(stamped.add_stamp(TimestampAttestation::Rfc3161 { tsa: "x".into(), token_der: vec![1] }));
+        assert_eq!(stamped.id(), ok.id(), "carimbo não muda a identidade da ação");
+        assert_eq!(stamped.imprint(), ok.imprint());
     }
 
     #[test]

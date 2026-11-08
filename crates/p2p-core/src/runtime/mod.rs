@@ -249,6 +249,11 @@ pub(crate) struct Runtime {
     pending_switch: Option<String>,
     last_invite: Option<String>,
     last_snapshot_reply: HashMap<String, std::time::Instant>,
+    /// Carimbos pedidos às TSAs em threads; o resultado volta para o loop
+    stamp_tx: UnboundedSender<servers::StampResult>,
+    stamp_rx: Option<UnboundedReceiver<servers::StampResult>>,
+    /// Último pedido de acesso de quem ainda não tem passaporte, por servidor
+    last_access_request: HashMap<String, std::time::Instant>,
 
     voice: voice::VoiceState,
     screen: screen::ScreenState,
@@ -290,6 +295,7 @@ impl Runtime {
         node.swarm.behaviour_mut().gossipsub.subscribe(&active.topic).map_err(|e| CoreStartError::Subscribe(format!("{:?}", e)))?;
         let screen = screen::ScreenState::new(&mut node);
         let files = files::FilesState::new(&identity, config.download_dir.clone());
+        let (stamp_tx, stamp_rx) = unbounded_channel();
         Ok(Self {
             identity,
             nick,
@@ -318,6 +324,9 @@ impl Runtime {
             pending_switch: None,
             last_invite: None,
             last_snapshot_reply: HashMap::new(),
+            stamp_tx,
+            stamp_rx: Some(stamp_rx),
+            last_access_request: HashMap::new(),
             voice: voice::VoiceState::default(),
             screen,
             files,
@@ -373,6 +382,7 @@ impl Runtime {
         let mut screen_rx = self.screen.outgoing.take();
         let mut manifest_rx = self.files.manifests.take();
         let mut fs_events_rx = self.files.fs_events.take();
+        let mut stamp_rx = self.stamp_rx.take();
 
         loop {
             tokio::select! {
@@ -392,6 +402,7 @@ impl Runtime {
                 Some(packet) = recv(&mut screen_rx) => self.broadcast_screen(packet),
                 Some(job) = recv(&mut manifest_rx) => self.manifest_ready(job),
                 Some(()) = recv(&mut fs_events_rx) => self.on_fs_watch_event(),
+                Some(result) = recv(&mut stamp_rx) => self.on_stamp_result(result),
             }
         }
 

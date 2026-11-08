@@ -121,9 +121,9 @@ pub fn main_menu(ctx: &MenuContext) -> Menu {
             ask("➕ Criar sala de voz…", "Nome da sala de voz", "/server channel add {} voz"),
             run("ℹ️ Informações do servidor", "/server info"),
             run("📜 Histórico de alterações", "/server history"),
-            run("🔒 Fechar servidor (allow-list)", "/server close"),
-            run("🔓 Abrir servidor", "/server open"),
-            ask("⏳ Política de certificados…", "Validade e janela de renovação (ex.: 7d 2d)", "/server policy {}"),
+            run("🔒 Tornar privado (passaporte manual)", "/server close"),
+            run("🔓 Tornar público (passaporte automático)", "/server open"),
+            ask("⏳ Política de passaportes…", "Validade e janela de renovação (ex.: 7d 2d)", "/server policy {}"),
             run("🚪 Sair deste servidor", "/server leave"),
         ]);
     } else {
@@ -235,8 +235,8 @@ pub fn member_menu(nick: &str, in_server: bool) -> Menu {
             run("🕊️ Desbanir", format!("/server unban {}", nick)),
             run("🛡️ Tornar moderador", format!("/server mod add {}", nick)),
             run("🛡️ Remover moderador", format!("/server mod remove {}", nick)),
-            run("✅ Admitir (servidor fechado)", format!("/server allow {}", nick)),
-            run("🚫 Remover da allow-list", format!("/server disallow {}", nick)),
+            run("🎫 Emitir passaporte de membro", format!("/server passport issue {}", nick)),
+            run("🚫 Revogar passaporte", format!("/server revoke {}", nick)),
         ]);
     }
     Menu::new(format!(" {} ", nick), items)
@@ -385,7 +385,7 @@ mod tests {
         let day = &durations.items[durations.find("1 dia").unwrap()];
         assert_eq!(day.action, MenuAction::Ask { prompt: "Motivo do ban de Bob (opcional)".into(), template: "/server ban Bob 1d {}".into() });
         assert!(menu.find("Remover moderador").is_some());
-        assert!(menu.find("Admitir").is_some());
+        assert!(menu.find("Emitir passaporte").is_some());
         let file = &menu.items[menu.find("Enviar arquivo").unwrap()];
         assert!(matches!(&file.action, MenuAction::Ask { template, .. } if template == "/send Bob \"{}\""));
     }

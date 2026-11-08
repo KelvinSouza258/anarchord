@@ -34,6 +34,16 @@ hkdf = "0.12"
 rand = "0.8"
 sha2 = "0.10"
 
+# Carimbo de tempo RFC 3161 (#84): leitura do token CMS e verificação ECDSA da TSA
+cms = "0.2"
+x509-tsp = "0.1"
+cmpv2 = "0.2"
+der = { version = "0.7", features = ["alloc", "oid"] }
+spki = "0.7"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
 # Assíncrono e Utilidades
 tokio = { version = "1.40", features = ["full"] }
 futures = "0.3"
@@ -67,3 +77,4 @@ xcap = { version = "0.9.8", features = ["wgc"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
+x509-cert = "0.2"

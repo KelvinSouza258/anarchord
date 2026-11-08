@@ -314,10 +314,13 @@ async fn test_server_chain_sync_and_moderation_over_network() {
     assert!(events.iter().any(|e| matches!(e, ServerEvent::ChainUpdated { height: 0, .. })), "{:?}", events);
     assert_eq!(bob_servers.get(&server_id).unwrap().name(), "Rust Guild");
 
-    // 2. Alice certifica Bob (bloco novo)
-    let cert_block = alice_servers.add_moderator(&server_id, &bob.identity.public_key_hex(), 1, T0 + 10).unwrap();
-    send_server_messages(&mut alice, &mut bob, Side::Alice, &control, vec![cert_block], &mut bob_servers, T0 + 10).await;
-    assert_eq!(bob_servers.get(&server_id).unwrap().level_of(&bob.identity.public_key_hex(), T0 + 10), Some(1));
+    // 2. Alice emite passaporte de moderador para Bob
+    let bob_pk = bob.identity.public_key_hex();
+    let passport = alice_servers
+        .issue_passport(&server_id, &alice.identity, &bob_pk, p2p_core::community::PassportPermission::default_moderator(), None, T0 + 10)
+        .unwrap();
+    assert!(bob_servers.accept_my_passport(&server_id, &bob_pk, &passport, T0 + 10));
+    assert!(bob_servers.get(&server_id).unwrap().is_moderator(&bob_pk, T0 + 10));
 
     // 3. Bob (moderador) bane um spammer: ação provisória que chega à Alice
     let spammer = UserIdentity::generate().public_key_hex();

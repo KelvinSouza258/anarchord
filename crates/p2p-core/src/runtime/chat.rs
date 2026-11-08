@@ -49,18 +49,28 @@ pub fn channel_members_with_topics(
     peer_topics: &HashMap<PeerId, HashSet<gossipsub::TopicHash>>,
     topic: &IdentTopic,
 ) -> Vec<String> {
+    let mut members: Vec<String> = topic_peers(gossipsub, peer_metadata, peer_topics, topic).into_iter().map(|(nick, _)| nick).collect();
+    members.sort();
+    members.dedup();
+    members
+}
+
+/// (nick, pubkey) dos pares Anarchord inscritos no tópico
+fn topic_peers(
+    gossipsub: &gossipsub::Behaviour,
+    peer_metadata: &HashMap<PeerId, (String, String)>,
+    peer_topics: &HashMap<PeerId, HashSet<gossipsub::TopicHash>>,
+    topic: &IdentTopic,
+) -> Vec<(String, String)> {
     let topic_hash = topic.hash();
-    let mut members: Vec<String> = peer_metadata
+    peer_metadata
         .iter()
         .filter(|(peer, _)| {
             peer_topics.get(peer).is_some_and(|topics| topics.contains(&topic_hash))
                 || gossipsub.all_peers().any(|(p, topics)| p == *peer && topics.contains(&&topic_hash))
         })
-        .map(|(_, (nick, _))| nick.clone())
-        .collect();
-    members.sort();
-    members.dedup();
-    members
+        .map(|(_, meta)| meta.clone())
+        .collect()
 }
 
 /// Nicks dos pares Anarchord inscritos no tópico do canal (compatibilidade com testes e API externa)
@@ -80,7 +90,7 @@ impl Runtime {
                 return self.error(CoreError::BannedHere);
             }
             if !server.is_allowed(&me, super::now_secs()) {
-                return self.error(CoreError::NotOnAllowList);
+                return self.error(CoreError::NoPassport);
             }
         }
         let message = ChatMessage::new_signed(&self.identity, &self.active.channel, text, super::now_millis());
@@ -158,13 +168,19 @@ impl Runtime {
         self.emit(CoreEvent::ServersChanged(entries));
     }
 
+    /// Lista de quem está no canal. Num servidor, o tópico do Gossipsub é aberto (um banido pode
+    /// continuar inscrito sem conseguir decifrar nada), então só aparece quem tem direito pela cadeia.
     pub(super) fn publish_channel_members(&self) {
-        let members = channel_members_with_topics(
-            &self.node.swarm.behaviour().gossipsub,
-            &self.peer_metadata,
-            &self.peer_topics,
-            &self.active.topic,
-        );
+        let now = super::now_secs();
+        let server = self.active.server_id().and_then(|id| self.servers.get(id));
+        let mut members: Vec<String> =
+            topic_peers(&self.node.swarm.behaviour().gossipsub, &self.peer_metadata, &self.peer_topics, &self.active.topic)
+                .into_iter()
+                .filter(|(_, pubkey)| server.is_none_or(|s| !s.is_excluded(pubkey, now)))
+                .map(|(nick, _)| nick)
+                .collect();
+        members.sort();
+        members.dedup();
         self.emit(CoreEvent::ChannelMembers { channel: self.active.channel.clone(), members });
     }
 
@@ -178,10 +194,8 @@ impl Runtime {
         if !message.verify(source) {
             // Assinatura inválida ou publicada por outro par que não o autor
             tracing::debug!("Mensagem de chat não autêntica descartada (autor alegado: {})", message.author_name);
-        } else if server.is_some_and(|s| s.is_banned(&message.author_pubkey, now)) {
-            tracing::debug!("Mensagem de usuário banido descartada: {}", message.author_name);
-        } else if server.is_some_and(|s| !s.is_allowed(&message.author_pubkey, now)) {
-            tracing::debug!("Mensagem de quem está fora da allow-list descartada: {}", message.author_name);
+        } else if server.is_some_and(|s| s.is_excluded(&message.author_pubkey, now)) {
+            tracing::debug!("Mensagem de usuário banido ou sem passaporte válido descartada: {}", message.author_name);
         } else {
             if let Some(invite) = super::parse_invite(&message.text) {
                 let known = self.servers.get(&invite).is_some();

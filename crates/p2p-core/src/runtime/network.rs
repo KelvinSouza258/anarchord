@@ -462,14 +462,14 @@ impl Runtime {
             self.screen.engine.request_keyframe();
         }
         // Entrou no tópico de controle de um servidor que conhecemos: entrega a cadeia
-        // (servidor fechado: só para quem está na allow-list)
+        // (servidor privado: só para quem tem passaporte)
         if let Some(server_id) = community::parse_server_control_topic(topic.as_str()).map(str::to_string) {
             let recently = self.last_snapshot_reply.get(&server_id).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2));
             let peer_pubkey = pubkey_hex_from_peer_id(&peer_id);
             let allowed = self
                 .servers
                 .get(&server_id)
-                .is_some_and(|s| peer_pubkey.as_deref().is_some_and(|pk| s.is_allowed(pk, super::now_secs())));
+                .is_some_and(|s| !s.chain().state().closed || peer_pubkey.as_deref().is_some_and(|pk| s.is_allowed(pk, super::now_secs())));
             if !recently && allowed {
                 let snapshot = self.servers.snapshot(&server_id);
                 if !snapshot.is_empty() {
@@ -588,6 +588,23 @@ impl Runtime {
                 Err(e) => {
                     self.sniff_packet("RX", &topic, src_str, &raw_data, None);
                     self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
+                    // Texto de canal que chegou sem que possamos ler: mostrado como está (cifrado)
+                    if let Some((server, channel)) = community::parse_server_channel_topic(&topic) {
+                        use base64::Engine as _;
+                        const PREVIEW_BYTES: usize = 48;
+                        let mut ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(&raw_data[..raw_data.len().min(PREVIEW_BYTES)]);
+                        if raw_data.len() > PREVIEW_BYTES {
+                            ciphertext_b64.push('…');
+                        }
+                        self.emit(CoreEvent::EncryptedMessage {
+                            server: server.to_string(),
+                            channel: channel.to_string(),
+                            epoch: community::e2ee::ServerGroups::peek_epoch(&raw_data),
+                            size: raw_data.len(),
+                            ciphertext_b64,
+                            timestamp: super::now_millis(),
+                        });
+                    }
                     return tracing::debug!("Conteúdo de servidor não decifrado: {}", e);
                 }
             }

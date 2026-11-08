@@ -4,7 +4,7 @@
 //!   exclusivamente em RAM. Se o processo encerrar, as chaves de época da sessão são destruídas.
 //! - **Chave do Servidor = Apenas Assinatura/Governança:** a chave de dono (`owner-key.json`) e a
 //!   cadeia de blocos (`ServerChain`) servem exclusivamente para governança (certificados de
-//!   moderador, allow-list, bans e canais). O dono **não precisa estar online** para que os membros
+//!   moderadores, passaportes, bans e canais). O dono **não precisa estar online** para que os membros
 //!   conversem com criptografia E2EE.
 //! - **Eleição Determinística de Líder (`menor pubkey`):** dentro de qualquer grupo MLS ativo,
 //!   o líder (committer responsável por adicionar/remover membros e rotacionar chaves) é sempre o
@@ -35,7 +35,7 @@ pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_
 pub enum E2eeError {
     #[error("sem chave do grupo deste servidor (ainda não admitido)")]
     NotInGroup,
-    #[error("quem pediu não tem direito de entrar (banido ou fora da allow-list)")]
+    #[error("quem pediu não tem direito de entrar (banido ou sem passaporte válido)")]
     NotAllowed,
     #[error("apenas o líder determinístico atual do grupo pode administrar commits")]
     NotOwner,
@@ -387,20 +387,22 @@ impl ServerGroups {
     /// Só aceita Commits assinados pelo **líder determinístico atual do grupo** (`self.leader(server_id)`)
     /// ou pelo `fallback_leader` informado (quando aplicável).
     pub fn process_commit(&mut self, server_id: &str, commit: &[u8], fallback_leader: &str) -> Result<CommitOutcome, E2eeError> {
-        self.process_commit_with_validator(server_id, commit, fallback_leader, |_pk| true)
+        self.process_commit_with_validator(server_id, commit, fallback_leader, |_pk| true, |_pk| true)
     }
 
     /// Aplica um Commit validando que o autor é o líder atual do grupo e que qualquer membro
     /// existente/novo no grupo resultante respeita `is_member_allowed`.
-    pub fn process_commit_with_validator<F>(
+    pub fn process_commit_with_validator<F, G>(
         &mut self,
         server_id: &str,
         commit: &[u8],
         fallback_leader: &str,
         mut is_member_allowed: F,
+        mut is_new_member_allowed: G,
     ) -> Result<CommitOutcome, E2eeError>
     where
         F: FnMut(&str) -> bool,
+        G: FnMut(&str) -> bool,
     {
         let current_leader = self.leader(server_id);
         let Some(group) = self.groups.get_mut(server_id) else { return Ok(CommitOutcome::Ignored) };
@@ -425,13 +427,13 @@ impl ServerGroups {
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             return Ok(CommitOutcome::Ignored);
         };
-        // Valida propostas de Add dentro do Commit: nenhuma folha ilegítima ou banida pode ser adicionada
+        // Valida propostas de Add dentro do Commit: só entra quem tem passaporte válido (visto no KeyPackage)
         for add_prop in staged.add_proposals() {
             let kp = add_prop.add_proposal().key_package();
             let leaf = kp.leaf_node();
             let cred_pk = String::from_utf8_lossy(leaf.credential().serialized_content()).to_string();
             let sig_pk: String = leaf.signature_key().as_slice().iter().map(|b| format!("{:02x}", b)).collect();
-            if cred_pk != sig_pk || !is_member_allowed(&cred_pk) {
+            if cred_pk != sig_pk || !is_new_member_allowed(&cred_pk) {
                 return Ok(CommitOutcome::Ignored);
             }
         }
@@ -441,7 +443,7 @@ impl ServerGroups {
         // 3) O próximo menor membro (`min` dos membros restantes) SE e SOMENTE SE o Commit estiver
         //    removendo o líder antigo (ex.: o líder antigo desconectou ou foi banido e o sucessor assumiu).
         // 4) O próximo menor membro permitido (`min` dos membros permitidos por `is_member_allowed`)
-        //    quando o antigo líder de menor `pubkey` acabou de ser banido ou removido da allow-list!
+        //    quando o antigo líder de menor `pubkey` acabou de ser banido ou perdido o passaporte!
         let is_expected_leader = if current_leader.as_deref() == Some(sender_pk.as_str())
             || (!fallback_leader.is_empty() && sender_pk == fallback_leader)
         {
@@ -507,6 +509,12 @@ impl ServerGroups {
     }
 
     /// Decifra conteúdo do grupo e devolve quem enviou (autenticado pelo MLS)
+    /// Época MLS de uma mensagem cifrada, lida do cabeçalho (que trafega em claro), sem a chave
+    pub fn peek_epoch(ciphertext: &[u8]) -> Option<u64> {
+        let message = MlsMessageIn::tls_deserialize_exact(ciphertext).ok()?;
+        Some(message.try_into_protocol_message().ok()?.epoch().as_u64())
+    }
+
     pub fn decrypt(&mut self, server_id: &str, ciphertext: &[u8]) -> Result<Decrypted, E2eeError> {
         let group = self.groups.get_mut(server_id).ok_or(E2eeError::NotInGroup)?;
         let message = MlsMessageIn::tls_deserialize_exact(ciphertext).map_err(|e| E2eeError::BadMessage(format!("{:?}", e)))?;
@@ -525,7 +533,7 @@ impl ServerGroups {
 }
 
 /// Líder determinístico atual do grupo: admite no grupo cifrado quem publicou o pacote de chave,
-/// se tiver direito pela cadeia de governança do servidor (não banido e, em servidor fechado, na allow-list).
+/// se tiver direito pela cadeia de governança do servidor (passaporte válido, apresentado ou já conhecido).
 /// O dono do servidor NÃO precisa estar online: qualquer membro legítimo que seja o líder atual (`min(pubkey)`)
 /// processa o `KeyPackage` e emite o `Commit` + `Welcome`.
 pub fn admit_from_key_package(
@@ -535,7 +543,6 @@ pub fn admit_from_key_package(
     from_pubkey: &str,
     key_package: &[u8],
     passport: Option<&super::ServerPassport>,
-    signer_identity: Option<&crate::identity::UserIdentity>,
     now: u64,
 ) -> Result<Vec<super::ServerMessage>, E2eeError> {
     let server = registry.get(server_id).filter(|s| s.has_chain()).ok_or(E2eeError::NotOwner)?;
@@ -560,48 +567,22 @@ pub fn admit_from_key_package(
     }
     let (commits, welcome) = groups.add_member(server_id, key_package, from_pubkey)?;
     groups.recently_added.insert(key, std::time::Instant::now());
-
-    // Se o solicitante não possuía passaporte e o servidor é público/aberto,
-    // o líder pode emitir automaticamente um passaporte inicial de membro para ele:
-    let issued_passport = if passport.is_none() {
-        if let Some(owner_key) = server.owner_key() {
-            Some(super::ServerPassport::issue_root(
-                owner_key,
-                from_pubkey,
-                super::MEMBER_LEVEL,
-                super::passport::PassportPermission::member(),
-                now,
-                Some(now + super::chain::DEFAULT_CERT_VALIDITY_SECS),
-            ))
-        } else if let (Some(my_passport), Some(signer)) = (server.my_passport(), signer_identity) {
-            my_passport.issue_subordinate(
-                signer,
-                from_pubkey,
-                super::MEMBER_LEVEL,
-                super::passport::PassportPermission::member(),
-                now,
-                now + super::chain::DEFAULT_CERT_VALIDITY_SECS,
-            ).ok()
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // Quem entra recebe os passaportes dos membros, para validar o grupo e os Commits do líder
+    let member_passports = groups
+        .members(server_id)
+        .iter()
+        .filter_map(|pk| if *pk == me { server.my_passport() } else { server.passport_of(pk) })
+        .cloned()
+        .collect();
 
     let mut out: Vec<super::ServerMessage> =
         commits.into_iter().map(|commit| super::ServerMessage::Commit { server_id: server_id.to_string(), commit }).collect();
-    out.push(super::ServerMessage::Welcome {
-        server_id: server_id.to_string(),
-        target: from_pubkey.to_string(),
-        welcome,
-        passport: issued_passport,
-    });
+    out.push(super::ServerMessage::Welcome { server_id: server_id.to_string(), target: from_pubkey.to_string(), welcome, member_passports });
     Ok(out)
 }
 
 /// Líder determinístico atual do grupo (ou sucessor imediato caso o líder anterior tenha sido banido):
-/// remove do grupo cifrado quem não deveria estar (banido ou fora da allow-list segundo a cadeia do servidor).
+/// remove do grupo cifrado quem não deveria estar (banido ou com passaporte conhecido inválido).
 /// Devolve o Commit a publicar, se alguém saiu.
 pub fn enforce_membership(
     groups: &mut ServerGroups,
@@ -617,14 +598,14 @@ pub fn enforce_membership(
     // Se nós mesmos fomos banidos, deixamos o líder legítimo emitir e publicar o Commit de remoção
     // (e quando esse Commit chegar em process_commit_with_validator, nossa folha será removida e
     // emitiremos ServerNotice::RemovedFromGroup).
-    if server.is_banned(&me, now) || !server.is_allowed(&me, now) {
+    if server.is_excluded(&me, now) || !server.is_allowed(&me, now) {
         return Ok(None);
     }
     // Quem deve executar a manutenção? O menor membro NÃO-banido e permitido que está no grupo!
     let effective_leader = groups
         .members(server_id)
         .into_iter()
-        .filter(|pk| !server.is_banned(pk, now) && server.is_allowed(pk, now))
+        .filter(|pk| !server.is_excluded(pk, now))
         .min();
     if effective_leader.as_deref() != Some(me.as_str()) {
         return Ok(None);
@@ -632,7 +613,7 @@ pub fn enforce_membership(
     let out: Vec<String> = groups
         .members(server_id)
         .into_iter()
-        .filter(|pk| *pk != me && (server.is_banned(pk, now) || !server.is_allowed(pk, now)))
+        .filter(|pk| *pk != me && server.is_excluded(pk, now))
         .collect();
     if out.is_empty() {
         return Ok(None);
@@ -963,7 +944,13 @@ mod tests {
         // Bob e Carol são membros comuns (o dono NÃO está no grupo MLS!)
         let mut nodes = sorted_nodes(2);
         let (carol_id, mut carol) = nodes.pop().unwrap();
-        let (_bob_id, mut bob) = nodes.pop().unwrap(); // bob tem menor pubkey entre bob e carol
+        let (bob_id, mut bob) = nodes.pop().unwrap(); // bob tem menor pubkey entre bob e carol
+        let member_passport = |who: &UserIdentity| {
+            owner_registry
+                .issue_passport(&server, &owner_id, &who.public_key_hex(), crate::community::PassportPermission::member(), None, T0)
+                .unwrap()
+        };
+        let (bob_p, carol_p) = (member_passport(&bob_id), member_passport(&carol_id));
 
         // Bob sincroniza a cadeia do servidor
         let mut bob_registry = ServerRegistry::in_memory();
@@ -973,18 +960,25 @@ mod tests {
         for m in messages {
             bob_registry.handle_message(m, None, T0);
         }
+        assert!(bob_registry.accept_my_passport(&server, &bob_id.public_key_hex(), &bob_p, T0));
 
         // Bob cria o grupo efêmero da sala (sem o dono estar online!) e admite Carol
         bob.create_group(&server).unwrap();
         let carol_pk = carol_id.public_key_hex();
         let kp = carol.key_package().unwrap();
-        let msgs = admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp, None, None, T0).unwrap();
+        assert!(
+            matches!(admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp, None, T0), Err(E2eeError::NotAllowed)),
+            "sem passaporte não entra"
+        );
+        let kp = carol.key_package().unwrap();
+        let msgs = admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp, Some(&carol_p), T0).unwrap();
         assert!(matches!(msgs.last(), Some(ServerMessage::Welcome { target, .. }) if *target == carol_pk));
         assert!(bob.members(&server).contains(&carol_pk));
+        bob_registry.get_mut(&server).unwrap().learn_passport(&carol_p, T0);
 
         // Pedido repetido logo depois de admitida: ignorado (sem nova troca de chave)
         let kp_again = carol.key_package().unwrap();
-        assert!(admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp_again, None, None, T0).unwrap().is_empty());
+        assert!(admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp_again, Some(&carol_p), T0).unwrap().is_empty());
 
         // Dono bane Carol na cadeia e o bloco chega para Bob -> Bob (líder MLS) remove Carol do grupo!
         let ban_block = owner_registry.moderate(&server, &owner_id, ModKind::Ban { until: None }, &carol_pk, "", T0 + 1).unwrap();
@@ -995,7 +989,7 @@ mod tests {
 
         // Banida não é readmitida pelo líder Bob
         let kp = carol.key_package().unwrap();
-        assert!(matches!(admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp, None, None, T0 + 4), Err(E2eeError::NotAllowed)));
+        assert!(matches!(admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp, Some(&carol_p), T0 + 4), Err(E2eeError::NotAllowed)));
     }
 
     /// Garante que o grupo MLS é 100% efêmero em memória: nenhum arquivo `mls-state.json` é criado

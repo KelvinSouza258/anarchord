@@ -4,28 +4,38 @@
 //! hashes assinada (como o histórico do Git). Cada bloco aponta para o hash do anterior e traz
 //! a data UTC do dono. Todos os membros guardam a cadeia e calculam o mesmo estado a partir dela.
 //!
-//! Regras principais:
-//! - **A ordem que vale é a da cadeia**, não as datas declaradas. Uma ação de moderador só tem
-//!   efeito definitivo se entrar na cadeia enquanto o certificado dele é válido; se a revogação
-//!   entrou antes, a ação é descartada por todos.
-//! - **Níveis**: 0 é o dono; certificados têm nível 1 ou mais (número maior = menos autoridade).
-//!   Só se age sobre quem tem nível maior, e só se desfaz ban de quem tem nível igual ou maior.
-//! - **Fork** (dois blocos diferentes na mesma altura, ex.: chave do dono usada em dois lugares):
-//!   vence o de menor hash, de forma determinística, e os membros convergem.
+//! Governança (#84):
+//! - **Passaporte é a única credencial.** Participar exige passaporte válido; não há allow-list.
+//! - **Linhagem**: ninguém age sobre um ancestral da própria cadeia de passaporte.
+//! - **Quem banir primeiro vence**: ações são ordenadas pelo tempo atestado. Cada ação tem um
+//!   início (`created_at`, aceito só se um carimbo o confirmar dentro do atraso máximo da política;
+//!   senão, o instante em que a ação foi comprovadamente vista) e uma prova de existência (o
+//!   carimbo mais antigo, ou a data do bloco que a incluiu). Uma ação de A é anulada se um ban
+//!   contra A foi comprovado antes do início dela. Intervalos sobrepostos = empate: ambos valem.
+//! - **Ban é uma janela sobre a pubkey** `[início, until)`: invalida os passaportes do alvo emitidos
+//!   antes dele e durante ele — exceto os emitidos pela Chave do Servidor depois do início (unban
+//!   do dono). Passaportes emitidos depois de `until` valem normalmente.
+//! - **Emissor banido**: um elo emitido por quem foi banido só vale se um carimbo provar que ele
+//!   existia antes do ban.
+//! - **Desban antecipado**: só a Chave do Servidor ou o próprio autor do ban.
+//! - **Fork** (dois blocos diferentes na mesma altura): vence o de menor hash.
 
-use super::cert::{ModAction, ModKind, ModeratorCert, UtcSecs};
-use super::passport::{PassportError, ServerPassport};
+use super::cert::{ModAction, ModKind, UtcSecs};
+use super::passport::{PassportError, PassportPermission, ServerPassport};
+use super::timestamp::{verify_rfc3161, TimestampAttestation, TimestampPolicy};
 use crate::identity::{verify_signature_hex, UserIdentity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Tolerância para relógios adiantados (ações datadas mais no futuro que isso são recusadas)
-pub const CLOCK_SKEW_SECS: u64 = 300;
-/// Validade padrão dos certificados de moderador
-pub const DEFAULT_CERT_VALIDITY_SECS: u64 = 7 * 86_400;
+/// Tolerância para relógios adiantados
+pub const CLOCK_SKEW_SECS: u64 = super::passport::CLOCK_SKEW_SECS;
+/// Validade padrão dos passaportes emitidos por moderadores
+pub const DEFAULT_PASSPORT_VALIDITY_SECS: u64 = 7 * 86_400;
 /// Janela de renovação padrão (antes de expirar)
 pub const DEFAULT_RENEWAL_WINDOW_SECS: u64 = 2 * 86_400;
+/// Até quantos níveis de carimbo-de-testemunha-de-testemunha a verificação desce
+const MAX_STAMP_DEPTH: u8 = 3;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelType {
@@ -43,15 +53,17 @@ pub struct Channel {
 /// Alterações registradas num bloco
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Entry {
-    /// Primeiro bloco: configuração inicial. `owner` é a identidade pessoal do dono (nível 0, como a
-    /// chave do servidor), para que ele não seja tratado como membro comum no chat.
+    /// Primeiro bloco: configuração inicial. `owner` é a identidade pessoal do dono (protegida
+    /// como a chave do servidor). `timestamp_policy` diz quais autoridades de tempo valem.
     Genesis {
         name: String,
         owner: String,
         channels: Vec<Channel>,
+        /// `false` = público (moderadores emitem passaporte automaticamente a quem pedir)
         closed: bool,
-        cert_validity_secs: u64,
+        passport_validity_secs: u64,
         renewal_window_secs: u64,
+        timestamp_policy: TimestampPolicy,
     },
     /// Transfere a posse para outra identidade pessoal
     SetOwner(String),
@@ -59,13 +71,13 @@ pub enum Entry {
     AddChannel(Channel),
     RemoveChannel(String),
     SetClosed(bool),
-    SetCertPolicy { validity_secs: u64, renewal_window_secs: u64 },
-    AllowAdd(String),
-    AllowRemove(String),
-    IssueCert(ModeratorCert),
-    RevokeCert { serial: String },
-    /// Ban aplicado pelo dono (nível 0)
+    SetPassportPolicy { validity_secs: u64, renewal_window_secs: u64 },
+    SetTimestampPolicy(TimestampPolicy),
+    /// Revoga um passaporte específico
+    RevokePassport { serial: String },
+    /// Ban aplicado pela Chave do Servidor
     Ban { target: String, until: Option<UtcSecs>, reason: String },
+    /// Desfaz todos os bans do alvo (só a Chave do Servidor)
     Unban { target: String },
     /// Consolidação: ação de moderador que passa a fazer parte da cadeia
     IncludeModAction(ModAction),
@@ -117,62 +129,88 @@ impl Block {
     }
 }
 
-/// Ban em vigor
+/// Um ban registrado sobre uma pubkey
 #[derive(Clone, Debug, PartialEq)]
 pub struct BanState {
     pub until: Option<UtcSecs>,
     pub reason: String,
-    /// Pubkey de quem baniu (a do servidor, se foi o dono)
+    /// Pubkey de quem baniu (a do servidor, se foi pela Chave do Servidor)
     pub by: String,
-    pub by_level: u8,
-    pub at: UtcSecs,
+    /// Início do ban (data declarada confirmada por carimbo, ou quando foi comprovadamente visto)
+    pub starts_at: UtcSecs,
+    /// Instante em que a existência do ban está provada (carimbo ou bloco)
+    pub proven_at: UtcSecs,
+    pub action_id: Option<String>,
 }
 
 /// Por que uma ação de moderador foi recusada
 #[derive(Debug, Clone, PartialEq)]
 pub enum Rejection {
     BadSignature,
-    CertRevoked,
-    CertExpired,
+    InvalidPassport(String),
     MissingPermission,
     FromTheFuture,
-    TargetOutranks,
-    BanFromHigherLevel,
+    TargetIsAncestor,
+    ProtectedTarget,
+    SelfTarget,
+    ActorBanned,
+    NotBanAuthor,
     AlreadyApplied,
 }
 
 impl std::fmt::Display for Rejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Rejection::BadSignature => "assinatura ou certificado inválido",
-            Rejection::CertRevoked => "certificado revogado",
-            Rejection::CertExpired => "certificado fora da validade",
-            Rejection::MissingPermission => "o certificado não dá essa permissão",
-            Rejection::FromTheFuture => "ação datada no futuro",
-            Rejection::TargetOutranks => "o alvo tem nível igual ou superior",
-            Rejection::BanFromHigherLevel => "existe um ban de nível superior para esse alvo",
-            Rejection::AlreadyApplied => "ação já aplicada",
-        })
+        match self {
+            Rejection::BadSignature => f.write_str("assinatura inválida"),
+            Rejection::InvalidPassport(why) => write!(f, "passaporte do autor inválido: {}", why),
+            Rejection::MissingPermission => f.write_str("o passaporte não dá essa permissão"),
+            Rejection::FromTheFuture => f.write_str("ação datada no futuro"),
+            Rejection::TargetIsAncestor => f.write_str("o alvo é ancestral de quem age (emitiu o passaporte dele ou de alguém acima)"),
+            Rejection::ProtectedTarget => f.write_str("o dono e a chave do servidor não podem ser alvo"),
+            Rejection::SelfTarget => f.write_str("não é possível agir sobre si mesmo"),
+            Rejection::ActorBanned => f.write_str("o autor já estava banido quando agiu"),
+            Rejection::NotBanAuthor => f.write_str("só quem aplicou o ban (ou o dono) pode desfazê-lo antes do prazo"),
+            Rejection::AlreadyApplied => f.write_str("ação já aplicada"),
+        }
     }
+}
+
+/// Evento de governança, guardado para reavaliar tudo na ordem do tempo atestado
+#[derive(Clone, Debug)]
+enum GovSource {
+    OwnerBan { target: String, until: Option<UtcSecs>, reason: String },
+    OwnerUnban { target: String },
+    OwnerRevoke { serial: String },
+    Mod(ModAction),
+}
+
+#[derive(Clone, Debug)]
+struct GovEvent {
+    source: GovSource,
+    /// Data do bloco que o incluiu, ou quando este nó o viu (ação provisória)
+    seen_at: UtcSecs,
 }
 
 /// Estado do servidor calculado a partir da cadeia
 #[derive(Clone, Debug, Default)]
 pub struct ServerState {
     pub server_id: String,
-    /// Identidade pessoal do dono (nível 0)
+    /// Identidade pessoal do dono
     pub owner: String,
     pub name: String,
     pub channels: Vec<Channel>,
+    /// `false` = público: moderadores emitem passaporte de membro automaticamente
     pub closed: bool,
-    pub cert_validity_secs: u64,
+    pub passport_validity_secs: u64,
     pub renewal_window_secs: u64,
-    pub allow_list: BTreeSet<String>,
-    /// Certificados emitidos (por serial), inclusive os já revogados
-    pub certs: BTreeMap<String, ModeratorCert>,
+    pub timestamp_policy: TimestampPolicy,
+    /// Seriais de passaporte revogados
     pub revoked: BTreeSet<String>,
-    pub bans: BTreeMap<String, BanState>,
+    pub bans: BTreeMap<String, Vec<BanState>>,
     pub applied_actions: BTreeSet<String>,
+    /// Ações avaliadas e recusadas (por id), com o motivo
+    pub rejected_actions: BTreeMap<String, Rejection>,
+    events: Vec<GovEvent>,
 }
 
 impl ServerState {
@@ -180,18 +218,20 @@ impl ServerState {
         Self { server_id: server_id.to_string(), ..Self::default() }
     }
 
-    /// Aplica um bloco. As entradas usam a data do bloco como "agora".
+    /// Aplica um bloco. Entradas de governança usam a data do bloco como prova de existência.
     fn apply_block(&mut self, block: &Block) {
         let at = block.body.timestamp;
+        let mut governance = false;
         for entry in &block.body.entries {
             match entry {
-                Entry::Genesis { name, owner, channels, closed, cert_validity_secs, renewal_window_secs } => {
+                Entry::Genesis { name, owner, channels, closed, passport_validity_secs, renewal_window_secs, timestamp_policy } => {
                     self.owner = owner.clone();
                     self.name = name.clone();
                     self.channels = channels.clone();
                     self.closed = *closed;
-                    self.cert_validity_secs = *cert_validity_secs;
+                    self.passport_validity_secs = *passport_validity_secs;
                     self.renewal_window_secs = *renewal_window_secs;
+                    self.timestamp_policy = timestamp_policy.clone();
                 }
                 Entry::SetOwner(owner) => self.owner = owner.clone(),
                 Entry::SetName(name) => self.name = name.clone(),
@@ -202,46 +242,110 @@ impl ServerState {
                 }
                 Entry::RemoveChannel(name) => self.channels.retain(|c| &c.name != name),
                 Entry::SetClosed(closed) => self.closed = *closed,
-                Entry::SetCertPolicy { validity_secs, renewal_window_secs } => {
-                    self.cert_validity_secs = *validity_secs;
+                Entry::SetPassportPolicy { validity_secs, renewal_window_secs } => {
+                    self.passport_validity_secs = *validity_secs;
                     self.renewal_window_secs = (*renewal_window_secs).min(*validity_secs);
                 }
-                Entry::AllowAdd(pubkey) => {
-                    self.allow_list.insert(pubkey.clone());
+                Entry::SetTimestampPolicy(policy) => {
+                    self.timestamp_policy = policy.clone();
+                    governance = true; // carimbos aceitos mudaram: reavaliar
                 }
-                Entry::AllowRemove(pubkey) => {
-                    self.allow_list.remove(pubkey);
-                }
-                Entry::IssueCert(cert) => {
-                    if cert.verify(&self.server_id) {
-                        self.certs.insert(cert.body.serial.clone(), cert.clone());
-                    }
-                }
-                Entry::RevokeCert { serial } => {
-                    self.revoked.insert(serial.clone());
+                Entry::RevokePassport { serial } => {
+                    self.events.push(GovEvent { source: GovSource::OwnerRevoke { serial: serial.clone() }, seen_at: at });
+                    governance = true;
                 }
                 Entry::Ban { target, until, reason } => {
-                    if target != &self.server_id && target != &self.owner {
-                        let ban =
-                            BanState { until: *until, reason: reason.clone(), by: self.server_id.clone(), by_level: 0, at };
-                        self.bans.insert(target.clone(), ban);
-                    }
+                    let source = GovSource::OwnerBan { target: target.clone(), until: *until, reason: reason.clone() };
+                    self.events.push(GovEvent { source, seen_at: at });
+                    governance = true;
                 }
                 Entry::Unban { target } => {
-                    self.bans.remove(target);
+                    self.events.push(GovEvent { source: GovSource::OwnerUnban { target: target.clone() }, seen_at: at });
+                    governance = true;
                 }
                 Entry::IncludeModAction(action) => {
-                    // Recusas não invalidam o bloco: a ação simplesmente não tem efeito
-                    let _ = self.apply_mod_action(action, at);
+                    self.events.push(GovEvent { source: GovSource::Mod(action.clone()), seen_at: at });
+                    governance = true;
                 }
             }
         }
+        if governance {
+            self.recompute();
+        }
     }
 
-    /// Aplica uma ação de moderador avaliada no instante `at` (data do bloco que a inclui, ou
-    /// "agora" para ações ainda provisórias), seguindo as regras de certificado e de nível.
-    pub fn apply_mod_action(&mut self, action: &ModAction, at: UtcSecs) -> Result<(), Rejection> {
-        self.check_mod_action(action, at)?;
+    /// Acrescenta ações provisórias (ainda fora da cadeia) vistas por este nó e reavalia
+    pub fn add_provisional<'a>(&mut self, actions: impl IntoIterator<Item = (&'a ModAction, UtcSecs)>) {
+        for (action, seen_at) in actions {
+            self.events.push(GovEvent { source: GovSource::Mod(action.clone()), seen_at });
+        }
+        self.recompute();
+    }
+
+    /// Recalcula bans, revogações e ações aplicadas, na ordem do início atestado de cada evento
+    fn recompute(&mut self) {
+        // Os tempos são calculados sobre um estado sem bans: só assinaturas, política e linhagem
+        let base = ServerState { bans: BTreeMap::new(), events: Vec::new(), ..self.clone() };
+        let mut ordered: Vec<(UtcSecs, UtcSecs, String, usize)> = self
+            .events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| {
+                let (start, proven, id) = match &event.source {
+                    GovSource::Mod(action) => {
+                        let (start, proven) = base.action_times(action, event.seen_at);
+                        (start, proven, action.id())
+                    }
+                    _ => (event.seen_at, event.seen_at, String::new()),
+                };
+                (start, proven, id, index)
+            })
+            .collect();
+        ordered.sort_by(|a, b| (a.0, &a.2, a.3).cmp(&(b.0, &b.2, b.3)));
+
+        self.revoked.clear();
+        self.bans.clear();
+        self.applied_actions.clear();
+        self.rejected_actions.clear();
+        let events = std::mem::take(&mut self.events);
+        for (start, proven, _, index) in &ordered {
+            match &events[*index].source {
+                GovSource::OwnerBan { target, until, reason } => {
+                    if target != &self.server_id && target != &self.owner {
+                        let ban = BanState {
+                            until: *until,
+                            reason: reason.clone(),
+                            by: self.server_id.clone(),
+                            starts_at: *start,
+                            proven_at: *proven,
+                            action_id: None,
+                        };
+                        self.bans.entry(target.clone()).or_default().push(ban);
+                    }
+                }
+                GovSource::OwnerUnban { target } => {
+                    self.bans.remove(target);
+                }
+                GovSource::OwnerRevoke { serial } => {
+                    self.revoked.insert(serial.clone());
+                }
+                GovSource::Mod(action) => {
+                    let id = action.id();
+                    match self.check_timed(action, *start, *proven) {
+                        Ok(()) => self.apply_checked(action, *start, *proven),
+                        Err(rejection) => {
+                            if !self.applied_actions.contains(&id) {
+                                self.rejected_actions.insert(id, rejection);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.events = events;
+    }
+
+    fn apply_checked(&mut self, action: &ModAction, start: UtcSecs, proven: UtcSecs) {
         let body = &action.body;
         match &body.kind {
             ModKind::Ban { until } => {
@@ -249,161 +353,181 @@ impl ServerState {
                     until: *until,
                     reason: body.reason.clone(),
                     by: action.actor().to_string(),
-                    by_level: action.cert.body.level,
-                    at: body.created_at,
+                    starts_at: start,
+                    proven_at: proven,
+                    action_id: Some(action.id()),
                 };
-                self.bans.insert(body.target.clone(), ban);
+                self.bans.entry(body.target.clone()).or_default().push(ban);
             }
             ModKind::Unban => {
-                self.bans.remove(&body.target);
+                if let Some(list) = self.bans.get_mut(&body.target) {
+                    list.retain(|b| !(b.by == action.actor() && b.starts_at <= start));
+                    if list.is_empty() {
+                        self.bans.remove(&body.target);
+                    }
+                }
             }
-            ModKind::Admit => {
-                self.allow_list.insert(body.target.clone());
-            }
-            ModKind::Unadmit => {
-                self.allow_list.remove(&body.target);
+            ModKind::Revoke { serial } => {
+                self.revoked.insert(serial.clone());
             }
         }
         self.applied_actions.insert(action.id());
-        Ok(())
     }
 
-    /// Valida uma ação sem aplicá-la
+    /// Início e prova de existência de uma ação vista em `seen_at` (bloco ou recebimento)
+    fn action_times(&self, action: &ModAction, seen_at: UtcSecs) -> (UtcSecs, UtcSecs) {
+        let imprint = action.imprint();
+        let attested = action.stamps.iter().filter_map(|s| self.stamp_time(s, &imprint, action.actor(), MAX_STAMP_DEPTH)).min();
+        let proven = attested.map_or(seen_at, |t| t.min(seen_at));
+        let created = action.body.created_at;
+        let confirmed = proven + CLOCK_SKEW_SECS >= created && proven <= created + self.timestamp_policy.max_delay_secs;
+        let start = if confirmed { created } else { proven };
+        (start, proven)
+    }
+
+    /// Instante atestado por um carimbo sobre `imprint`, se ele for aceito.
+    /// `excluded` é quem gerou o conteúdo: não pode testemunhar nem ser ancestral da testemunha.
+    pub fn stamp_time(&self, stamp: &TimestampAttestation, imprint: &[u8; 32], excluded: &str, depth: u8) -> Option<UtcSecs> {
+        match stamp {
+            TimestampAttestation::Rfc3161 { token_der, .. } => {
+                verify_rfc3161(token_der, imprint, &self.timestamp_policy.tsas).ok().map(|(at, _)| at)
+            }
+            TimestampAttestation::Peer(token) => {
+                let at = token.verify_structure(&self.server_id, imprint).ok()?;
+                let witness = &token.witness_passport;
+                if token.body.witness == excluded || witness.has_ancestor(excluded) {
+                    return None; // linhagem: quem descende do autor não atesta por ele
+                }
+                if depth == 0 || !witness.allows(PassportPermission::EnterServer) {
+                    return None;
+                }
+                self.verify_passport_inner(witness, at, true, depth - 1).ok()?;
+                Some(at)
+            }
+        }
+    }
+
+    /// Valida uma ação ainda não incluída, como se fosse vista agora
     pub fn check_mod_action(&self, action: &ModAction, at: UtcSecs) -> Result<(), Rejection> {
+        let (start, proven) = self.action_times(action, at);
+        self.check_timed(action, start, proven)
+    }
+
+    fn check_timed(&self, action: &ModAction, start: UtcSecs, proven: UtcSecs) -> Result<(), Rejection> {
         if self.applied_actions.contains(&action.id()) {
             return Err(Rejection::AlreadyApplied);
         }
         if !action.verify_signatures(&self.server_id) {
             return Err(Rejection::BadSignature);
         }
-        let cert = &action.cert;
-        if self.revoked.contains(&cert.body.serial) {
-            return Err(Rejection::CertRevoked);
-        }
-        if !cert.valid_at(at) {
-            return Err(Rejection::CertExpired);
-        }
-        if !cert.allows(action.body.kind.permission()) {
-            return Err(Rejection::MissingPermission);
-        }
-        if action.body.created_at > at + CLOCK_SKEW_SECS {
+        if action.body.created_at > proven + CLOCK_SKEW_SECS {
             return Err(Rejection::FromTheFuture);
         }
-        let level = cert.body.level;
-        if self.level_of(&action.body.target, at).is_some_and(|target_level| target_level <= level) {
-            return Err(Rejection::TargetOutranks);
+        let passport = &action.passport;
+        let actor = action.actor();
+        // Bans contra o próprio autor seguem a regra de precedência abaixo, não a do titular
+        self.verify_passport_inner(passport, start, false, MAX_STAMP_DEPTH)
+            .map_err(|e| Rejection::InvalidPassport(e.to_string()))?;
+        if let Some(bans) = self.bans.get(actor) {
+            if bans.iter().any(|ban| ban.proven_at < start && !self.cleared(passport, ban)) {
+                return Err(Rejection::ActorBanned);
+            }
         }
-        if matches!(action.body.kind, ModKind::Ban { .. } | ModKind::Unban)
-            && self.bans.get(&action.body.target).is_some_and(|ban| ban.by_level < level)
+        if !passport.allows(action.body.kind.permission()) {
+            return Err(Rejection::MissingPermission);
+        }
+        let target = &action.body.target;
+        if target == actor {
+            return Err(Rejection::SelfTarget);
+        }
+        if target == &self.server_id || (!self.owner.is_empty() && target == &self.owner) {
+            return Err(Rejection::ProtectedTarget);
+        }
+        if passport.has_ancestor(target) {
+            return Err(Rejection::TargetIsAncestor);
+        }
+        if action.body.kind == ModKind::Unban
+            && !self.bans.get(target).is_some_and(|bans| bans.iter().any(|b| b.by == actor && b.starts_at <= start))
         {
-            return Err(Rejection::BanFromHigherLevel);
+            return Err(Rejection::NotBanAuthor);
         }
         Ok(())
     }
 
-    /// Certificados ativos em `at` (válidos e não revogados)
-    pub fn active_certs(&self, at: UtcSecs) -> impl Iterator<Item = &ModeratorCert> {
-        self.certs.values().filter(move |c| !self.revoked.contains(&c.body.serial) && c.valid_at(at))
+    /// Passaporte emitido depois do ban de forma que o libera: pela Chave do Servidor depois do
+    /// início do ban, ou por qualquer emissor depois do fim do prazo
+    fn cleared(&self, passport: &ServerPassport, ban: &BanState) -> bool {
+        (passport.body.issuer == self.server_id && passport.body.issued_at >= ban.starts_at)
+            || ban.until.is_some_and(|until| passport.body.issued_at >= until)
     }
 
-    /// Nível de autoridade: 0 para o dono, o menor nível entre os certificados ativos, ou None (membro)
-    pub fn level_of(&self, pubkey: &str, at: UtcSecs) -> Option<u8> {
-        if pubkey == self.server_id || (!self.owner.is_empty() && pubkey == self.owner) {
-            return Some(0);
+    /// Bans sobre `pubkey` já iniciados em `at`
+    fn bans_started<'a>(&'a self, pubkey: &str, at: UtcSecs) -> impl Iterator<Item = &'a BanState> + 'a {
+        self.bans.get(pubkey).into_iter().flatten().filter(move |b| b.starts_at <= at)
+    }
+
+    /// Valida um passaporte em `at`: cadeia criptográfica, revogação e bans de titular e emissores
+    pub fn verify_passport(&self, passport: &ServerPassport, at: UtcSecs) -> Result<(), PassportError> {
+        self.verify_passport_inner(passport, at, true, MAX_STAMP_DEPTH)
+    }
+
+    fn verify_passport_inner(&self, passport: &ServerPassport, at: UtcSecs, holder_bans: bool, depth: u8) -> Result<(), PassportError> {
+        passport.verify_at(&self.server_id, at)?;
+        if self.revoked.contains(&passport.body.serial) {
+            return Err(PassportError::RevokedOrBanned(passport.body.serial.clone()));
         }
-        self.active_certs(at).filter(|c| c.body.subject == pubkey).map(|c| c.body.level).min()
-    }
-
-    /// Certificado ativo de mais autoridade de uma pubkey
-    pub fn best_cert(&self, pubkey: &str, at: UtcSecs) -> Option<&ModeratorCert> {
-        self.active_certs(at).filter(|c| c.body.subject == pubkey).min_by_key(|c| (c.body.level, u64::MAX - c.body.expires_at))
-    }
-
-    /// Moderadores ativos: (pubkey, nível, expira em)
-    pub fn moderators(&self, at: UtcSecs) -> Vec<(String, u8, UtcSecs)> {
-        let mut by_subject: BTreeMap<String, (u8, UtcSecs)> = BTreeMap::new();
-        for cert in self.active_certs(at) {
-            let entry = by_subject.entry(cert.body.subject.clone()).or_insert((cert.body.level, cert.body.expires_at));
-            entry.0 = entry.0.min(cert.body.level);
-            entry.1 = entry.1.max(cert.body.expires_at);
+        let holder = &passport.body.holder;
+        if holder_bans && holder != &self.owner && self.bans_started(holder, at).any(|ban| !self.cleared(passport, ban)) {
+            return Err(PassportError::RevokedOrBanned(holder.clone()));
         }
-        by_subject.into_iter().map(|(pk, (level, exp))| (pk, level, exp)).collect()
+        // Emissores banidos: o elo filho precisa de prova de que existia antes do ban
+        let links = passport.links();
+        for pair in links.windows(2) {
+            let (child, parent) = (pair[0], pair[1]);
+            let issuer = &child.body.issuer;
+            if issuer == &self.server_id || issuer == &self.owner {
+                continue;
+            }
+            for ban in self.bans_started(issuer, at) {
+                if self.cleared(parent, ban) || (depth > 0 && self.proven_before(child, ban.starts_at, issuer, depth - 1)) {
+                    continue;
+                }
+                return Err(PassportError::RevokedOrBanned(issuer.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Algum carimbo aceito prova que o elo existia antes de `t`
+    fn proven_before(&self, link: &ServerPassport, t: UtcSecs, issuer: &str, depth: u8) -> bool {
+        let imprint = link.imprint();
+        link.stamps.iter().filter_map(|s| self.stamp_time(s, &imprint, issuer, depth)).any(|at| at < t)
     }
 
     /// Ban em vigor em `at` (bans com prazo expiram sozinhos)
     pub fn is_banned(&self, pubkey: &str, at: UtcSecs) -> bool {
-        self.bans.get(pubkey).is_some_and(|b| b.until.map_or(true, |until| at < until))
+        self.bans_started(pubkey, at).any(|b| b.until.map_or(true, |until| at < until))
     }
 
     pub fn active_bans(&self, at: UtcSecs) -> Vec<(&String, &BanState)> {
-        self.bans.iter().filter(|(pk, _)| self.is_banned(pk, at)).collect()
+        self.bans
+            .iter()
+            .flat_map(|(pk, list)| list.iter().map(move |b| (pk, b)))
+            .filter(|(_, b)| b.starts_at <= at && b.until.map_or(true, |until| at < until))
+            .collect()
     }
 
-    /// Valida se um passaporte do servidor é aceito e não possui nenhum emissor ou titular banido ou revogado
-    pub fn verify_passport(&self, passport: &ServerPassport, at: UtcSecs) -> Result<(), PassportError> {
-        passport.verify_at(&self.server_id, at)?;
-
-        // 1. O titular não pode estar banido no momento atual
-        if self.is_banned(&passport.body.holder, at) {
-            return Err(PassportError::RevokedOrBanned(passport.body.holder.clone()));
-        }
-
-        // 2. O passaporte do titular não pode ter sido revogado explicitamente
-        if self.revoked.contains(&passport.body.serial) {
-            return Err(PassportError::RevokedOrBanned(passport.body.serial.clone()));
-        }
-
-        // 3. Validação temporal de ancestrais:
-        //    Um emissor só invalida o passaporte filho se ele já estava banido no momento da emissão!
-        let mut curr = passport;
-        while let Some(parent) = &curr.issuer_passport {
-            let issuer_pk = &curr.body.issuer;
-            let issued_at = curr.body.issued_at;
-
-            if let Some(ban) = self.bans.get(issuer_pk) {
-                if ban.at <= issued_at && ban.until.map_or(true, |until| issued_at < until) {
-                    return Err(PassportError::RevokedOrBanned(issuer_pk.clone()));
-                }
-            }
-
-            curr = parent;
-        }
-
-        Ok(())
+    /// Dono e chave do servidor sempre participam
+    pub fn is_owner_key(&self, pubkey: &str) -> bool {
+        pubkey == self.server_id || (!self.owner.is_empty() && pubkey == self.owner)
     }
 
-    /// Pode participar: servidor aberto, ou dono, moderador ativo, passaporte válido ou na allow-list
+    /// Pode participar: dono/chave do servidor, ou passaporte válido do próprio `pubkey`
     pub fn is_allowed_with_passport(&self, pubkey: &str, passport: Option<&ServerPassport>, at: UtcSecs) -> bool {
-        if self.is_banned(pubkey, at) {
-            return false;
-        }
-        if pubkey == self.server_id || (!self.owner.is_empty() && pubkey == self.owner) {
+        if self.is_owner_key(pubkey) {
             return true;
         }
-        if let Some(p) = passport {
-            if p.body.holder == pubkey && self.verify_passport(p, at).is_ok() {
-                return true;
-            }
-        }
-        !self.closed || self.allow_list.contains(pubkey) || self.level_of(pubkey, at).is_some()
-    }
-
-    /// Pode participar: servidor aberto, ou dono, moderador ativo ou na allow-list
-    pub fn is_allowed(&self, pubkey: &str, at: UtcSecs) -> bool {
-        self.is_allowed_with_passport(pubkey, None, at)
-    }
-
-    /// Certificados que entraram na janela de renovação e ainda não têm sucessor mais longo
-    pub fn certs_due_for_renewal(&self, at: UtcSecs) -> Vec<&ModeratorCert> {
-        let latest: BTreeMap<&str, UtcSecs> = self.active_certs(at).fold(BTreeMap::new(), |mut acc, c| {
-            let e = acc.entry(c.body.subject.as_str()).or_insert(0);
-            *e = (*e).max(c.body.expires_at);
-            acc
-        });
-        self.active_certs(at)
-            .filter(|c| c.body.expires_at.saturating_sub(at) <= self.renewal_window_secs)
-            .filter(|c| latest.get(c.body.subject.as_str()) == Some(&c.body.expires_at))
-            .collect()
+        passport.is_some_and(|p| p.body.holder == pubkey && p.allows(PassportPermission::EnterServer) && self.verify_passport(p, at).is_ok())
     }
 }
 
@@ -508,60 +632,75 @@ impl ServerChain {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::cert::{default_permissions, Permission};
+pub(crate) mod tests {
+    use super::super::passport::PassportPermission as P;
+    use super::super::timestamp::{test_tsa::LocalTsa, PeerTimestampToken};
     use super::*;
 
-    const DAY: u64 = 86_400;
     const T0: u64 = 1_800_000_000;
     /// Identidade pessoal do dono (diferente da chave do servidor)
     const OWNER_PERSONAL: &str = "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d";
 
-    struct Setup {
-        owner: UserIdentity,
-        chain: ServerChain,
+    fn pk(id: &UserIdentity) -> String {
+        id.public_key_hex()
     }
 
-    impl Setup {
-        fn new() -> Self {
-            let owner = UserIdentity::generate();
-            let mut chain = ServerChain::new(&owner.public_key_hex());
-            chain.append_own(&owner, T0, vec![genesis(false)]);
-            Self { owner, chain }
-        }
-
-        fn append(&mut self, at: u64, entries: Vec<Entry>) -> Block {
-            self.chain.append_own(&self.owner, at, entries)
-        }
-
-        fn certify(&mut self, who: &UserIdentity, level: u8, at: u64) -> ModeratorCert {
-            let cert = ModeratorCert::issue(&self.owner, &who.public_key_hex(), level, default_permissions(), at, 7 * DAY);
-            self.append(at, vec![Entry::IssueCert(cert.clone())]);
-            cert
-        }
-
-        fn state(&self) -> &ServerState {
-            self.chain.state()
-        }
-    }
-
-    fn genesis(closed: bool) -> Entry {
+    pub(crate) fn genesis(closed: bool, policy: TimestampPolicy) -> Entry {
         Entry::Genesis {
             name: "Rust Guild".into(),
             owner: OWNER_PERSONAL.into(),
             channels: vec![Channel { name: "geral".into(), channel_type: ChannelType::Text }],
             closed,
-            cert_validity_secs: 7 * DAY,
-            renewal_window_secs: 2 * DAY,
+            passport_validity_secs: 7 * 86_400,
+            renewal_window_secs: 2 * 86_400,
+            timestamp_policy: policy,
         }
     }
 
-    fn ban(by: &UserIdentity, cert: &ModeratorCert, target: &str, at: u64) -> ModAction {
-        ModAction::create(by, cert, ModKind::Ban { until: None }, target, "spam", at)
+    /// Servidor com uma TSA local de teste na política
+    struct Setup {
+        key: UserIdentity,
+        tsa: LocalTsa,
+        chain: ServerChain,
     }
 
-    fn pk(id: &UserIdentity) -> String {
-        id.public_key_hex()
+    impl Setup {
+        fn new() -> Self {
+            let key = UserIdentity::generate();
+            let tsa = LocalTsa::new();
+            let policy = TimestampPolicy { tsas: vec![tsa.trusted("local")], max_delay_secs: 600 };
+            let mut chain = ServerChain::new(&pk(&key));
+            chain.append_own(&key, T0, vec![genesis(false, policy)]);
+            Self { key, tsa, chain }
+        }
+
+        fn sid(&self) -> String {
+            pk(&self.key)
+        }
+
+        fn append(&mut self, at: u64, entries: Vec<Entry>) {
+            self.chain.append_own(&self.key, at, entries);
+        }
+
+        fn state(&self) -> &ServerState {
+            self.chain.state()
+        }
+
+        /// Moderador emitido direto pela chave do servidor
+        fn moderator(&self, who: &UserIdentity, at: u64) -> ServerPassport {
+            ServerPassport::issue_root(&self.key, &pk(who), P::default_moderator(), at, Some(at + 30 * 86_400))
+        }
+
+        /// Ação carimbada pela TSA local `delay` segundos depois de criada
+        fn stamped(&self, mut action: ModAction, delay: u64) -> ModAction {
+            let stamp = self.tsa.stamp(&action.imprint(), action.body.created_at + delay);
+            action.add_stamp(stamp);
+            action
+        }
+    }
+
+    fn ban(by: &UserIdentity, passport: &ServerPassport, target: &str, at: u64) -> ModAction {
+        ModAction::create(by, passport, ModKind::Ban { until: None }, target, "spam", at)
     }
 
     #[test]
@@ -570,11 +709,9 @@ mod tests {
         s.append(T0 + 10, vec![Entry::AddChannel(Channel { name: "jogos".into(), channel_type: ChannelType::Text })]);
         assert_eq!(s.chain.blocks().len(), 2);
         assert_eq!(s.chain.blocks()[1].body.prev_hash, s.chain.blocks()[0].hash());
-        assert_eq!(s.state().name, "Rust Guild");
         assert_eq!(s.state().channels.len(), 2);
 
-        // Outro membro reconstrói o mesmo estado a partir dos blocos
-        let mut copy = ServerChain::new(&pk(&s.owner));
+        let mut copy = ServerChain::new(&s.sid());
         for b in s.chain.blocks() {
             assert_eq!(copy.try_append(b.clone()), AppendResult::Appended);
         }
@@ -586,27 +723,19 @@ mod tests {
     fn test_rejects_forged_unlinked_and_gapped_blocks() {
         let s = Setup::new();
         let attacker = UserIdentity::generate();
-        let mut member = ServerChain::new(&pk(&s.owner));
-
-        let forged = Block::create(&attacker, None, T0, vec![genesis(false)]);
+        let mut member = ServerChain::new(&s.sid());
+        let forged = Block::create(&attacker, None, T0, vec![genesis(false, TimestampPolicy::default())]);
         assert!(matches!(member.try_append(forged), AppendResult::Invalid(_)), "assinado por outra chave");
 
         member.try_append(s.chain.blocks()[0].clone());
-        let unlinked = Block::create(&s.owner, None, T0, vec![genesis(true)]); // altura 0 de novo, outro conteúdo
-        let mut wrong_prev = Block::create(&s.owner, Some(&unlinked), T0 + 1, vec![Entry::SetClosed(true)]);
+        let unlinked = Block::create(&s.key, None, T0, vec![genesis(true, TimestampPolicy::default())]);
+        let mut wrong_prev = Block::create(&s.key, Some(&unlinked), T0 + 1, vec![Entry::SetClosed(true)]);
         wrong_prev.body.height = 1;
         assert!(matches!(member.try_append(wrong_prev), AppendResult::Invalid(_)));
 
-        let far = Block::create(&s.owner, Some(&s.chain.blocks()[0]), T0, vec![]);
-        let mut far = far;
-        far.body.height = 5;
-        // A assinatura cobre a altura: altura alterada invalida
-        assert!(matches!(member.try_append(far), AppendResult::Invalid(_)));
-
         let mut full = s.chain.clone();
-        let b1 = full.append_own(&s.owner, T0 + 1, vec![]);
-        let b2 = full.append_own(&s.owner, T0 + 2, vec![]);
-        let _ = b1;
+        full.append_own(&s.key, T0 + 1, vec![]);
+        let b2 = full.append_own(&s.key, T0 + 2, vec![]);
         assert_eq!(member.try_append(b2), AppendResult::Gap { need_from: 1 });
     }
 
@@ -614,12 +743,10 @@ mod tests {
     fn test_fork_resolves_to_lowest_hash_on_every_member() {
         let s = Setup::new();
         let genesis_block = s.chain.blocks()[0].clone();
-        let a = Block::create(&s.owner, Some(&genesis_block), T0 + 5, vec![Entry::SetName("A".into())]);
-        let b = Block::create(&s.owner, Some(&genesis_block), T0 + 5, vec![Entry::SetName("B".into())]);
+        let a = Block::create(&s.key, Some(&genesis_block), T0 + 5, vec![Entry::SetName("A".into())]);
+        let b = Block::create(&s.key, Some(&genesis_block), T0 + 5, vec![Entry::SetName("B".into())]);
         let winner = if a.hash() < b.hash() { "A" } else { "B" };
-
-        let mut m1 = ServerChain::new(&pk(&s.owner));
-        let mut m2 = ServerChain::new(&pk(&s.owner));
+        let (mut m1, mut m2) = (ServerChain::new(&s.sid()), ServerChain::new(&s.sid()));
         for m in [&mut m1, &mut m2] {
             m.try_append(genesis_block.clone());
         }
@@ -634,206 +761,237 @@ mod tests {
     #[test]
     fn test_moderator_ban_is_applied_when_included() {
         let mut s = Setup::new();
-        let moderator = UserIdentity::generate();
-        let spammer = UserIdentity::generate();
-        let cert = s.certify(&moderator, 1, T0 + 10);
-        s.append(T0 + 20, vec![Entry::IncludeModAction(ban(&moderator, &cert, &pk(&spammer), T0 + 15))]);
+        let (moderator, spammer) = (UserIdentity::generate(), UserIdentity::generate());
+        let passport = s.moderator(&moderator, T0);
+        s.append(T0 + 20, vec![Entry::IncludeModAction(ban(&moderator, &passport, &pk(&spammer), T0 + 15))]);
         assert!(s.state().is_banned(&pk(&spammer), T0 + 30));
-        assert_eq!(s.state().bans[&pk(&spammer)].by_level, 1);
-    }
-
-    /// Regra central: ação incluída depois da revogação é desfeita, mesmo que a data declarada
-    /// pelo moderador seja anterior à revogação (backdating).
-    #[test]
-    fn test_actions_included_after_revocation_have_no_effect() {
-        let mut s = Setup::new();
-        let rogue = UserIdentity::generate();
-        let early = UserIdentity::generate();
-        let late = UserIdentity::generate();
-        let cert = s.certify(&rogue, 1, T0 + 10);
-
-        s.append(T0 + 20, vec![Entry::IncludeModAction(ban(&rogue, &cert, &pk(&early), T0 + 15))]);
-        s.append(T0 + 30, vec![Entry::RevokeCert { serial: cert.body.serial.clone() }]);
-        // Datada antes da revogação, mas entra na cadeia depois dela
-        s.append(T0 + 40, vec![Entry::IncludeModAction(ban(&rogue, &cert, &pk(&late), T0 + 16))]);
-
-        assert!(s.state().is_banned(&pk(&early), T0 + 50), "incluída antes da revogação: continua");
-        assert!(!s.state().is_banned(&pk(&late), T0 + 50), "incluída depois da revogação: sem efeito");
-        assert_eq!(s.state().level_of(&pk(&rogue), T0 + 50), None);
+        assert_eq!(s.state().bans[&pk(&spammer)][0].by, pk(&moderator));
     }
 
     #[test]
-    fn test_level_rules() {
-        let mut s = Setup::new();
-        let senior = UserIdentity::generate();
-        let peer = UserIdentity::generate();
-        let junior = UserIdentity::generate();
+    fn test_member_without_ban_permission_cannot_moderate() {
+        let s = Setup::new();
         let member = UserIdentity::generate();
-        let c_senior = s.certify(&senior, 1, T0 + 1);
-        let c_peer = s.certify(&peer, 1, T0 + 1);
-        let c_junior = s.certify(&junior, 2, T0 + 1);
-        let state = s.state().clone();
-        let at = T0 + 100;
-
-        assert_eq!(state.level_of(&pk(&s.owner), at), Some(0));
-        assert_eq!(state.level_of(&pk(&junior), at), Some(2));
-        assert_eq!(state.level_of(&pk(&member), at), None);
-
-        assert_eq!(state.check_mod_action(&ban(&senior, &c_senior, &pk(&junior), at), at), Ok(()), "1 age sobre 2");
-        assert_eq!(state.check_mod_action(&ban(&senior, &c_senior, &pk(&member), at), at), Ok(()));
-        assert_eq!(state.check_mod_action(&ban(&senior, &c_senior, &pk(&peer), at), at), Err(Rejection::TargetOutranks), "mesmo nível");
-        assert_eq!(state.check_mod_action(&ban(&junior, &c_junior, &pk(&senior), at), at), Err(Rejection::TargetOutranks));
-        assert_eq!(state.check_mod_action(&ban(&senior, &c_senior, &pk(&s.owner), at), at), Err(Rejection::TargetOutranks), "ninguém age sobre o dono");
-        let _ = c_peer;
+        let passport = ServerPassport::issue_root(&s.key, &pk(&member), P::member(), T0, Some(T0 + 86_400));
+        let action = ban(&member, &passport, &pk(&UserIdentity::generate()), T0 + 5);
+        assert_eq!(s.state().check_mod_action(&action, T0 + 5), Err(Rejection::MissingPermission));
     }
 
-    /// O dono conversa com a identidade pessoal: ela também é nível 0
+    /// Regra de linhagem: ninguém age sobre quem emitiu o próprio passaporte (nem acima dele)
     #[test]
-    fn test_owner_personal_identity_is_level_zero() {
-        let mut s = Setup::new();
-        let moderator = UserIdentity::generate();
-        let cert = s.certify(&moderator, 1, T0);
-        assert_eq!(s.state().level_of(OWNER_PERSONAL, T0 + 1), Some(0));
-        assert_eq!(s.state().check_mod_action(&ban(&moderator, &cert, OWNER_PERSONAL, T0 + 1), T0 + 1), Err(Rejection::TargetOutranks));
+    fn test_moderator_cannot_ban_ancestor_or_owner() {
+        let s = Setup::new();
+        let (alice, bob) = (UserIdentity::generate(), UserIdentity::generate());
+        let alice_p = ServerPassport::issue_root(&s.key, &pk(&alice), P::all(), T0, Some(T0 + 30 * 86_400));
+        let bob_p = alice_p.issue_subordinate(&alice, &pk(&bob), P::default_moderator(), T0, T0 + 86_400).unwrap();
+        let at = T0 + 10;
+        assert_eq!(s.state().check_mod_action(&ban(&bob, &bob_p, &pk(&alice), at), at), Err(Rejection::TargetIsAncestor));
+        assert_eq!(s.state().check_mod_action(&ban(&bob, &bob_p, OWNER_PERSONAL, at), at), Err(Rejection::ProtectedTarget));
+        assert_eq!(s.state().check_mod_action(&ban(&bob, &bob_p, &s.sid(), at), at), Err(Rejection::ProtectedTarget));
+        assert_eq!(s.state().check_mod_action(&ban(&alice, &alice_p, &pk(&bob), at), at), Ok(()), "de cima para baixo pode");
+    }
 
-        let new_owner = UserIdentity::generate();
-        s.append(T0 + 2, vec![Entry::SetOwner(pk(&new_owner))]);
-        assert_eq!(s.state().level_of(&pk(&new_owner), T0 + 3), Some(0), "posse transferida");
-        assert_eq!(s.state().level_of(OWNER_PERSONAL, T0 + 3), None);
+    /// Moderadores de ramos diferentes: vale quem banir primeiro (comprovado por carimbo)
+    #[test]
+    fn test_first_attested_ban_wins_regardless_of_arrival_order() {
+        let s = Setup::new();
+        let (a, b) = (UserIdentity::generate(), UserIdentity::generate());
+        let (a_p, b_p) = (s.moderator(&a, T0), s.moderator(&b, T0));
+        let a_bans_b = s.stamped(ban(&a, &a_p, &pk(&b), T0 + 100), 5);
+        let b_bans_a = s.stamped(ban(&b, &b_p, &pk(&a), T0 + 1000), 5);
+
+        for order in [[&a_bans_b, &b_bans_a], [&b_bans_a, &a_bans_b]] {
+            let mut state = s.state().clone();
+            state.add_provisional(order.iter().map(|action| (*action, T0 + 2000)));
+            assert!(state.is_banned(&pk(&b), T0 + 2000), "A baniu primeiro");
+            assert!(!state.is_banned(&pk(&a), T0 + 2000), "ban de B veio depois de B estar banido");
+            assert_eq!(state.rejected_actions.get(&b_bans_a.id()), Some(&Rejection::ActorBanned));
+        }
+    }
+
+    /// Intervalos sobrepostos: não dá para saber quem veio primeiro, os dois ficam banidos
+    #[test]
+    fn test_overlapping_bans_ban_both() {
+        let s = Setup::new();
+        let (a, b) = (UserIdentity::generate(), UserIdentity::generate());
+        let (a_p, b_p) = (s.moderator(&a, T0), s.moderator(&b, T0));
+        let a_bans_b = s.stamped(ban(&a, &a_p, &pk(&b), T0 + 100), 30);
+        let b_bans_a = s.stamped(ban(&b, &b_p, &pk(&a), T0 + 110), 30);
+        let mut state = s.state().clone();
+        state.add_provisional([(&a_bans_b, T0 + 500), (&b_bans_a, T0 + 500)]);
+        assert!(state.is_banned(&pk(&a), T0 + 500) && state.is_banned(&pk(&b), T0 + 500));
+    }
+
+    /// Ação sem carimbo e datada no passado vale como criada quando foi vista (backdating)
+    #[test]
+    fn test_unstamped_backdated_action_after_ban_is_rejected() {
+        let mut s = Setup::new();
+        let (rogue, victim) = (UserIdentity::generate(), UserIdentity::generate());
+        let rogue_p = s.moderator(&rogue, T0);
+        s.append(T0 + 1000, vec![Entry::Ban { target: pk(&rogue), until: None, reason: "abuso".into() }]);
+        let backdated = ban(&rogue, &rogue_p, &pk(&victim), T0 + 500);
+        s.append(T0 + 2000, vec![Entry::IncludeModAction(backdated.clone())]);
+        assert!(!s.state().is_banned(&pk(&victim), T0 + 2000));
+        assert_eq!(s.state().rejected_actions.get(&backdated.id()), Some(&Rejection::ActorBanned));
+
+        // Carimbo com atraso maior que a política não confirma a data declarada
+        let late_stamp = s.stamped(ban(&rogue, &rogue_p, &pk(&victim), T0 + 501), 1400);
+        assert_eq!(s.state().check_mod_action(&late_stamp, T0 + 2100), Err(Rejection::ActorBanned));
+        // Carimbo dentro do prazo prova que a ação foi antes do ban
+        let honest = s.stamped(ban(&rogue, &rogue_p, &pk(&victim), T0 + 502), 10);
+        assert_eq!(s.state().check_mod_action(&honest, T0 + 2100), Ok(()));
     }
 
     #[test]
-    fn test_cannot_undo_ban_from_higher_authority() {
+    fn test_only_ban_author_or_server_key_unbans_early() {
         let mut s = Setup::new();
-        let moderator = UserIdentity::generate();
-        let junior = UserIdentity::generate();
+        let (a, b, target) = (UserIdentity::generate(), UserIdentity::generate(), UserIdentity::generate());
+        let (a_p, b_p) = (s.moderator(&a, T0), s.moderator(&b, T0));
+        s.append(T0 + 10, vec![Entry::IncludeModAction(ban(&a, &a_p, &pk(&target), T0 + 10))]);
+
+        let other = ModAction::create(&b, &b_p, ModKind::Unban, &pk(&target), "", T0 + 20);
+        assert_eq!(s.state().check_mod_action(&other, T0 + 20), Err(Rejection::NotBanAuthor));
+        let own = ModAction::create(&a, &a_p, ModKind::Unban, &pk(&target), "engano", T0 + 20);
+        s.append(T0 + 20, vec![Entry::IncludeModAction(own)]);
+        assert!(!s.state().is_banned(&pk(&target), T0 + 30), "autor desfez o próprio ban");
+
+        s.append(T0 + 40, vec![Entry::IncludeModAction(ban(&a, &a_p, &pk(&target), T0 + 40))]);
+        s.append(T0 + 50, vec![Entry::Unban { target: pk(&target) }]);
+        assert!(!s.state().is_banned(&pk(&target), T0 + 60), "a chave do servidor desfaz qualquer ban");
+    }
+
+    #[test]
+    fn test_banned_author_cannot_undo_own_ban() {
+        let mut s = Setup::new();
+        let (a, target) = (UserIdentity::generate(), UserIdentity::generate());
+        let a_p = s.moderator(&a, T0);
+        s.append(T0 + 10, vec![Entry::IncludeModAction(ban(&a, &a_p, &pk(&target), T0 + 10))]);
+        s.append(T0 + 20, vec![Entry::Ban { target: pk(&a), until: None, reason: "".into() }]);
+        let unban = ModAction::create(&a, &a_p, ModKind::Unban, &pk(&target), "", T0 + 30);
+        assert_eq!(s.state().check_mod_action(&unban, T0 + 30), Err(Rejection::ActorBanned));
+    }
+
+    #[test]
+    fn test_ban_window_and_reissue_rules() {
+        let mut s = Setup::new();
+        let (moderator, member) = (UserIdentity::generate(), UserIdentity::generate());
+        let mod_p = s.moderator(&moderator, T0);
+        let old = mod_p.issue_subordinate(&moderator, &pk(&member), P::member(), T0 + 10, T0 + 20 * 86_400).unwrap();
+        s.append(T0 + 100, vec![Entry::Ban { target: pk(&member), until: Some(T0 + 3600), reason: "1h".into() }]);
+        let st = s.state();
+        assert!(st.verify_passport(&old, T0 + 200).is_err(), "emitido antes do ban: invalidado");
+        assert!(st.verify_passport(&old, T0 + 7200).is_err(), "continua inválido depois do prazo");
+
+        let during = mod_p.issue_subordinate(&moderator, &pk(&member), P::member(), T0 + 200, T0 + 20 * 86_400).unwrap();
+        assert!(st.verify_passport(&during, T0 + 300).is_err(), "moderador não fura o ban (emissão automática inclusa)");
+        let by_server = ServerPassport::issue_root(&s.key, &pk(&member), P::member(), T0 + 200, Some(T0 + 86_400));
+        assert!(st.verify_passport(&by_server, T0 + 300).is_ok(), "Chave do Servidor libera durante a janela");
+        let after = mod_p.issue_subordinate(&moderator, &pk(&member), P::member(), T0 + 3600, T0 + 20 * 86_400).unwrap();
+        assert!(st.verify_passport(&after, T0 + 3700).is_ok(), "depois do prazo qualquer emissor reabilita");
+        assert!(st.verify_passport(&after, T0 + 300).is_err(), "datado no futuro não vale antes");
+    }
+
+    /// Ban derruba também passaportes cruzados (A emite para B, B emite de volta para A)
+    #[test]
+    fn test_ban_invalidates_cross_issued_passports() {
+        let mut s = Setup::new();
+        let (a, b) = (UserIdentity::generate(), UserIdentity::generate());
+        let a_p = ServerPassport::issue_root(&s.key, &pk(&a), P::all(), T0, Some(T0 + 30 * 86_400));
+        let b_p = a_p.issue_subordinate(&a, &pk(&b), P::all(), T0 + 1, T0 + 30 * 86_400).unwrap();
+        let a_again = b_p.issue_subordinate(&b, &pk(&a), P::all(), T0 + 2, T0 + 30 * 86_400).unwrap();
+        s.append(T0 + 100, vec![Entry::Ban { target: pk(&a), until: None, reason: "".into() }]);
+        assert!(s.state().verify_passport(&a_p, T0 + 200).is_err());
+        assert!(s.state().verify_passport(&a_again, T0 + 200).is_err(), "o passaporte cruzado também cai");
+    }
+
+    /// #84: passaporte emitido por moderador banido só vale com carimbo anterior ao ban
+    #[test]
+    fn test_passport_from_banned_issuer_needs_prior_timestamp() {
+        let mut s = Setup::new();
+        let (bob, carol, dave, eve) = (UserIdentity::generate(), UserIdentity::generate(), UserIdentity::generate(), UserIdentity::generate());
+        let bob_p = s.moderator(&bob, T0);
+        let mut carol_p = bob_p.issue_subordinate(&bob, &pk(&carol), P::member(), T0 + 100, T0 + 20 * 86_400).unwrap();
+        carol_p.add_stamp(s.tsa.stamp(&carol_p.imprint(), T0 + 101));
+        let unstamped = bob_p.issue_subordinate(&bob, &pk(&dave), P::member(), T0 + 100, T0 + 20 * 86_400).unwrap();
+
+        s.append(T0 + 1000, vec![Entry::Ban { target: pk(&bob), until: None, reason: "infração".into() }]);
+        let st = s.state();
+        assert!(st.verify_passport(&carol_p, T0 + 2000).is_ok(), "carimbo anterior ao ban: legítimo");
+        assert!(st.verify_passport(&unstamped, T0 + 2000).is_err(), "emissor banido e sem prova: rejeita");
+
+        // Bob forja depois do ban com data anterior: o carimbo só pode ser posterior
+        let mut forged = bob_p.issue_subordinate(&bob, &pk(&eve), P::member(), T0 + 500, T0 + 20 * 86_400).unwrap();
+        forged.add_stamp(s.tsa.stamp(&forged.imprint(), T0 + 1500));
+        assert!(st.verify_passport(&forged, T0 + 2000).is_err(), "carimbo posterior ao ban: forjado");
+
+        // Carimbo adulterado ou de autoridade fora da política
+        let mut other_tsa = bob_p.issue_subordinate(&bob, &pk(&eve), P::member(), T0 + 100, T0 + 20 * 86_400).unwrap();
+        other_tsa.add_stamp(LocalTsa::new().stamp(&other_tsa.imprint(), T0 + 101));
+        assert!(st.verify_passport(&other_tsa, T0 + 2000).is_err(), "TSA não homologada");
+        let mut tampered = bob_p.issue_subordinate(&bob, &pk(&eve), P::member(), T0 + 100, T0 + 20 * 86_400).unwrap();
+        let TimestampAttestation::Rfc3161 { tsa, mut token_der } = s.tsa.stamp(&tampered.imprint(), T0 + 101) else { unreachable!() };
+        let n = token_der.len();
+        token_der[n - 3] ^= 0x10;
+        tampered.add_stamp(TimestampAttestation::Rfc3161 { tsa, token_der });
+        assert!(st.verify_passport(&tampered, T0 + 2000).is_err(), "carimbo adulterado");
+    }
+
+    /// Testemunha da rede no papel de TSA, com a regra de linhagem
+    #[test]
+    fn test_peer_witness_counts_only_outside_issuer_lineage() {
+        let mut s = Setup::new();
+        let (bob, carol, sock, witness) = (UserIdentity::generate(), UserIdentity::generate(), UserIdentity::generate(), UserIdentity::generate());
+        let bob_p = s.moderator(&bob, T0);
+        let sock_p = bob_p.issue_subordinate(&bob, &pk(&sock), P::member(), T0, T0 + 20 * 86_400).unwrap();
+        let witness_p = ServerPassport::issue_root(&s.key, &pk(&witness), P::member(), T0, Some(T0 + 20 * 86_400));
+
+        let carol_base = bob_p.issue_subordinate(&bob, &pk(&carol), P::member(), T0 + 100, T0 + 20 * 86_400).unwrap();
+        let mut by_sock = carol_base.clone();
+        by_sock.add_stamp(TimestampAttestation::Peer(Box::new(PeerTimestampToken::issue(&sock, &sock_p, &carol_base.imprint(), "n", T0 + 101))));
+        let mut by_witness = carol_base.clone();
+        by_witness.add_stamp(TimestampAttestation::Peer(Box::new(PeerTimestampToken::issue(&witness, &witness_p, &carol_base.imprint(), "n", T0 + 101))));
+
+        s.append(T0 + 1000, vec![Entry::Ban { target: pk(&bob), until: None, reason: "".into() }]);
+        assert!(s.state().verify_passport(&by_sock, T0 + 2000).is_err(), "testemunha descendente do emissor não vale");
+        assert!(s.state().verify_passport(&by_witness, T0 + 2000).is_ok(), "testemunha independente vale como TSA");
+    }
+
+    #[test]
+    fn test_temporary_ban_expires_and_owner_cannot_be_banned() {
+        let mut s = Setup::new();
         let target = UserIdentity::generate();
-        let cert = s.certify(&moderator, 1, T0 + 1);
-        let c_junior = s.certify(&junior, 2, T0 + 1);
-
-        s.append(T0 + 10, vec![Entry::Ban { target: pk(&target), until: None, reason: "dono".into() }]);
-        let unban = ModAction::create(&moderator, &cert, ModKind::Unban, &pk(&target), "", T0 + 20);
-        assert_eq!(s.state().check_mod_action(&unban, T0 + 20), Err(Rejection::BanFromHigherLevel), "ban do dono");
-
-        s.append(T0 + 30, vec![Entry::Unban { target: pk(&target) }]);
-        s.append(T0 + 40, vec![Entry::IncludeModAction(ban(&moderator, &cert, &pk(&target), T0 + 35))]);
-        let junior_unban = ModAction::create(&junior, &c_junior, ModKind::Unban, &pk(&target), "", T0 + 50);
-        assert_eq!(s.state().check_mod_action(&junior_unban, T0 + 50), Err(Rejection::BanFromHigherLevel), "nível 2 não desfaz nível 1");
-        let same_level_unban = ModAction::create(&moderator, &cert, ModKind::Unban, &pk(&target), "", T0 + 50);
-        assert_eq!(s.state().check_mod_action(&same_level_unban, T0 + 50), Ok(()));
-    }
-
-    #[test]
-    fn test_temporary_ban_expires() {
-        let mut s = Setup::new();
-        let target = UserIdentity::generate();
-        s.append(T0 + 10, vec![Entry::Ban { target: pk(&target), until: Some(T0 + 3600), reason: "1h".into() }]);
+        s.append(T0 + 10, vec![
+            Entry::Ban { target: pk(&target), until: Some(T0 + 3600), reason: "1h".into() },
+            Entry::Ban { target: OWNER_PERSONAL.into(), until: None, reason: "".into() },
+        ]);
         assert!(s.state().is_banned(&pk(&target), T0 + 3599));
         assert!(!s.state().is_banned(&pk(&target), T0 + 3600));
-        assert!(s.state().active_bans(T0 + 4000).is_empty());
+        assert!(!s.state().is_banned(OWNER_PERSONAL, T0 + 20));
+        assert!(s.state().is_allowed_with_passport(OWNER_PERSONAL, None, T0 + 20));
     }
 
     #[test]
-    fn test_expired_cert_missing_permission_and_future_actions_are_rejected() {
+    fn test_revocation_by_server_key_and_by_moderator() {
         let mut s = Setup::new();
-        let moderator = UserIdentity::generate();
-        let target = pk(&UserIdentity::generate());
-        let cert = s.certify(&moderator, 1, T0);
-
-        let after_expiry = T0 + 7 * DAY + 1;
-        assert_eq!(s.state().check_mod_action(&ban(&moderator, &cert, &target, after_expiry), after_expiry), Err(Rejection::CertExpired));
-
-        let future = ban(&moderator, &cert, &target, T0 + 10 + CLOCK_SKEW_SECS + 60);
-        assert_eq!(s.state().check_mod_action(&future, T0 + 10), Err(Rejection::FromTheFuture));
-
-        let admit_only = ModeratorCert::issue(&s.owner, &pk(&moderator), 1, vec![Permission::Admit], T0, DAY);
-        s.append(T0 + 1, vec![Entry::IssueCert(admit_only.clone())]);
-        assert_eq!(s.state().check_mod_action(&ban(&moderator, &admit_only, &target, T0 + 5), T0 + 5), Err(Rejection::MissingPermission));
+        let (moderator, member) = (UserIdentity::generate(), UserIdentity::generate());
+        let mod_p = s.moderator(&moderator, T0);
+        let p1 = ServerPassport::issue_root(&s.key, &pk(&member), P::member(), T0, Some(T0 + 86_400));
+        let p2 = ServerPassport::issue_root(&s.key, &pk(&member), P::member(), T0, Some(T0 + 86_400));
+        s.append(T0 + 1, vec![Entry::RevokePassport { serial: p1.body.serial.clone() }]);
+        let revoke = ModAction::create(&moderator, &mod_p, ModKind::Revoke { serial: p2.body.serial.clone() }, &pk(&member), "", T0 + 2);
+        s.append(T0 + 3, vec![Entry::IncludeModAction(revoke)]);
+        assert!(s.state().verify_passport(&p1, T0 + 5).is_err());
+        assert!(s.state().verify_passport(&p2, T0 + 5).is_err());
+        assert!(!s.state().is_allowed_with_passport(&pk(&member), Some(&p2), T0 + 5));
     }
 
     #[test]
     fn test_same_action_is_not_applied_twice() {
         let mut s = Setup::new();
         let moderator = UserIdentity::generate();
-        let cert = s.certify(&moderator, 1, T0);
-        let action = ban(&moderator, &cert, &pk(&UserIdentity::generate()), T0 + 5);
+        let mod_p = s.moderator(&moderator, T0);
+        let action = ban(&moderator, &mod_p, &pk(&UserIdentity::generate()), T0 + 5);
         s.append(T0 + 10, vec![Entry::IncludeModAction(action.clone())]);
         assert_eq!(s.state().check_mod_action(&action, T0 + 20), Err(Rejection::AlreadyApplied));
-    }
-
-    #[test]
-    fn test_closed_server_allow_list() {
-        let owner = UserIdentity::generate();
-        let mut chain = ServerChain::new(&pk(&owner));
-        chain.append_own(&owner, T0, vec![genesis(true)]);
-        let guest = UserIdentity::generate();
-        let moderator = UserIdentity::generate();
-
-        assert!(chain.state().is_allowed(&pk(&owner), T0));
-        assert!(!chain.state().is_allowed(&pk(&guest), T0));
-        chain.append_own(&owner, T0 + 1, vec![Entry::AllowAdd(pk(&guest))]);
-        assert!(chain.state().is_allowed(&pk(&guest), T0 + 2));
-
-        let cert = ModeratorCert::issue(&owner, &pk(&moderator), 1, default_permissions(), T0, DAY);
-        chain.append_own(&owner, T0 + 2, vec![Entry::IssueCert(cert), Entry::AllowRemove(pk(&guest))]);
-        assert!(chain.state().is_allowed(&pk(&moderator), T0 + 3), "moderador ativo participa");
-        assert!(!chain.state().is_allowed(&pk(&guest), T0 + 3));
-    }
-
-    #[test]
-    fn test_renewal_window() {
-        let mut s = Setup::new();
-        let moderator = UserIdentity::generate();
-        let cert = s.certify(&moderator, 1, T0);
-        assert!(s.state().certs_due_for_renewal(T0 + 4 * DAY).is_empty(), "faltam 3 dias");
-        let due = s.state().certs_due_for_renewal(T0 + 5 * DAY);
-        assert_eq!(due.len(), 1, "faltam 2 dias: entra na janela");
-
-        let renewed = cert.renewed(&s.owner, T0 + 5 * DAY, 7 * DAY);
-        s.append(T0 + 5 * DAY, vec![Entry::IssueCert(renewed)]);
-        assert!(s.state().certs_due_for_renewal(T0 + 5 * DAY + 10).is_empty(), "o sucessor resolve");
-        assert_eq!(s.state().level_of(&pk(&moderator), T0 + 8 * DAY), Some(1), "continua moderador após a validade original");
-    }
-
-    #[test]
-    fn test_banning_moderator_does_not_revoke_previously_issued_passports() {
-        let server_key = UserIdentity::generate();
-        let sid = pk(&server_key);
-        let mut chain = ServerChain::new(&sid);
-        chain.append_own(&server_key, 1000, vec![genesis(true)]);
-
-        let alice = UserIdentity::generate();
-        let bob = UserIdentity::generate();
-        let carol = UserIdentity::generate();
-        let dave = UserIdentity::generate();
-
-        // 1. Servidor emite passaporte vitalício para Alice (Dona, Nível 1)
-        let alice_p = ServerPassport::issue_root(&server_key, &pk(&alice), 1, super::super::passport::PassportPermission::all(), 1000, None);
-
-        // 2. Alice emite passaporte para Bob (Moderador, Nível 2) em t=1000
-        let bob_p = alice_p.issue_subordinate(&alice, &pk(&bob), 2, super::super::passport::PassportPermission::default_moderator(), 1000, 3000).unwrap();
-
-        // 3. Bob emite passaporte para Carol em t=1200 (Bob é moderador legítimo)
-        let carol_p = bob_p.issue_subordinate(&bob, &pk(&carol), 255, super::super::passport::PassportPermission::member(), 1200, 2500).unwrap();
-
-        assert!(chain.state().verify_passport(&carol_p, 1300).is_ok());
-
-        // 4. Em t=1500, Bob comete infração e o dono bane Bob na ServerChain
-        chain.append_own(&server_key, 1500, vec![Entry::Ban { target: pk(&bob), until: None, reason: "infracao".into() }]);
-
-        // 5. Em t=1600:
-        // Bob está banido e seu acesso é negado:
-        assert!(chain.state().is_banned(&pk(&bob), 1600));
-        assert!(!chain.state().is_allowed_with_passport(&pk(&bob), Some(&bob_p), 1600));
-
-        // Carol NÃO perde seu acesso, pois o passaporte foi emitido em t=1200 quando Bob era legítimo!
-        assert!(!chain.state().is_banned(&pk(&carol), 1600));
-        assert!(chain.state().verify_passport(&carol_p, 1600).is_ok(), "Carol permanece válida mesmo após Bob ser banido");
-        assert!(chain.state().is_allowed_with_passport(&pk(&carol), Some(&carol_p), 1600));
-
-        // 6. Se Bob tentar emitir um passaporte para Dave em t=1700 (quando Bob já estava banido):
-        let dave_p = bob_p.issue_subordinate(&bob, &pk(&dave), 255, super::super::passport::PassportPermission::member(), 1700, 2500).unwrap();
-        // Dave é recusado porque na data de emissão (1700) Bob já estava banido!
-        assert!(chain.state().verify_passport(&dave_p, 1750).is_err(), "Dave é recusado pois emissor já estava banido na data de emissão");
     }
 }

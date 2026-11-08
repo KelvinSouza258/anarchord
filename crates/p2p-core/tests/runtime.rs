@@ -162,9 +162,9 @@ async fn test_two_cores_server_lifecycle() {
             }
             assert!(received, "mensagem cifrada deveria chegar a Bob");
 
-            // Sem certificado, Bob não modera
+            // Passaporte de membro não dá permissão de moderar
             bob.server(ServerCommand::Ban { target: "Alice".into(), duration: None, reason: String::new() });
-            bob.wait("ban recusado sem certificado", |e| matches!(e, CoreEvent::Error(CoreError::Server(m)) if m.contains("não tem certificado"))).await;
+            bob.wait("ban recusado sem permissão", |e| matches!(e, CoreEvent::Error(CoreError::Server(m)) if m.contains("não dá essa permissão"))).await;
 
             // O líder determinístico atual (menor pubkey entre Alice e Bob) gira a chave MLS (/server rotate-key)
             if alice_pk < bob_pk {
@@ -201,23 +201,28 @@ async fn test_two_cores_server_lifecycle() {
                 matches!(e, CoreEvent::ChannelEntered { channel, .. } if channel == "geral")
             }).await;
 
-            // Alice certifica Bob como moderador nível 1
-            alice.server(ServerCommand::AddModerator { target: "Bob".into(), level: 1 });
+            // Alice emite passaporte de moderador para Bob
+            alice.server(ServerCommand::AddModerator { target: "Bob".into() });
             alice
-                .wait("Bob certificado", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::ModeratorAdded { level: 1, .. }, .. })))
+                .wait("Bob certificado", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::ModeratorAdded { .. }, .. })))
                 .await;
-            bob.wait("Bob virar moderador", |e| matches!(e, CoreEvent::Server(ServerNotice::Role { level: Some(1), .. }))).await;
+            bob.wait("Bob virar moderador", |e| matches!(e, CoreEvent::Server(ServerNotice::Role { moderator: true, .. }))).await;
 
-            // Moderador nível 1 não age sobre a dona (nível 0)
+            // Moderador não age sobre a dona
             bob.server(ServerCommand::Ban { target: "Alice".into(), duration: None, reason: String::new() });
-            bob.wait("ban recusado pela regra de níveis", |e| matches!(e, CoreEvent::Error(CoreError::Server(m)) if m.contains("nível igual ou superior"))).await;
+            bob.wait("ban recusado: dono protegido", |e| matches!(e, CoreEvent::Error(CoreError::Server(m)) if m.contains("não podem ser alvo"))).await;
 
-            // Alice revoga o certificado e bane Bob por 1 hora
+            // Alice revoga o passaporte de moderador e bane Bob por 1 hora
             alice.server(ServerCommand::RemoveModerator("Bob".into()));
             alice.server(ServerCommand::Ban { target: "Bob".into(), duration: Some(3600), reason: "spam".into() });
             alice.wait("ban gravado", |e| matches!(e, CoreEvent::Server(ServerNotice::Moderated { recorded_by_owner: true, .. }))).await;
-            bob.wait("Bob perder o certificado", |e| matches!(e, CoreEvent::Server(ServerNotice::Role { level: None, .. }))).await;
             bob.wait("Bob ser avisado do ban", |e| matches!(e, CoreEvent::Server(ServerNotice::BanStatus { banned: true, .. }))).await;
+            alice.drain(Duration::from_millis(300)).await;
+            let last_members = alice.seen.iter().rev().find_map(|e| match e {
+                CoreEvent::ChannelMembers { members, .. } => Some(members.clone()),
+                _ => None,
+            });
+            assert!(!last_members.unwrap_or_default().iter().any(|m| m == "Bob"), "banido não aparece na lista do canal");
 
             // A manutenção da dona tira Bob do grupo cifrado; depois disso ele não lê mais nada
             bob.wait("Bob sair do grupo cifrado", |e| matches!(e, CoreEvent::Server(ServerNotice::RemovedFromGroup { .. }))).await;
@@ -226,6 +231,10 @@ async fn test_two_cores_server_lifecycle() {
                 bob.drain(Duration::from_millis(500)).await;
             }
             assert!(!bob.seen.iter().any(|e| chat_text(e) == Some("depois do ban")), "banido não lê mais o servidor");
+            assert!(
+                bob.seen.iter().any(|e| matches!(e, CoreEvent::EncryptedMessage { channel, size, .. } if channel == "geral" && *size > 0)),
+                "o banido vê que as mensagens chegam, mas só cifradas"
+            );
 
             // O histórico (a cadeia) registra tudo
             bob.server(ServerCommand::History);
@@ -237,7 +246,6 @@ async fn test_two_cores_server_lifecycle() {
             let text: Vec<&str> = history.iter().map(|h| h.description.as_str()).collect();
             let joined = text.join("\n");
             assert!(joined.contains("criado 'Rust Guild'"), "{}", joined);
-            assert!(joined.contains("certificado de moderador nível 1"), "{}", joined);
             assert!(joined.contains("revogado"), "{}", joined);
             assert!(joined.contains("dono baniu"), "{}", joined);
 
@@ -511,15 +519,15 @@ async fn test_server_passport_issuance_acceptance_and_flattening() {
             bob.server(ServerCommand::ShowPassport);
             let initial_info = bob
                 .wait("Bob receber PassportInfo inicial", |e| {
-                    matches!(e, CoreEvent::Server(ServerNotice::PassportInfo { level: 255, .. }))
+                    matches!(e, CoreEvent::Server(ServerNotice::PassportInfo { .. }))
                 })
                 .await;
-            assert!(matches!(initial_info, CoreEvent::Server(ServerNotice::PassportInfo { level: 255, .. })));
+            assert!(matches!(initial_info, CoreEvent::Server(ServerNotice::PassportInfo { ref permissions, .. }) if !permissions.contains(&"Ban".to_string())));
 
-            // 2. Alice promove Bob emitindo passaporte de moderador (nível 2)
+            // 2. Alice promove Bob emitindo passaporte de moderador
             alice.server(ServerCommand::IssuePassport {
                 target: "Bob".to_string(),
-                level: 2,
+                moderator: true,
                 duration: Some(7 * 86_400),
             });
 
@@ -527,27 +535,85 @@ async fn test_server_passport_issuance_acceptance_and_flattening() {
             bob.drain(Duration::from_millis(300)).await;
             bob.server(ServerCommand::ShowPassport);
             let promoted_info = bob
-                .wait("Bob receber PassportInfo nível 2", |e| {
-                    matches!(e, CoreEvent::Server(ServerNotice::PassportInfo { level: 2, .. }))
+                .wait("Bob receber PassportInfo de moderador", |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::PassportInfo { permissions, .. }) if permissions.contains(&"Ban".to_string()))
                 })
                 .await;
 
             match promoted_info {
                 CoreEvent::Server(ServerNotice::PassportInfo {
                     holder,
-                    level,
                     chain_depth,
                     permissions,
                     ..
                 }) => {
                     assert_eq!(holder, bob_pubkey);
-                    assert_eq!(level, 2);
                     assert_eq!(chain_depth, 1);
                     assert!(permissions.contains(&"EnterServer".to_string()));
                     assert!(permissions.contains(&"Ban".to_string()));
                 }
                 _ => unreachable!(),
             }
+        })
+        .await;
+}
+
+/// Dona e membro saem e voltam: o servidor continua funcionando com os dados salvos em disco
+#[tokio::test]
+async fn test_server_chat_survives_restart_of_owner_and_member() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (alice_ident, bob_ident) = (UserIdentity::generate_with_nick("Alice"), UserIdentity::generate_with_nick("Bob"));
+            let (alice_srv, alice_down, bob_srv, bob_down) = (temp_dir("ra_srv"), temp_dir("ra_down"), temp_dir("rb_srv"), temp_dir("rb_down"));
+            let room = format!("teste-{}", rand_suffix());
+            let in_server = |id: String| move |e: &CoreEvent| matches!(e, CoreEvent::ChannelEntered { space: SpaceInfo::Server { id: sid, .. }, .. } if *sid == id);
+
+            // 1ª sessão: Alice cria, Bob entra e recebe passaporte automático
+            let (mut alice, alice_task) = start_with_dirs("Alice", alice_ident.clone(), alice_srv.clone(), alice_down.clone(), room.clone(), None);
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+            let (mut bob, bob_task) = start_with_dirs("Bob", bob_ident.clone(), bob_srv.clone(), bob_down.clone(), room.clone(), Some(alice_port));
+            tokio::task::spawn_local(bob_task.run());
+            alice.wait("Alice identificar Bob", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Bob")).await;
+            alice.server(ServerCommand::Create("Guilda".into()));
+            let CoreEvent::Server(ServerNotice::Created { id, .. }) =
+                alice.wait("servidor criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))).await
+            else {
+                unreachable!()
+            };
+            bob.server(ServerCommand::Join(id.clone()));
+            bob.wait("Bob receber a chave", |e| matches!(e, CoreEvent::Server(ServerNotice::KeyReceived { .. }))).await;
+            alice.send(CoreCommand::Shutdown);
+            bob.send(CoreCommand::Shutdown);
+            alice.wait("Alice encerrar", |e| matches!(e, CoreEvent::Stopped)).await;
+            bob.wait("Bob encerrar", |e| matches!(e, CoreEvent::Stopped)).await;
+
+            // 2ª sessão: os dois voltam e conversam no servidor
+            let (mut alice, alice_task) = start_with_dirs("Alice", alice_ident, alice_srv, alice_down, room.clone(), None);
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+            let (mut bob, bob_task) = start_with_dirs("Bob", bob_ident, bob_srv, bob_down, room, Some(alice_port));
+            tokio::task::spawn_local(bob_task.run());
+            alice.wait("Alice identificar Bob de novo", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Bob")).await;
+            alice.server(ServerCommand::Switch(id.clone()));
+            bob.server(ServerCommand::Switch(id.clone()));
+            alice.wait("Alice voltar ao servidor", in_server(id.clone())).await;
+            bob.wait("Bob voltar ao servidor", in_server(id.clone())).await;
+
+            let mut received = false;
+            for _ in 0..30 {
+                alice.send(CoreCommand::SendMessage("de volta".into()));
+                bob.drain(Duration::from_millis(500)).await;
+                if bob.seen.iter().any(|e| chat_text(e) == Some("de volta")) {
+                    received = true;
+                    break;
+                }
+            }
+            alice.drain(Duration::from_millis(100)).await;
+            assert!(received, "Bob deveria receber a mensagem depois de voltar.\nBob: {:#?}\nAlice: {:#?}",
+                bob.seen.iter().filter(|e| !matches!(e, CoreEvent::Network(_))).collect::<Vec<_>>(),
+                alice.seen.iter().filter(|e| matches!(e, CoreEvent::Server(_) | CoreEvent::Error(_))).collect::<Vec<_>>());
         })
         .await;
 }

@@ -83,24 +83,26 @@ pub enum ServerCommand {
     History,
     AddChannel { name: String, voice: bool },
     RemoveChannel(String),
-    /// Emite certificado de moderador (nível 1 = mais autoridade abaixo do dono)
-    AddModerator { target: String, level: u8 },
-    /// Revoga os certificados de moderador
+    /// Emite passaporte de moderador (permissões padrão de moderação)
+    AddModerator { target: String },
+    /// Revoga os passaportes de moderação conhecidos (dono)
     RemoveModerator(String),
     /// Ban com duração em segundos (`None` = permanente)
     Ban { target: String, duration: Option<u64>, reason: String },
     Unban(String),
-    /// Allow-list (servidor fechado)
-    Allow(String),
-    Disallow(String),
+    /// Revoga o passaporte conhecido de um participante
+    Revoke(String),
     Close,
     Open,
-    /// Validade dos certificados e janela de renovação, em segundos
+    /// Validade dos passaportes e janela de renovação, em segundos
     Policy { validity: u64, renewal_window: u64 },
     /// Rotaciona imediatamente a chave de época do grupo MLS atual (executado pelo líder)
     RotateKey,
     /// Emite um passaporte criptográfico do servidor para um par
-    IssuePassport { target: String, level: u8, duration: Option<u64> },
+    IssuePassport { target: String, moderator: bool, duration: Option<u64> },
+    /// Acrescenta uma autoridade de tempo RFC 3161 à configuração do servidor (dono)
+    AddTsa { name: String, url: String, public_key_b64: String },
+    RemoveTsa(String),
     /// Exibe os detalhes criptográficos do passaporte deste nó no servidor atual
     ShowPassport,
     /// Solicita o achatamento de cadeia do passaporte local caso haja autoridade superior online

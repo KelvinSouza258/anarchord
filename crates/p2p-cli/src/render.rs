@@ -11,9 +11,9 @@ use p2p_core::runtime::{
 
 /// Ajuda dos comandos de servidor
 pub const SERVER_HELP: &str = "Comandos: /server create <nome> | join <id> | accept | list | switch <nome|id|lobby> | info | history \
-| invite | channel add <nome> [voz] | channel remove <nome> | passport issue <par> [nível] [duração] | passport show | passport flatten \
-| ban <par> [30m|12h|3d|2w|perm] [motivo] | unban <par> | allow <par> | disallow <par> | close | open \
-| policy <validade> <janela> (ex.: 7d 2d) | rotate-key | leave  (atalho: /lobby)";
+| invite | mod add <par> | mod remove <par> | channel add <nome> [voz] | channel remove <nome> | passport issue <par> [mod] [duração] | passport show | passport flatten \
+| ban <par> [30m|12h|3d|2w|perm] [motivo] | unban <par> | revoke <par> | close (privado) | open (público) \
+| policy <validade> <janela> (ex.: 7d 2d) | tsa add <nome> <url> <chave-base64> | tsa remove <nome> | rotate-key | leave  (atalho: /lobby)";
 
 pub fn space_label(space: &SpaceInfo) -> String {
     match space {
@@ -99,7 +99,7 @@ pub fn describe(event: &CoreEvent) -> Vec<String> {
         }
         CoreEvent::SpaceChanged { .. } | CoreEvent::ServersChanged(_) | CoreEvent::ChannelMembers { .. } => Vec::new(),
         CoreEvent::ChannelEntered { space, channel } => one(format!("🚀 {} #{}", space_label(space), channel)),
-        CoreEvent::ChatMessage { .. } => Vec::new(),
+        CoreEvent::ChatMessage { .. } | CoreEvent::EncryptedMessage { .. } => Vec::new(),
         CoreEvent::InviteReceived { from, known: false, .. } => one(format!("💡 Convite de {}: digite /server accept para entrar", from)),
         CoreEvent::InviteReceived { .. } => Vec::new(),
         CoreEvent::Voice(e) => voice(e).into_iter().collect(),
@@ -308,9 +308,8 @@ fn files(list: &[FileSummary]) -> Vec<String> {
 fn moderation_text(target: &str, kind: &ModKind, at: u64) -> String {
     match kind {
         ModKind::Ban { until } => format!("baniu {} ({})", target, format_duration(until.map(|u| u.saturating_sub(at)))),
-        ModKind::Unban => format!("desbaniu {}", target),
-        ModKind::Admit => format!("admitiu {}", target),
-        ModKind::Unadmit => format!("removeu {} da allow-list", target),
+        ModKind::Unban => format!("desfez o próprio ban de {}", target),
+        ModKind::Revoke { serial } => format!("revogou o passaporte {} de {}", serial, target),
     }
 }
 
@@ -318,14 +317,14 @@ fn server(notice: &ServerNotice) -> Vec<String> {
     let one = |s: String| vec![s];
     match notice {
         ServerNotice::Created { id, name } => one(format!(
-            "🏰 Servidor '{}' criado (id {}). Você é o dono (nível 0). Chat, voz e tela do servidor são cifrados de ponta a ponta. \
-             Use /server invite para convidar.",
+            "🏰 Servidor '{}' criado (id {}). Você é o dono. Chat, voz e tela do servidor são cifrados de ponta a ponta. \
+             Use /server invite para convidar. Carimbos de tempo: FreeTSA (/server tsa para mudar).",
             name,
             short_id(id)
         )),
         ServerNotice::Searching { id } => one(format!(
             "⏳ Procurando membros online do servidor {}... você entra assim que a configuração chegar \
-             (servidor fechado: é preciso estar na allow-list).",
+             (servidor privado: um moderador precisa emitir seu passaporte).",
             short_id(id)
         )),
         ServerNotice::WaitingConfig { id } => one(format!("⏳ A configuração de {} ainda não chegou; você entra assim que chegar.", short_id(id))),
@@ -344,31 +343,31 @@ fn server(notice: &ServerNotice) -> Vec<String> {
         ServerNotice::Changed { change, .. } => one(match change {
             ServerChange::ChannelAdded { name, voice } => format!("✅ Canal {}{} criado.", if *voice { "🔊 " } else { "#" }, name),
             ServerChange::ChannelRemoved(name) => format!("🗑️ Canal {} removido.", name),
-            ServerChange::ModeratorAdded { who, level, validity_secs } => format!(
-                "🛡️ {} agora é moderador nível {} (certificado de {}, renovado automaticamente).",
+            ServerChange::ModeratorAdded { who, validity_secs } => format!(
+                "🛡️ Passaporte de moderador enviado a {} (validade padrão {}).",
                 who,
-                level,
                 format_duration(Some(*validity_secs))
             ),
             ServerChange::ModeratorRemoved { who } => {
-                format!("🛡️ Certificado de {} revogado. Ações dele ainda não consolidadas serão desfeitas.", who)
+                format!("🛡️ Passaporte de moderador de {} revogado. Ações posteriores dele serão desfeitas.", who)
             }
             ServerChange::Closed => {
-                "🔒 Servidor fechado: só dono, moderadores e quem está na allow-list participam. Admita com /server allow <par>.".to_string()
+                "🔒 Servidor privado: só entra quem recebe passaporte de um moderador (/server passport issue <par>).".to_string()
             }
-            ServerChange::Opened => "🔓 Servidor aberto: qualquer um com o id pode entrar.".to_string(),
+            ServerChange::Opened => "🔓 Servidor público: moderadores online emitem passaporte automaticamente a quem pedir.".to_string(),
             ServerChange::Policy { validity_secs, renewal_window_secs } => format!(
-                "⏳ Certificados: validade {}, renovação nos últimos {}.",
+                "⏳ Passaportes: validade {}, renovação nos últimos {}.",
                 format_duration(Some(*validity_secs)),
                 format_duration(Some(*renewal_window_secs))
             ),
+            ServerChange::TsaAdded(name) => format!("🕰️ Autoridade de tempo '{}' adicionada à configuração do servidor.", name),
+            ServerChange::TsaRemoved(name) => format!("🕰️ Autoridade de tempo '{}' removida da configuração do servidor.", name),
         }),
         ServerNotice::Moderated { target, kind, at, recorded_by_owner, .. } => {
             let what = match kind {
                 ModKind::Ban { until } => format!("🔨 {} foi banido ({}).", target, format_duration(until.map(|u| u.saturating_sub(*at)))),
                 ModKind::Unban => format!("🕊️ {} foi desbanido.", target),
-                ModKind::Admit => format!("✅ {} entrou na allow-list.", target),
-                ModKind::Unadmit => format!("🚫 {} saiu da allow-list.", target),
+                ModKind::Revoke { .. } => format!("🎫 Passaporte de {} revogado.", target),
             };
             let note = if *recorded_by_owner { " Gravado na cadeia." } else { " Vale agora; fica definitivo quando o dono consolidar." };
             one(format!("{}{}", what, note))
@@ -378,18 +377,26 @@ fn server(notice: &ServerNotice) -> Vec<String> {
             one(format!("🔨 [{}] {} {}{}", server, by, moderation_text(target, kind, *at), reason))
         }
         ServerNotice::ActionsUndone { server, count } => one(format!(
-            "↩️ [{}] {} ação(ões) de moderação desfeita(s): o certificado do moderador foi revogado ou expirou.",
+            "↩️ [{}] {} ação(ões) de moderação desfeita(s): o autor já estava banido ou perdeu o passaporte.",
             server, count
         )),
         ServerNotice::BanStatus { server, banned: true } => {
             one(format!("⛔ Você foi banido de '{}': suas mensagens serão ignoradas pelos membros.", server))
         }
         ServerNotice::BanStatus { server, banned: false } => one(format!("🕊️ Seu ban em '{}' acabou.", server)),
-        ServerNotice::Role { server, level: Some(level) } => one(format!("🛡️ Você agora é moderador nível {} em '{}'.", level, server)),
-        ServerNotice::Role { server, level: None } => one(format!("🛡️ Você não é mais moderador em '{}'.", server)),
+        ServerNotice::Role { server, moderator: true } => one(format!("🛡️ Você agora é moderador em '{}'.", server)),
+        ServerNotice::Role { server, moderator: false } => one(format!("🛡️ Você não é mais moderador em '{}'.", server)),
+        ServerNotice::AccessRequested { server, who } => one(format!(
+            "🎫 [{}] {} pediu acesso. Servidor privado: emita com /server passport issue {}.",
+            server, who, who
+        )),
+        ServerNotice::StampObtained { server, source } => one(format!("🕰️ [{}] Carimbo de tempo obtido de {}.", server, source)),
+        ServerNotice::StampFailed { server, tsa, reason } => {
+            one(format!("⚠️ [{}] Sem carimbo de {} ({}); valem as testemunhas da rede.", server, tsa, reason))
+        }
         ServerNotice::KeyGranted { to } => one(format!("🔐 {} recebeu a chave do grupo cifrado.", to)),
         ServerNotice::PassportUpdated { server } => one(format!("🎫 Passaporte de '{}' atualizado com sucesso.", server)),
-        ServerNotice::PassportInfo { server, holder, issuer, level, chain_depth, expires_at, permissions } => {
+        ServerNotice::PassportInfo { server, holder, issuer, chain_depth, stamps, expires_at, permissions } => {
             let exp_str = match expires_at {
                 Some(exp) => fmt_utc(*exp),
                 None => "Vitalício (Sem expiração)".to_string(),
@@ -398,7 +405,7 @@ fn server(notice: &ServerNotice) -> Vec<String> {
                 format!("🎫 Passaporte do Servidor '{}':", server),
                 format!("   Titular: {}", short_id(holder)),
                 format!("   Emissor: {}", short_id(issuer)),
-                format!("   Nível: {} (Profundidade da cadeia: {} elos)", level, chain_depth),
+                format!("   Cadeia: {} elo(s) | Carimbos de tempo: {}", chain_depth, stamps),
                 format!("   Validade: {}", exp_str),
                 format!("   Permissões: {}", permissions.join(", ")),
             ]
@@ -416,8 +423,8 @@ fn server(notice: &ServerNotice) -> Vec<String> {
             one(format!("📨 Convite para '{}' publicado no 🌐 Lobby #geral. Quem estiver lá digita /server accept.", server))
         }
         ServerNotice::InviteManual { id } => one(format!("⚠️ Ninguém no 🌐 Lobby #geral agora. Id do servidor para convite manual: {}", id)),
-        ServerNotice::InviteNeedsAllow => {
-            one("🔒 Servidor fechado: admita a pessoa com /server allow <par> para ela conseguir entrar.".to_string())
+        ServerNotice::InviteNeedsPassport => {
+            one("🔒 Servidor privado: emita o passaporte com /server passport issue <par> para a pessoa conseguir entrar.".to_string())
         }
         ServerNotice::List { lobby_current, servers } => {
             let marker = |on: bool| if on { "▶" } else { " " };
@@ -429,14 +436,14 @@ fn server(notice: &ServerNotice) -> Vec<String> {
                 let mut tags = Vec::new();
                 if s.owner {
                     tags.push("dono".to_string());
-                } else if let Some(level) = s.moderator_level {
-                    tags.push(format!("moderador n{}", level));
+                } else if s.moderator {
+                    tags.push("moderador".to_string());
                 }
                 if s.pending {
                     tags.push("aguardando configuração".into());
                 }
                 if s.closed {
-                    tags.push("fechado".into());
+                    tags.push("privado".into());
                 }
                 if s.banned {
                     tags.push("banido".into());
@@ -461,20 +468,32 @@ fn server(notice: &ServerNotice) -> Vec<String> {
 fn server_info(info: &ServerInfo) -> Vec<String> {
     let channels: Vec<String> = info.channels.iter().map(|c| format!("{}{}", if c.voice { "🔊 " } else { "#" }, c.name)).collect();
     let role = match info.role {
-        Role::Owner => "dono (nível 0)".to_string(),
-        Role::Moderator(level) => format!("moderador nível {}", level),
+        Role::Owner => "dono".to_string(),
+        Role::Moderator => "moderador".to_string(),
         Role::Member => "membro".to_string(),
     };
-    let access = if info.closed { format!("fechado, {} na allow-list", info.allow_list) } else { "aberto".to_string() };
-    let mods: Vec<String> = info.moderators.iter().map(|(nick, level, until)| format!("{} (n{}, até {})", nick, level, fmt_utc(*until))).collect();
+    let access = format!(
+        "{}, {} passaporte(s) conhecido(s)",
+        if info.closed { "privado (passaporte manual)" } else { "público (passaporte automático)" },
+        info.passports_known
+    );
+    let mods: Vec<String> = info
+        .moderators
+        .iter()
+        .map(|(nick, perms, until)| {
+            let until = until.map_or("vitalício".to_string(), |u| format!("até {}", fmt_utc(u)));
+            format!("{} ({}; {})", nick, perms.join("/"), until)
+        })
+        .collect();
     let bans: Vec<String> = info
         .bans
         .iter()
         .map(|(nick, until, by)| {
             let until = until.map_or("permanente".to_string(), |u| format!("até {}", fmt_utc(u)));
-            format!("{} ({}, por n{})", nick, until, by)
+            format!("{} ({}, por {})", nick, until, by)
         })
         .collect();
+    let tsas: Vec<String> = info.tsas.iter().map(|(name, url)| format!("{} <{}>", name, url)).collect();
     let none_or = |list: Vec<String>| if list.is_empty() { "nenhum".to_string() } else { list.join(", ") };
     let mls_str = match (&info.mls_leader, info.mls_epoch) {
         (Some(leader), Some(epoch)) => format!("líder MLS: {} (época {})", leader, epoch),
@@ -492,9 +511,10 @@ fn server_info(info: &ServerInfo) -> Vec<String> {
         format!("   Você: {} | Acesso: {}", role, access),
         format!("   Moderadores: {}", none_or(mods)),
         format!("   Banidos: {}", none_or(bans)),
+        format!("   Autoridades de tempo: {} (+ testemunhas da rede)", none_or(tsas)),
         format!(
-            "   Certificados: validade {}, renovação nos últimos {} | Ações aguardando o dono: {}",
-            format_duration(Some(info.cert_validity_secs)),
+            "   Passaportes: validade {}, renovação nos últimos {} | Ações aguardando o dono: {}",
+            format_duration(Some(info.passport_validity_secs)),
             format_duration(Some(info.renewal_window_secs)),
             info.pending_actions
         ),
@@ -611,7 +631,7 @@ fn error(error: &CoreError) -> String {
             "🔐 Aguardando a chave do grupo cifrado deste servidor (sincronizando com o líder presente na sala).".to_string()
         }
         CoreError::BannedHere => "⛔ Você está banido deste servidor: os outros membros ignoram suas mensagens.".to_string(),
-        CoreError::NotOnAllowList => "🔒 Servidor fechado e você não está na allow-list: suas mensagens são ignoradas.".to_string(),
+        CoreError::NoPassport => "🎫 Você ainda não tem passaporte neste servidor: suas mensagens são ignoradas até um moderador emitir.".to_string(),
         CoreError::InLobby => "Você está no 🌐 Lobby. Entre num servidor primeiro (/server list, /server switch <nome>).".to_string(),
         CoreError::SelfModeration => "❌ Você não pode moderar a si mesmo.".to_string(),
         CoreError::NoInvite => "Nenhum convite recebido ainda. Peça para alguém usar /server invite no Lobby.".to_string(),
@@ -639,14 +659,14 @@ mod tests {
                 name: "Guilda".into(),
                 current: true,
                 owner: true,
-                moderator_level: None,
+                moderator: false,
                 pending: false,
                 closed: true,
                 banned: false,
             }],
         }));
         assert_eq!(list.len(), 2);
-        assert!(list[1].starts_with("▶ 🏰 Guilda") && list[1].contains("[dono, fechado]"), "{}", list[1]);
+        assert!(list[1].starts_with("▶ 🏰 Guilda") && list[1].contains("[dono, privado]"), "{}", list[1]);
         assert!(describe(&CoreEvent::Error(CoreError::InLobby))[0].contains("Lobby"));
         assert!(describe(&CoreEvent::ChatMessage {
             channel: "geral".into(),

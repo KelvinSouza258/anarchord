@@ -1,5 +1,5 @@
 use p2p_core::identity::UserIdentity;
-use p2p_core::keystore::{set_keystore_encryption_disabled, is_keystore_encryption_disabled};
+use p2p_core::keystore::set_keystore_encryption_disabled;
 
 #[test]
 fn test_identity_bidirectional_conversion_plain_and_dpapi() {

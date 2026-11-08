@@ -40,6 +40,10 @@ pub enum CoreEvent {
     /// Pares Anarchord inscritos no canal de texto atual
     ChannelMembers { channel: String, members: Vec<String> },
     ChatMessage { channel: String, author: String, author_pubkey: String, text: String, timestamp: u64 },
+    /// Mensagem de canal de texto de servidor que chegou mas este nó não consegue decifrar (sem a
+    /// chave do grupo: banido, ainda sem passaporte ou fora de sincronia). Só o que trafega em claro:
+    /// canal (do tópico), época MLS, tamanho e o próprio texto cifrado (base64, encurtado).
+    EncryptedMessage { server: String, channel: String, epoch: Option<u64>, size: usize, ciphertext_b64: String, timestamp: u64 },
     /// Convite de servidor recebido no chat (`/server accept`)
     InviteReceived { from: String, server_id: String, known: bool },
     Voice(VoiceEvent),
@@ -254,8 +258,14 @@ pub enum ServerNotice {
     ActionsUndone { server: String, count: usize },
     /// Ban deste usuário começou ou acabou
     BanStatus { server: String, banned: bool },
-    /// Nível de moderador deste usuário mudou
-    Role { server: String, level: Option<u8> },
+    /// Este usuário passou a ser (ou deixou de ser) moderador
+    Role { server: String, moderator: bool },
+    /// Alguém sem passaporte pediu acesso a um servidor privado (só moderador emite manualmente)
+    AccessRequested { server: String, who: String },
+    /// Carimbo de tempo obtido (TSA ou testemunha) para uma ação ou passaporte deste nó
+    StampObtained { server: String, source: String },
+    /// Não foi possível obter carimbo de uma TSA da política
+    StampFailed { server: String, tsa: String, reason: String },
     /// (líder) entregou a chave do grupo cifrado a alguém
     KeyGranted { to: String },
     KeyReceived { server: String },
@@ -267,8 +277,8 @@ pub enum ServerNotice {
     InviteSent { server: String },
     /// Ninguém no Lobby para receber o convite: id para mandar à mão
     InviteManual { id: String },
-    /// Servidor fechado: quem foi convidado precisa estar na allow-list
-    InviteNeedsAllow,
+    /// Servidor privado: quem foi convidado precisa receber passaporte de um moderador
+    InviteNeedsPassport,
     List { lobby_current: bool, servers: Vec<ServerListEntry> },
     Info(ServerInfo),
     /// Detalhes do passaporte criptográfico local
@@ -276,8 +286,8 @@ pub enum ServerNotice {
         server: String,
         holder: String,
         issuer: String,
-        level: u8,
         chain_depth: usize,
+        stamps: usize,
         expires_at: Option<UtcSecs>,
         permissions: Vec<String>,
     },
@@ -289,11 +299,13 @@ pub enum ServerNotice {
 pub enum ServerChange {
     ChannelAdded { name: String, voice: bool },
     ChannelRemoved(String),
-    ModeratorAdded { who: String, level: u8, validity_secs: u64 },
+    ModeratorAdded { who: String, validity_secs: u64 },
     ModeratorRemoved { who: String },
     Closed,
     Opened,
     Policy { validity_secs: u64, renewal_window_secs: u64 },
+    TsaAdded(String),
+    TsaRemoved(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -302,7 +314,7 @@ pub struct ServerListEntry {
     pub name: String,
     pub current: bool,
     pub owner: bool,
-    pub moderator_level: Option<u8>,
+    pub moderator: bool,
     pub pending: bool,
     pub closed: bool,
     pub banned: bool,
@@ -311,7 +323,7 @@ pub struct ServerListEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Role {
     Owner,
-    Moderator(u8),
+    Moderator,
     Member,
 }
 
@@ -333,12 +345,15 @@ pub struct ServerInfo {
     pub channels: Vec<ChannelInfo>,
     pub role: Role,
     pub closed: bool,
-    pub allow_list: usize,
-    /// (nick, nível, validade do certificado)
-    pub moderators: Vec<(String, u8, UtcSecs)>,
-    /// (nick, até quando, nível de quem baniu)
-    pub bans: Vec<(String, Option<UtcSecs>, u8)>,
-    pub cert_validity_secs: u64,
+    /// Passaportes conhecidos de participantes
+    pub passports_known: usize,
+    /// (nick, permissões, validade do passaporte)
+    pub moderators: Vec<(String, Vec<String>, Option<UtcSecs>)>,
+    /// (nick, até quando, quem baniu)
+    pub bans: Vec<(String, Option<UtcSecs>, String)>,
+    /// Autoridades de tempo aceitas: (nome, url)
+    pub tsas: Vec<(String, String)>,
+    pub passport_validity_secs: u64,
     pub renewal_window_secs: u64,
     pub pending_actions: usize,
 }
@@ -354,7 +369,8 @@ pub enum CoreError {
     /// Servidor e este nó ainda não tem a chave do grupo cifrado
     NoGroupKey,
     BannedHere,
-    NotOnAllowList,
+    /// Sem passaporte válido no servidor
+    NoPassport,
     /// Comando de servidor usado no Lobby
     InLobby,
     SelfModeration,
