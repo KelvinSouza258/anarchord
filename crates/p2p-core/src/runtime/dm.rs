@@ -599,7 +599,14 @@ impl Runtime {
                             now,
                         ) {
                             DmFirewallVerdict::Allowed => {
-                                if let Some(invite) = super::parse_invite(&payload.text) {
+                                if let Some((invite, maybe_passport)) = super::parse_invite_details(&payload.text) {
+                                    if let Some(passport) = maybe_passport {
+                                        let my_pk = self.my_pubkey();
+                                        let now = super::now_secs();
+                                        let _ = self.servers.join(&invite);
+                                        self.servers.accept_my_passport(&invite, &my_pk, &passport, now);
+                                        let _ = self.servers.persist(&invite);
+                                    }
                                     let known = self.servers.get(&invite).is_some();
                                     self.emit(CoreEvent::InviteReceived {
                                         from: payload.sender_nick.clone(),
@@ -876,7 +883,14 @@ impl Runtime {
                     now,
                 ) {
                     DmFirewallVerdict::Allowed => {
-                        if let Some(invite) = super::parse_invite(&payload.text) {
+                        if let Some((invite, maybe_passport)) = super::parse_invite_details(&payload.text) {
+                            if let Some(passport) = maybe_passport {
+                                let my_pk = self.my_pubkey();
+                                let now = super::now_secs();
+                                let _ = self.servers.join(&invite);
+                                self.servers.accept_my_passport(&invite, &my_pk, &passport, now);
+                                let _ = self.servers.persist(&invite);
+                            }
                             let known = self.servers.get(&invite).is_some();
                             self.emit(CoreEvent::InviteReceived {
                                 from: payload.sender_nick.clone(),
@@ -1788,5 +1802,31 @@ mod tests {
             }
         }
         assert!(got_offline_invite, "Deveria emitir CoreEvent::InviteReceived para convite offline");
+
+        // 3. Convite com Passaporte criptográfico embutido (Servidor Privado)
+        let now = super::super::now_secs();
+        let server_key = UserIdentity::generate();
+        let server_id3 = server_key.public_key_hex();
+        let passport = crate::community::ServerPassport::issue_root(
+            &server_key,
+            &alice_pk,
+            crate::community::PassportPermission::member(),
+            now,
+            Some(now + 3600),
+        );
+        let token = passport.to_token();
+        let invite_with_passport = format!("📨 Convite: /server join {} {}", server_id3, token);
+        let env_with_passport = DirectMessageEnvelope::seal(
+            &bob,
+            &alice_pk,
+            &invite_with_passport,
+            now * 1000,
+            None,
+        ).unwrap();
+
+        runtime.on_dm_wire_message(DmWireMessage::Message(env_with_passport));
+        assert_eq!(runtime.last_invite.as_deref(), Some(server_id3.as_str()));
+        let my_p = runtime.servers.get(&server_id3).and_then(|s| s.my_passport().cloned());
+        assert_eq!(my_p, Some(passport), "Passaporte recebido no convite deve ser aceito automaticamente");
     }
 }

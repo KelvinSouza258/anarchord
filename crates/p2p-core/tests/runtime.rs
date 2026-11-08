@@ -135,7 +135,7 @@ async fn test_two_cores_server_lifecycle() {
             alice.send(CoreCommand::Server(ServerCommand::Switch("Rust Guild".into())));
             // Repete até a malha do #geral se formar (sem ninguém lá, o convite não é publicado)
             for _ in 0..20 {
-                alice.server(ServerCommand::Invite);
+                alice.server(ServerCommand::Invite { target: None, server_id: None });
                 alice.drain(Duration::from_millis(500)).await;
                 if alice.seen.iter().any(|e| matches!(e, CoreEvent::Server(ServerNotice::InviteSent { .. }))) {
                     break;
@@ -614,6 +614,52 @@ async fn test_server_chat_survives_restart_of_owner_and_member() {
             assert!(received, "Bob deveria receber a mensagem depois de voltar.\nBob: {:#?}\nAlice: {:#?}",
                 bob.seen.iter().filter(|e| !matches!(e, CoreEvent::Network(_))).collect::<Vec<_>>(),
                 alice.seen.iter().filter(|e| matches!(e, CoreEvent::Server(_) | CoreEvent::Error(_))).collect::<Vec<_>>());
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_private_server_direct_invite_with_passport() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (alice_ident, bob_ident) = (UserIdentity::generate_with_nick("Alice"), UserIdentity::generate_with_nick("Bob"));
+            let (alice_srv, alice_down, bob_srv, bob_down) = (temp_dir("priv_srv_a"), temp_dir("priv_down_a"), temp_dir("priv_srv_b"), temp_dir("priv_down_b"));
+            let room = format!("priv-{}", rand_suffix());
+            let in_server = |id: String| move |e: &CoreEvent| matches!(e, CoreEvent::ChannelEntered { space: SpaceInfo::Server { id: sid, .. }, .. } if *sid == id);
+
+            let (mut alice, alice_task) = start_with_dirs("Alice", alice_ident, alice_srv, alice_down, room.clone(), None);
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+            let (mut bob, bob_task) = start_with_dirs("Bob", bob_ident, bob_srv, bob_down, room, Some(alice_port));
+            tokio::task::spawn_local(bob_task.run());
+
+            alice.wait("Alice identificar Bob", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Bob")).await;
+            bob.wait("Bob identificar Alice", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Alice")).await;
+
+            // 1. Alice cria um servidor e torna privado (fechado)
+            alice.server(ServerCommand::Create("Clube Privado".into()));
+            let CoreEvent::Server(ServerNotice::Created { id, .. }) =
+                alice.wait("servidor criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))).await
+            else {
+                unreachable!()
+            };
+
+            alice.server(ServerCommand::Close);
+            alice.wait("servidor fechado", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::Closed, .. }))).await;
+
+            // 2. Alice convida Bob diretamente para o servidor privado
+            alice.server(ServerCommand::Invite { target: Some("Bob".into()), server_id: Some(id.clone()) });
+            alice.wait("convite enviado", |e| matches!(e, CoreEvent::Server(ServerNotice::InviteSent { .. }))).await;
+
+            // 3. Bob recebe o convite contendo o passaporte embutido
+            let sid = id.clone();
+            bob.wait("Bob receber convite com passaporte", move |e| matches!(e, CoreEvent::InviteReceived { server_id, .. } if *server_id == sid)).await;
+
+            // 4. Bob aceita o convite e entra diretamente no servidor privado
+            bob.server(ServerCommand::Accept);
+            bob.wait("Bob entrar no servidor privado", in_server(id.clone())).await;
+            bob.wait("Bob receber chave do grupo MLS", |e| matches!(e, CoreEvent::Server(ServerNotice::KeyReceived { .. }))).await;
         })
         .await;
 }

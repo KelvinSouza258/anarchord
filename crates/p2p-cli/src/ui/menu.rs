@@ -346,7 +346,7 @@ pub fn member_menu(
             .iter()
             .map(|s| MenuItem {
                 label: format!("🏰 {}", s.name),
-                action: MenuAction::Run(format!("/dm {} 📨 Convite para o servidor '{}': /server join {}", nick, s.name, s.id)),
+                action: MenuAction::Run(format!("/server invite {} {}", s.id, nick)),
             })
             .collect()
     };

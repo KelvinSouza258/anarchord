@@ -201,7 +201,13 @@ impl Runtime {
         } else if server.is_some_and(|s| s.is_excluded(&message.author_pubkey, now)) {
             tracing::debug!("Mensagem de usuário banido ou sem passaporte válido descartada: {}", message.author_name);
         } else {
-            if let Some(invite) = super::parse_invite(&message.text) {
+            if let Some((invite, maybe_passport)) = super::parse_invite_details(&message.text) {
+                if let Some(passport) = maybe_passport {
+                    let my_pk = self.my_pubkey();
+                    let _ = self.servers.join(&invite);
+                    self.servers.accept_my_passport(&invite, &my_pk, &passport, now);
+                    let _ = self.servers.persist(&invite);
+                }
                 let known = self.servers.get(&invite).is_some();
                 self.emit(CoreEvent::InviteReceived { from: message.author_name.clone(), server_id: invite.clone(), known });
                 self.last_invite = Some(invite);

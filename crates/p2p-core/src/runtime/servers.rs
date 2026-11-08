@@ -32,11 +32,22 @@ pub fn invite_text(server_name: &str, server_id: &str) -> String {
     format!("📨 Convite para o servidor '{}'. Para entrar: /server accept  (ou /server join {})", server_name, server_id)
 }
 
+/// Se a mensagem de chat contém um convite (`/server join <id> [token]`), devolve o id do servidor e o passaporte opcional
+pub fn parse_invite_details(text: &str) -> Option<(String, Option<crate::community::ServerPassport>)> {
+    let rest = text.split("/server join ").nth(1)?.trim();
+    let mut parts = rest.split_whitespace();
+    let id_raw = parts.next()?;
+    let id: String = id_raw.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    if !community::is_valid_server_id(&id) {
+        return None;
+    }
+    let passport = parts.next().and_then(crate::community::ServerPassport::from_token);
+    Some((id, passport))
+}
+
 /// Se a mensagem de chat contém um convite (`/server join <id>`), devolve o id do servidor
 pub fn parse_invite(text: &str) -> Option<String> {
-    let rest = text.split("/server join ").nth(1)?;
-    let id: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-    community::is_valid_server_id(&id).then_some(id)
+    parse_invite_details(text).map(|(id, _)| id)
 }
 
 impl Runtime {
@@ -217,6 +228,7 @@ impl Runtime {
             if let Some(request) = self.servers.chain_request(&id) {
                 self.publish_server_message(&id, &request);
             }
+            self.publish_server_message(&id, &ServerMessage::AccessRequest { server_id: id.clone() });
         }
         let now = super::now_secs();
         let synced: Vec<String> = self.servers.list().filter(|s| s.has_chain()).map(|s| s.server_id.clone()).collect();
@@ -273,9 +285,20 @@ impl Runtime {
     }
 
     /// Entra (ou volta) num servidor pelo id. Sem a cadeia ainda, pede aos membros e entra quando chegar.
-    fn join_server(&mut self, server_id: &str) {
+    fn join_server(&mut self, query: &str) {
+        let mut parts = query.split_whitespace();
+        let server_id = parts.next().unwrap_or(query);
+        let token = parts.next();
         if let Err(e) = self.servers.join(server_id) {
             return self.error(CoreError::Server(e.to_string()));
+        }
+        if let Some(token) = token {
+            if let Some(passport) = crate::community::ServerPassport::from_token(token) {
+                let my_pk = self.my_pubkey();
+                let now = super::now_secs();
+                self.servers.accept_my_passport(server_id, &my_pk, &passport, now);
+                let _ = self.servers.persist(server_id);
+            }
         }
         self.follow_server(server_id);
         if self.servers.get(server_id).is_some_and(|s| s.has_chain()) {
@@ -286,6 +309,7 @@ impl Runtime {
             if let Some(request) = self.servers.chain_request(server_id) {
                 self.publish_server_message(server_id, &request);
             }
+            self.publish_server_message(server_id, &ServerMessage::AccessRequest { server_id: server_id.to_string() });
             self.notice(ServerNotice::Searching { id: server_id.to_string() });
         }
     }
@@ -471,15 +495,59 @@ impl Runtime {
                     None => self.error(CoreError::ServerNotFound(query)),
                 }
             }
-            ServerCommand::Invite => {
-                let id = need_server!();
+            ServerCommand::Invite { target, server_id } => {
+                let id = match server_id {
+                    Some(id) => id,
+                    None => need_server!(),
+                };
                 let name = self.server_name(&id);
-                let invite = ChatMessage::new_signed(&self.identity, "geral", &invite_text(&name, &id), now);
-                let lobby = IdentTopic::new(community::channel_topic(&Space::Lobby, "geral"));
-                let sent = self.publish_gossip(lobby, crate::wire::encode(&invite)).is_ok();
-                self.notice(if sent { ServerNotice::InviteSent { server: name } } else { ServerNotice::InviteManual { id: id.clone() } });
-                if self.servers.get(&id).is_some_and(|s| s.chain().state().closed) {
-                    self.notice(ServerNotice::InviteNeedsPassport);
+                match target {
+                    Some(target_nick) => {
+                        let target_pk = need_peer!(target_nick);
+                        let is_closed = self.servers.get(&id).is_some_and(|s| s.has_chain() && s.chain().state().closed);
+                        let can_issue = self.servers.get(&id).is_some_and(|s| {
+                            s.is_owner() || s.my_passport().is_some_and(|p| p.allows(PassportPermission::IssueMember))
+                        });
+                        let passport_token = if is_closed && can_issue {
+                            match self.servers.issue_passport(&id, &self.identity, &target_pk, PassportPermission::member(), None, now) {
+                                Ok(passport) => {
+                                    if let Some(s) = self.servers.get_mut(&id) {
+                                        s.learn_passport(&passport, now);
+                                    }
+                                    let _ = self.servers.persist(&id);
+                                    self.publish_server_message(&id, &ServerMessage::PassportOffer {
+                                        server_id: id.clone(),
+                                        target: target_pk.clone(),
+                                        passport: passport.clone(),
+                                    });
+                                    self.request_stamps(&id, passport.imprint());
+                                    Some(passport.to_token())
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Não foi possível emitir passaporte automático: {}", e);
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        let text = match passport_token {
+                            Some(token) => format!("📨 Convite para o servidor '{}': /server join {} {}", name, id, token),
+                            None => format!("📨 Convite para o servidor '{}': /server join {}", name, id),
+                        };
+                        self.send_dm(&target_pk, &text, None);
+                        self.notice(ServerNotice::InviteSent { server: name });
+                    }
+                    None => {
+                        let invite = ChatMessage::new_signed(&self.identity, "geral", &invite_text(&name, &id), now);
+                        let lobby = IdentTopic::new(community::channel_topic(&Space::Lobby, "geral"));
+                        let sent = self.publish_gossip(lobby, crate::wire::encode(&invite)).is_ok();
+                        self.notice(if sent { ServerNotice::InviteSent { server: name } } else { ServerNotice::InviteManual { id: id.clone() } });
+                        if self.servers.get(&id).is_some_and(|s| s.chain().state().closed) {
+                            self.notice(ServerNotice::InviteNeedsPassport);
+                        }
+                    }
                 }
             }
             ServerCommand::AddChannel { name, voice } => {

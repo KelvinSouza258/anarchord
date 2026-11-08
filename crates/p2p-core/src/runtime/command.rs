@@ -79,7 +79,8 @@ pub enum ServerCommand {
     Info,
     /// Troca de espaço: nome ou id de servidor, ou "lobby"
     Switch(String),
-    Invite,
+    /// Convite para o servidor: no Lobby se `target` for None, ou por DM direta para o par alvo (com passaporte automático se for privado)
+    Invite { target: Option<String>, server_id: Option<String> },
     History,
     AddChannel { name: String, voice: bool },
     RemoveChannel(String),

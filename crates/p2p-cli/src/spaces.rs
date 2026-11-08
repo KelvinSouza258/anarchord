@@ -16,7 +16,26 @@ pub fn parse_server_command(rest: &str) -> ServerCommand {
         "list" | "ls" => Some(ServerCommand::List),
         "info" => Some(ServerCommand::Info),
         "switch" | "go" => non_empty(args).map(ServerCommand::Switch),
-        "invite" => Some(ServerCommand::Invite),
+        "invite" => {
+            let mut parts = args.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some(first), Some(second)) => {
+                    if p2p_core::community::is_valid_server_id(first) {
+                        Some(ServerCommand::Invite { server_id: Some(first.to_string()), target: Some(second.to_string()) })
+                    } else {
+                        Some(ServerCommand::Invite { target: Some(first.to_string()), server_id: Some(second.to_string()) })
+                    }
+                }
+                (Some(first), None) => {
+                    if p2p_core::community::is_valid_server_id(first) {
+                        Some(ServerCommand::Invite { server_id: Some(first.to_string()), target: None })
+                    } else {
+                        Some(ServerCommand::Invite { target: Some(first.to_string()), server_id: None })
+                    }
+                }
+                _ => Some(ServerCommand::Invite { target: None, server_id: None }),
+            }
+        }
         "history" | "historico" => Some(ServerCommand::History),
         "bans" => Some(ServerCommand::Bans),
         "channel" => {
@@ -130,6 +149,8 @@ mod tests {
         assert_eq!(parse_server_command("create Rust Guild"), ServerCommand::Create("Rust Guild".into()));
         assert_eq!(parse_server_command("join abc123"), ServerCommand::Join("abc123".into()));
         assert_eq!(parse_server_command("accept"), ServerCommand::Accept);
+        assert_eq!(parse_server_command("invite"), ServerCommand::Invite { target: None, server_id: None });
+        assert_eq!(parse_server_command("invite Bob"), ServerCommand::Invite { target: Some("Bob".into()), server_id: None });
         assert_eq!(parse_server_command("list"), ServerCommand::List);
         assert_eq!(parse_server_command("switch lobby"), ServerCommand::Switch("lobby".into()));
         assert_eq!(parse_server_command("channel add #jogos"), ServerCommand::AddChannel { name: "jogos".into(), voice: false });

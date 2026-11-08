@@ -21,7 +21,7 @@ mod voice;
 pub use chat::ActiveChannel;
 pub use command::{CoreCommand, FrameSink, ServerCommand};
 pub use event::*;
-pub use servers::{invite_text, parse_invite};
+pub use servers::{invite_text, parse_invite, parse_invite_details};
 // FriendStatus vem de `event::*`
 
 use crate::community::{self, e2ee::ServerGroups, ServerRegistry, Space};

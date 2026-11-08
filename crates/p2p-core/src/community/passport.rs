@@ -20,6 +20,7 @@
 
 use super::timestamp::TimestampAttestation;
 use crate::identity::{verify_signature_hex, UserIdentity};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -236,6 +237,18 @@ impl ServerPassport {
     /// Hash carimbado deste elo (corpo + assinatura)
     pub fn imprint(&self) -> [u8; 32] {
         super::timestamp::imprint("passport", &crate::wire::signing_bytes("passport", &self.body), &self.signature)
+    }
+
+    /// Serializa o passaporte em um token compacto Base64 (URL-safe) para transporte em convites
+    pub fn to_token(&self) -> String {
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Desserializa um passaporte a partir do token Base64 do convite
+    pub fn from_token(token: &str) -> Option<Self> {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token.trim()).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     /// Valida toda a cadeia criptográfica até a Raiz do Servidor: assinaturas, escopo de
@@ -527,5 +540,22 @@ mod tests {
         assert!(!bob_p.add_stamp_to_link(&parent_imprint, &stamp), "sem duplicar");
         assert_eq!(bob_p.issuer_passport.as_ref().unwrap().stamps.len(), 1);
         assert!(bob_p.verify_at(&pk(&server), 1000).is_ok(), "carimbos não alteram assinaturas");
+    }
+
+    #[test]
+    fn test_passport_token_roundtrip() {
+        let server = UserIdentity::generate();
+        let member = UserIdentity::generate();
+        let passport = ServerPassport::issue_root(
+            &server,
+            &member.public_key_hex(),
+            PassportPermission::member(),
+            1000,
+            Some(2000),
+        );
+        let token = passport.to_token();
+        assert!(!token.is_empty());
+        let restored = ServerPassport::from_token(&token).expect("deve decodificar o token");
+        assert_eq!(passport, restored);
     }
 }
