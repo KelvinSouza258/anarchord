@@ -342,16 +342,33 @@ impl ServerState {
     /// Valida se um passaporte do servidor é aceito e não possui nenhum emissor ou titular banido ou revogado
     pub fn verify_passport(&self, passport: &ServerPassport, at: UtcSecs) -> Result<(), PassportError> {
         passport.verify_at(&self.server_id, at)?;
-        for participant in passport.all_participants() {
-            if self.is_banned(&participant, at) {
-                return Err(PassportError::RevokedOrBanned(participant));
-            }
+
+        // 1. O titular não pode estar banido no momento atual
+        if self.is_banned(&passport.body.holder, at) {
+            return Err(PassportError::RevokedOrBanned(passport.body.holder.clone()));
         }
-        for serial in passport.all_serials() {
-            if self.revoked.contains(&serial) {
-                return Err(PassportError::RevokedOrBanned(serial));
-            }
+
+        // 2. O passaporte do titular não pode ter sido revogado explicitamente
+        if self.revoked.contains(&passport.body.serial) {
+            return Err(PassportError::RevokedOrBanned(passport.body.serial.clone()));
         }
+
+        // 3. Validação temporal de ancestrais:
+        //    Um emissor só invalida o passaporte filho se ele já estava banido no momento da emissão!
+        let mut curr = passport;
+        while let Some(parent) = &curr.issuer_passport {
+            let issuer_pk = &curr.body.issuer;
+            let issued_at = curr.body.issued_at;
+
+            if let Some(ban) = self.bans.get(issuer_pk) {
+                if ban.at <= issued_at && ban.until.map_or(true, |until| issued_at < until) {
+                    return Err(PassportError::RevokedOrBanned(issuer_pk.clone()));
+                }
+            }
+
+            curr = parent;
+        }
+
         Ok(())
     }
 
@@ -776,5 +793,47 @@ mod tests {
         s.append(T0 + 5 * DAY, vec![Entry::IssueCert(renewed)]);
         assert!(s.state().certs_due_for_renewal(T0 + 5 * DAY + 10).is_empty(), "o sucessor resolve");
         assert_eq!(s.state().level_of(&pk(&moderator), T0 + 8 * DAY), Some(1), "continua moderador após a validade original");
+    }
+
+    #[test]
+    fn test_banning_moderator_does_not_revoke_previously_issued_passports() {
+        let server_key = UserIdentity::generate();
+        let sid = pk(&server_key);
+        let mut chain = ServerChain::new(&sid);
+        chain.append_own(&server_key, 1000, vec![genesis(true)]);
+
+        let alice = UserIdentity::generate();
+        let bob = UserIdentity::generate();
+        let carol = UserIdentity::generate();
+        let dave = UserIdentity::generate();
+
+        // 1. Servidor emite passaporte vitalício para Alice (Dona, Nível 1)
+        let alice_p = ServerPassport::issue_root(&server_key, &pk(&alice), 1, super::super::passport::PassportPermission::all(), 1000, None);
+
+        // 2. Alice emite passaporte para Bob (Moderador, Nível 2) em t=1000
+        let bob_p = alice_p.issue_subordinate(&alice, &pk(&bob), 2, super::super::passport::PassportPermission::default_moderator(), 1000, 3000).unwrap();
+
+        // 3. Bob emite passaporte para Carol em t=1200 (Bob é moderador legítimo)
+        let carol_p = bob_p.issue_subordinate(&bob, &pk(&carol), 255, super::super::passport::PassportPermission::member(), 1200, 2500).unwrap();
+
+        assert!(chain.state().verify_passport(&carol_p, 1300).is_ok());
+
+        // 4. Em t=1500, Bob comete infração e o dono bane Bob na ServerChain
+        chain.append_own(&server_key, 1500, vec![Entry::Ban { target: pk(&bob), until: None, reason: "infracao".into() }]);
+
+        // 5. Em t=1600:
+        // Bob está banido e seu acesso é negado:
+        assert!(chain.state().is_banned(&pk(&bob), 1600));
+        assert!(!chain.state().is_allowed_with_passport(&pk(&bob), Some(&bob_p), 1600));
+
+        // Carol NÃO perde seu acesso, pois o passaporte foi emitido em t=1200 quando Bob era legítimo!
+        assert!(!chain.state().is_banned(&pk(&carol), 1600));
+        assert!(chain.state().verify_passport(&carol_p, 1600).is_ok(), "Carol permanece válida mesmo após Bob ser banido");
+        assert!(chain.state().is_allowed_with_passport(&pk(&carol), Some(&carol_p), 1600));
+
+        // 6. Se Bob tentar emitir um passaporte para Dave em t=1700 (quando Bob já estava banido):
+        let dave_p = bob_p.issue_subordinate(&bob, &pk(&dave), 255, super::super::passport::PassportPermission::member(), 1700, 2500).unwrap();
+        // Dave é recusado porque na data de emissão (1700) Bob já estava banido!
+        assert!(chain.state().verify_passport(&dave_p, 1750).is_err(), "Dave é recusado pois emissor já estava banido na data de emissão");
     }
 }
