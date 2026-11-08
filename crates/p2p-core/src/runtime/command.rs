@@ -94,6 +94,8 @@ pub enum ServerCommand {
     Revoke(String),
     Close,
     Open,
+    /// Lista os membros banidos do servidor atual
+    Bans,
     /// Validade dos passaportes e janela de renovação, em segundos
     Policy { validity: u64, renewal_window: u64 },
     /// Rotaciona imediatamente a chave de época do grupo MLS atual (executado pelo líder)

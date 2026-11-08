@@ -2,7 +2,7 @@
 //! grupo cifrado (MLS).
 
 use super::{
-    ChannelInfo, CoreError, CoreEvent, Role, Runtime, ServerChange, ServerCommand, ServerInfo, ServerListEntry, ServerNotice,
+    BanEntry, ChannelInfo, CoreError, CoreEvent, Role, Runtime, ServerChange, ServerCommand, ServerInfo, ServerListEntry, ServerNotice,
 };
 use crate::api::ChatMessage;
 use crate::community::{
@@ -431,6 +431,32 @@ impl Runtime {
                 let id = need_server!();
                 let history = self.servers.history(&id);
                 self.notice(ServerNotice::History(history));
+            }
+            ServerCommand::Bans => {
+                let id = need_server!();
+                let name = self.server_name(&id);
+                let bans: Vec<BanEntry> = if let Some(server) = self.servers.get(&id) {
+                    if server.has_chain() {
+                        server
+                            .chain()
+                            .state()
+                            .active_bans(now)
+                            .into_iter()
+                            .map(|(pk, b)| BanEntry {
+                                target: pk.clone(),
+                                target_nick: self.nick_for(pk),
+                                until: b.until,
+                                reason: b.reason.clone(),
+                                by: self.nick_for(&b.by),
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                self.notice(ServerNotice::Bans { server: name, bans });
             }
             ServerCommand::Switch(query) => {
                 if query.eq_ignore_ascii_case("lobby") {

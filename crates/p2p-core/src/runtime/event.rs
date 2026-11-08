@@ -188,8 +188,10 @@ pub struct ServerSummary {
     pub name: String,
     pub current: bool,
     pub owner: bool,
+    pub moderator: bool,
     /// Configuração ainda não chegou
     pub pending: bool,
+    pub closed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -280,6 +282,8 @@ pub enum ServerNotice {
     /// Servidor privado: quem foi convidado precisa receber passaporte de um moderador
     InviteNeedsPassport,
     List { lobby_current: bool, servers: Vec<ServerListEntry> },
+    /// Lista dos membros atualmente banidos
+    Bans { server: String, bans: Vec<BanEntry> },
     Info(ServerInfo),
     /// Detalhes do passaporte criptográfico local
     PassportInfo {
@@ -318,6 +322,16 @@ pub struct ServerListEntry {
     pub pending: bool,
     pub closed: bool,
     pub banned: bool,
+}
+
+/// Detalhes de um ban ativo para a gestão visual de moderação
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BanEntry {
+    pub target: String,
+    pub target_nick: String,
+    pub until: Option<UtcSecs>,
+    pub reason: String,
+    pub by: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

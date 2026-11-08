@@ -18,6 +18,7 @@ pub fn parse_server_command(rest: &str) -> ServerCommand {
         "switch" | "go" => non_empty(args).map(ServerCommand::Switch),
         "invite" => Some(ServerCommand::Invite),
         "history" | "historico" => Some(ServerCommand::History),
+        "bans" => Some(ServerCommand::Bans),
         "channel" => {
             let mut parts = args.split_whitespace();
             match (parts.next(), parts.next(), parts.next()) {
@@ -136,6 +137,7 @@ mod tests {
         assert_eq!(parse_server_command("rotate-key"), ServerCommand::RotateKey);
         assert_eq!(parse_server_command("rotate"), ServerCommand::RotateKey);
         assert_eq!(parse_server_command("history"), ServerCommand::History);
+        assert_eq!(parse_server_command("bans"), ServerCommand::Bans);
         assert_eq!(parse_server_command("channel remove #jogos"), ServerCommand::RemoveChannel("jogos".into()));
         assert_eq!(
             parse_server_command("policy 7d 2d"),

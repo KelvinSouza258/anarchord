@@ -38,7 +38,19 @@ pub struct ServerEntry {
     pub id: String,
     pub current: bool,
     pub owner: bool,
+    pub moderator: bool,
     pub pending: bool,
+    pub closed: bool,
+}
+
+/// Detalhes de um ban ativo para exibição no menu de bans
+#[derive(Debug, Clone, PartialEq)]
+pub struct BanUiEntry {
+    pub target: String,
+    pub target_nick: String,
+    pub until: Option<u64>,
+    pub reason: String,
+    pub by: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,54 +110,131 @@ impl Menu {
 }
 
 /// O que a interface sabe do contexto atual, para montar menus que fazem sentido
+#[derive(Debug, Clone)]
 pub struct MenuContext<'a> {
     pub in_server: bool,
+    pub is_server_closed: bool,
     pub in_voice: bool,
+    pub is_muted: bool,
+    pub is_screen_sharing: bool,
     pub servers: &'a [ServerEntry],
     pub friends: &'a [FriendUiEntry],
 }
 
-/// Menu principal (F1)
+/// Menu principal (F1) categorizado logicamente por seções
 pub fn main_menu(ctx: &MenuContext) -> Menu {
-    let mut items = vec![
-        ask("🏰 Criar servidor…", "Nome do novo servidor", "/server create {}"),
-        run("📨 Aceitar último convite", "/server accept"),
-        MenuItem { label: "🔀 Trocar de espaço ▸".into(), action: MenuAction::Submenu(spaces_menu(ctx.servers)) },
-        MenuItem { label: "👥 Amigos e DMs ▸".into(), action: MenuAction::Submenu(friends_menu(ctx.friends)) },
-        ask("🔗 Entrar em servidor pelo id…", "Id do servidor (64 caracteres)", "/server join {}"),
+    let items = vec![
+        MenuItem {
+            label: "🔀 Espaços e Servidores ▸".into(),
+            action: MenuAction::Submenu(spaces_category_menu(ctx)),
+        },
+        MenuItem {
+            label: "👥 Amigos e DMs ▸".into(),
+            action: MenuAction::Submenu(friends_menu(ctx.friends)),
+        },
+        MenuItem {
+            label: "📁 Arquivos e Transferências ▸".into(),
+            action: MenuAction::Submenu(files_category_menu()),
+        },
+        MenuItem {
+            label: "🔊 Áudio, Vídeo e Dispositivos ▸".into(),
+            action: MenuAction::Submenu(media_category_menu(ctx)),
+        },
+        MenuItem {
+            label: "⚙️ Configurações e Preferências ▸".into(),
+            action: MenuAction::Submenu(config_category_menu(ctx)),
+        },
+        MenuItem { label: "❓ Ajuda e atalhos".into(), action: MenuAction::Help },
+        run("⏻ Sair do Anarchord", "/quit"),
     ];
+    Menu::new(" Menu Principal ", items)
+}
+
+/// Submenu da categoria Espaços e Servidores
+pub fn spaces_category_menu(ctx: &MenuContext) -> Menu {
+    let mut items = Vec::new();
     if ctx.in_server {
-        items.extend([
-            run("📨 Convidar para este servidor", "/server invite"),
-            ask("➕ Criar canal de texto…", "Nome do canal", "/server channel add {}"),
-            ask("➕ Criar sala de voz…", "Nome da sala de voz", "/server channel add {} voz"),
-            run("ℹ️ Informações do servidor", "/server info"),
-            run("📜 Histórico de alterações", "/server history"),
-            run("🔒 Tornar privado (passaporte manual)", "/server close"),
-            run("🔓 Tornar público (passaporte automático)", "/server open"),
-            ask("⏳ Política de passaportes…", "Validade e janela de renovação (ex.: 7d 2d)", "/server policy {}"),
-            run("🚪 Sair deste servidor", "/server leave"),
-        ]);
+        items.push(run("📨 Convidar para este servidor", "/server invite"));
+        items.push(ask("➕ Criar canal de texto…", "Nome do canal", "/server channel add {}"));
+        items.push(ask("➕ Criar sala de voz…", "Nome da sala de voz", "/server channel add {} voz"));
+        items.push(run("ℹ️ Informações do servidor", "/server info"));
+        items.push(run("🔨 Membros banidos (/server bans)", "/server bans"));
+        // Toggle inteligente de privacidade do servidor
+        if ctx.is_server_closed {
+            items.push(run("🔓 Tornar público (passaporte automático)", "/server open"));
+        } else {
+            items.push(run("🔒 Tornar privado (passaporte manual)", "/server close"));
+        }
+        items.push(run("📜 Histórico de alterações", "/server history"));
+        items.push(ask("⏳ Política de passaportes…", "Validade e janela de renovação (ex.: 7d 2d)", "/server policy {}"));
+        items.push(run("🚪 Sair deste servidor", "/server leave"));
     } else {
         items.push(ask("# Entrar em canal do Lobby…", "Nome do canal", "/join {}"));
     }
+    items.push(MenuItem {
+        label: "🔀 Trocar de espaço ▸".into(),
+        action: MenuAction::Submenu(spaces_menu(ctx.servers)),
+    });
+    items.push(ask("🏰 Criar novo servidor…", "Nome do novo servidor", "/server create {}"));
+    items.push(run("📨 Aceitar último convite", "/server accept"));
+    items.push(ask("🔗 Entrar em servidor pelo id…", "Id do servidor (64 caracteres)", "/server join {}"));
+
+    Menu::new(" Espaços e Servidores ", items)
+}
+
+/// Submenu da categoria Arquivos e Transferências
+pub fn files_category_menu() -> Menu {
+    Menu::new(
+        " Arquivos e Transferências ",
+        vec![
+            run("📁 Gerenciador de arquivos (/files)", "/files"),
+            ask("📎 Compartilhar arquivo na sala…", "Caminho do arquivo", "/share \"{}\""),
+        ],
+    )
+}
+
+/// Submenu da categoria Áudio, Vídeo e Dispositivos com toggles de estado
+pub fn media_category_menu(ctx: &MenuContext) -> Menu {
+    let mut items = Vec::new();
+
+    // Toggle de voz
     if ctx.in_voice {
         items.push(run("🔇 Sair da sala de voz", "/voice leave"));
     } else {
         items.push(ask("🔊 Entrar em sala de voz…", "Nome da sala de voz", "/voice join {}"));
     }
-    items.extend([
-        run("🎙️ Mutar / desmutar microfone", "/mute"),
-        ask("📎 Compartilhar arquivo na sala…", "Caminho do arquivo", "/share \"{}\""),
-        run("📁 Arquivos (ofertas, downloads e compartilhados)", "/files"),
-        run("📺 Compartilhar minha tela", "/screen start"),
-        run("⏹️ Parar compartilhamento de tela", "/screen stop"),
-        run("👥 Pares conectados", "/peers"),
-        run("🎧 Dispositivos de áudio", "/devices"),
-        MenuItem { label: "❓ Ajuda e atalhos".into(), action: MenuAction::Help },
-        run("⏻ Sair do Anarchord", "/quit"),
-    ]);
-    Menu::new(" Menu ", items)
+
+    // Toggle de microfone
+    if ctx.is_muted {
+        items.push(run("🎙️ Desmutar microfone", "/mute"));
+    } else {
+        items.push(run("🔇 Mutar microfone", "/mute"));
+    }
+
+    // Toggle de transmissão de tela
+    if ctx.is_screen_sharing {
+        items.push(run("⏹️ Parar compartilhamento de tela", "/screen stop"));
+    } else {
+        items.push(run("📺 Compartilhar minha tela", "/screen start"));
+    }
+
+    items.push(run("🎧 Dispositivos de áudio", "/devices"));
+    items.push(run("👥 Pares conectados", "/peers"));
+
+    Menu::new(" Áudio, Vídeo e Dispositivos ", items)
+}
+
+/// Submenu da categoria Configurações e Preferências
+pub fn config_category_menu(ctx: &MenuContext) -> Menu {
+    let mut items = vec![
+        run("📋 Ver configurações atuais (/config show)", "/config show"),
+        ask("✏️ Alterar configuração…", "Chave e valor (ex.: mailbox.max_message_ttl_days 14)", "/config set {}"),
+        run("🛡️ Firewall e IPs bloqueados (/firewall)", "/firewall"),
+    ];
+    if ctx.in_server {
+        items.push(run("🔑 Rotacionar chave criptográfica do servidor", "/server rotate-key"));
+    }
+    Menu::new(" Configurações e Preferências ", items)
 }
 
 /// Submenu com o Lobby e os servidores conhecidos
@@ -219,27 +308,94 @@ pub fn friends_menu(friends: &[FriendUiEntry]) -> Menu {
     Menu::new(" Amigos e DMs ", items)
 }
 
-/// Menu de contexto de um membro da sala
-pub fn member_menu(nick: &str, in_server: bool) -> Menu {
+/// Menu de contexto de um membro da sala, com toggles inteligentes e convites ubíquos
+pub fn member_menu(
+    nick: &str,
+    is_friend: bool,
+    in_server: bool,
+    can_moderate: bool,
+    is_moderator: bool,
+    inviteable_servers: &[ServerEntry],
+) -> Menu {
     let mut items = vec![
         run("💬 Abrir conversa direta (DM)", format!("/dm open {}", nick)),
         ask("📨 Enviar mensagem direta…", format!("Mensagem privada para {}", nick), format!("/dm {} {{}}", nick)),
         ask("📁 Enviar arquivo…", format!("Caminho do arquivo para {}", nick), format!("/send {} \"{{}}\"", nick)),
         run("📺 Assistir tela", format!("/screen watch {}", nick)),
-        run("💚 Adicionar aos amigos", format!("/friend add {}", nick)),
-        run("💔 Remover dos amigos", format!("/friend remove {}", nick)),
     ];
-    if in_server {
+
+    // Toggle de Amizade (nunca exibe os dois simultaneamente)
+    if is_friend {
+        items.push(run("💔 Remover dos amigos", format!("/friend remove {}", nick)));
+    } else {
+        items.push(run("💚 Adicionar aos amigos", format!("/friend add {}", nick)));
+    }
+
+    // Convidar para Servidor (Ubíquo: em qualquer lugar onde o usuário tem autoridade)
+    let invite_items = if inviteable_servers.is_empty() {
+        vec![MenuItem {
+            label: "Nenhum servidor administrado".into(),
+            action: MenuAction::Run("/server list".into()),
+        }]
+    } else {
+        inviteable_servers
+            .iter()
+            .map(|s| MenuItem {
+                label: format!("🏰 {}", s.name),
+                action: MenuAction::Run(format!("/dm {} 📨 Convite para o servidor '{}': /server join {}", nick, s.name, s.id)),
+            })
+            .collect()
+    };
+    items.push(MenuItem {
+        label: "🏰 Convidar para Servidor ▸".into(),
+        action: MenuAction::Submenu(Menu::new(format!(" Convidar {} ", nick), invite_items)),
+    });
+
+    if in_server && can_moderate {
+        let mod_item = if is_moderator {
+            run("🛡️ Remover moderador", format!("/server mod remove {}", nick))
+        } else {
+            run("🛡️ Tornar moderador", format!("/server mod add {}", nick))
+        };
         items.extend([
+            mod_item,
             MenuItem { label: "🔨 Banir ▸".into(), action: MenuAction::Submenu(ban_menu(nick)) },
-            run("🕊️ Desbanir", format!("/server unban {}", nick)),
-            run("🛡️ Tornar moderador", format!("/server mod add {}", nick)),
-            run("🛡️ Remover moderador", format!("/server mod remove {}", nick)),
             run("🎫 Emitir passaporte de membro", format!("/server passport issue {}", nick)),
             run("🚫 Revogar passaporte", format!("/server revoke {}", nick)),
         ]);
     }
+
     Menu::new(format!(" {} ", nick), items)
+}
+
+/// Menu interativo de membros banidos com desbanimento em 1 clique
+pub fn bans_menu(server_name: &str, bans: &[BanUiEntry]) -> Menu {
+    let items = if bans.is_empty() {
+        vec![MenuItem {
+            label: "Nenhum membro banido no momento".into(),
+            action: MenuAction::Run("/server info".into()),
+        }]
+    } else {
+        bans.iter()
+            .map(|b| {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                let dur = b.until.map_or("permanente".to_string(), |u| {
+                    format!("expira em {}", p2p_core::community::cert::format_duration(Some(u.saturating_sub(now))))
+                });
+                let name = if b.target_nick.is_empty() {
+                    if b.target.len() >= 8 { &b.target[..8] } else { &b.target }
+                } else {
+                    &b.target_nick
+                };
+                let label = format!("🕊️ Desbanir {} ({})", name, dur);
+                MenuItem {
+                    label,
+                    action: MenuAction::Run(format!("/server unban {}", b.target)),
+                }
+            })
+            .collect()
+    };
+    Menu::new(format!(" Membros Banidos ({}) ", server_name), items)
 }
 
 /// Duração do ban; cada opção pergunta o motivo (opcional)
@@ -350,21 +506,67 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, current: bool) -> ServerEntry {
-        ServerEntry { name: name.into(), id: format!("{}-id", name), current, owner: false, pending: false }
+        ServerEntry {
+            name: name.into(),
+            id: format!("{}-id", name),
+            current,
+            owner: true,
+            moderator: false,
+            pending: false,
+            closed: false,
+        }
     }
 
     #[test]
     fn test_main_menu_depends_on_context() {
-        let lobby = main_menu(&MenuContext { in_server: false, in_voice: false, servers: &[], friends: &[] });
-        assert!(lobby.find("Criar servidor").is_some());
+        let lobby_ctx = MenuContext {
+            in_server: false,
+            is_server_closed: false,
+            in_voice: false,
+            is_muted: false,
+            is_screen_sharing: false,
+            servers: &[],
+            friends: &[],
+        };
+        let lobby = main_menu(&lobby_ctx);
+        assert!(lobby.find("Espaços e Servidores").is_some());
         assert!(lobby.find("Amigos e DMs").is_some());
-        assert!(lobby.find("Convidar").is_none(), "no Lobby não há servidor para convidar");
-        assert!(lobby.find("Entrar em sala de voz").is_some());
+        assert!(lobby.find("Arquivos e Transferências").is_some());
+        assert!(lobby.find("Áudio, Vídeo e Dispositivos").is_some());
+        assert!(lobby.find("Configurações").is_some());
 
-        let server = main_menu(&MenuContext { in_server: true, in_voice: true, servers: &[], friends: &[] });
-        assert!(server.find("Convidar").is_some());
-        assert!(server.find("Criar canal de texto").is_some());
-        assert!(server.find("Sair da sala de voz").is_some());
+        let spaces_lobby = spaces_category_menu(&lobby_ctx);
+        assert!(spaces_lobby.find("Criar novo servidor").is_some());
+        assert!(spaces_lobby.find("Convidar").is_none(), "no Lobby não há servidor para convidar");
+
+        let server_ctx = MenuContext {
+            in_server: true,
+            is_server_closed: false,
+            in_voice: true,
+            is_muted: false,
+            is_screen_sharing: true,
+            servers: &[],
+            friends: &[],
+        };
+        let spaces_server = spaces_category_menu(&server_ctx);
+        assert!(spaces_server.find("Convidar").is_some());
+        assert!(spaces_server.find("Criar canal de texto").is_some());
+        assert!(spaces_server.find("Tornar privado").is_some(), "servidor aberto mostra opção de fechar");
+        assert!(spaces_server.find("Tornar público").is_none());
+
+        // Teste de toggle de privacidade quando fechado
+        let mut server_closed_ctx = server_ctx.clone();
+        server_closed_ctx.is_server_closed = true;
+        let spaces_closed = spaces_category_menu(&server_closed_ctx);
+        assert!(spaces_closed.find("Tornar público").is_some());
+        assert!(spaces_closed.find("Tornar privado").is_none());
+
+        // Teste de toggles de mídia
+        let media = media_category_menu(&server_ctx);
+        assert!(media.find("Sair da sala de voz").is_some());
+        assert!(media.find("Mutar microfone").is_some());
+        assert!(media.find("Parar compartilhamento de tela").is_some(), "já compartilhando");
+        assert!(media.find("Compartilhar minha tela").is_none());
     }
 
     #[test]
@@ -377,17 +579,52 @@ mod tests {
     }
 
     #[test]
-    fn test_member_menu_moderation_only_in_server() {
-        assert!(member_menu("Bob", false).find("Banir").is_none());
-        let menu = member_menu("Bob", true);
+    fn test_member_menu_moderation_and_toggles() {
+        let servers = vec![entry("Minha Guild", false)];
+
+        // No Lobby e sem amizade
+        let lobby_non_friend = member_menu("Bob", false, false, false, false, &servers);
+        assert!(lobby_non_friend.find("Banir").is_none());
+        assert!(lobby_non_friend.find("Adicionar aos amigos").is_some());
+        assert!(lobby_non_friend.find("Remover dos amigos").is_none());
+        assert!(lobby_non_friend.find("Convidar para Servidor").is_some(), "convite ubíquo presente");
+
+        // Já amigo (toggle)
+        let friend_menu = member_menu("Bob", true, false, false, false, &servers);
+        assert!(friend_menu.find("Adicionar aos amigos").is_none());
+        assert!(friend_menu.find("Remover dos amigos").is_some());
+
+        // Em servidor com autoridade de moderação
+        let menu = member_menu("Bob", false, true, true, false, &servers);
         let ban = &menu.items[menu.find("Banir").unwrap()];
         let MenuAction::Submenu(durations) = &ban.action else { panic!("Banir abre as durações") };
         let day = &durations.items[durations.find("1 dia").unwrap()];
         assert_eq!(day.action, MenuAction::Ask { prompt: "Motivo do ban de Bob (opcional)".into(), template: "/server ban Bob 1d {}".into() });
-        assert!(menu.find("Remover moderador").is_some());
+        assert!(menu.find("Tornar moderador").is_some());
+        assert!(menu.find("Remover moderador").is_none());
         assert!(menu.find("Emitir passaporte").is_some());
         let file = &menu.items[menu.find("Enviar arquivo").unwrap()];
         assert!(matches!(&file.action, MenuAction::Ask { template, .. } if template == "/send Bob \"{}\""));
+
+        // Se o alvo já for moderador
+        let mod_target_menu = member_menu("Bob", false, true, true, true, &servers);
+        assert!(mod_target_menu.find("Remover moderador").is_some());
+        assert!(mod_target_menu.find("Tornar moderador").is_none());
+    }
+
+    #[test]
+    fn test_bans_menu_actions() {
+        let bans = vec![BanUiEntry {
+            target: "1122334455667788".into(),
+            target_nick: "Spammer".into(),
+            until: None,
+            reason: "flood".into(),
+            by: "Admin".into(),
+        }];
+        let menu = bans_menu("Meu Servidor", &bans);
+        assert_eq!(menu.items.len(), 1);
+        assert!(menu.items[0].label.contains("Desbanir Spammer"));
+        assert_eq!(menu.items[0].action, MenuAction::Run("/server unban 1122334455667788".into()));
     }
 
     #[test]

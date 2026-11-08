@@ -154,6 +154,8 @@ impl Runtime {
     }
 
     pub(super) fn publish_servers(&self) {
+        let me = self.my_pubkey();
+        let now = super::now_secs();
         let entries = self
             .servers
             .list()
@@ -162,7 +164,9 @@ impl Runtime {
                 id: s.server_id.clone(),
                 current: self.active.server_id() == Some(s.server_id.as_str()),
                 owner: s.is_owner(),
+                moderator: !s.is_owner() && s.has_chain() && s.is_moderator(&me, now),
                 pending: !s.has_chain(),
+                closed: s.has_chain() && s.chain().state().closed,
             })
             .collect();
         self.emit(CoreEvent::ServersChanged(entries));

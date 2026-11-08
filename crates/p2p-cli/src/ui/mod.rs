@@ -21,8 +21,9 @@ use ratatui::{
 use std::collections::{HashMap, HashSet};
 use editor::LineEditor;
 use menu::{
-    channel_command, channel_menu, files_menu, main_menu, member_menu, spaces_menu, FileUiEntry,
-    FileUiState, FriendUiEntry, Menu, MenuAction, MenuContext, ServerEntry, HELP_LINES,
+    bans_menu, channel_command, channel_menu, files_menu, main_menu, member_menu, spaces_menu,
+    BanUiEntry, FileUiEntry, FileUiState, FriendUiEntry, Menu, MenuAction, MenuContext,
+    ServerEntry, HELP_LINES,
 };
 use std::io;
 use std::path::PathBuf;
@@ -100,6 +101,13 @@ pub enum UiEvent {
     FileKnown(FileUiEntry),
     /// Resposta a `/files` — atualiza a lista de arquivos e abre o popup clicável de arquivos
     FilesListed(Vec<FileUiEntry>),
+    /// Resposta a `/server bans` — abre o menu visual de bans com ação de desbanir
+    BansListed {
+        server: String,
+        bans: Vec<BanUiEntry>,
+    },
+    /// Estado da transmissão de tela deste nó (ativa ou inativa)
+    ScreenShareActive(bool),
 }
 
 /// Ações disparadas pela UI para o backend P2P
@@ -152,6 +160,7 @@ pub struct TerminalUi {
     speakers: Vec<String>,                // Nomes de quem está falando agora
     file_transfer: Option<(String, f32, bool)>, // (nome, pct, is_download)
     is_muted: Arc<AtomicBool>,
+    is_screen_sharing: bool,
     peers_area: Rect,
     /// Nicks na ordem exibida em "Membros" (para saber em quem o mouse clicou)
     member_rows: Vec<String>,
@@ -205,6 +214,7 @@ impl TerminalUi {
             speakers: Vec::new(),
             file_transfer: None,
             is_muted,
+            is_screen_sharing: false,
             peers_area: Rect::default(),
             member_rows: Vec::new(),
             space_name: "🌐 Lobby".to_string(),
@@ -436,6 +446,12 @@ impl TerminalUi {
                 self.known_files = entries;
                 self.overlay = Some(Overlay::Menu(vec![files_menu(&self.known_files)]));
             }
+            UiEvent::BansListed { server, bans } => {
+                self.overlay = Some(Overlay::Menu(vec![bans_menu(&server, &bans)]));
+            }
+            UiEvent::ScreenShareActive(active) => {
+                self.is_screen_sharing = active;
+            }
         }
     }
 
@@ -450,6 +466,14 @@ impl TerminalUi {
             Some(Overlay::Menu(mut stack)) => {
                 let Some(menu) = stack.last_mut() else { return Vec::new() };
                 match key.code {
+                    KeyCode::F(1) => {
+                        self.open_main_menu();
+                        return Vec::new();
+                    }
+                    KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.open_main_menu();
+                        return Vec::new();
+                    }
                     KeyCode::Up => menu.up(),
                     KeyCode::Down | KeyCode::Tab => menu.down(),
                     KeyCode::Esc | KeyCode::Left | KeyCode::Backspace => {
@@ -583,7 +607,23 @@ impl TerminalUi {
                 if let Some(index) = row_in(self.peers_area, col, row) {
                     // A primeira linha é o próprio usuário
                     if let Some(nick) = self.member_rows.get(index).filter(|n| **n != self.my_nick).cloned() {
-                        self.overlay = Some(Overlay::Menu(vec![member_menu(&nick, self.in_server)]));
+                        let target_pk = self.peers.iter().find(|(_, n, _)| n == &nick).map(|(_, _, pk)| pk.as_str());
+                        let is_friend = self.friends.iter().any(|f| {
+                            (f.display_name.eq_ignore_ascii_case(&nick) || target_pk.is_some_and(|pk| f.public_key == pk))
+                                && f.state == p2p_core::identity::FriendState::Confirmed
+                        });
+                        let current_server = self.servers.iter().find(|s| s.current);
+                        let can_moderate = self.in_server && current_server.is_some_and(|s| s.owner || s.moderator);
+                        let is_moderator = false;
+                        let inviteable_servers: Vec<ServerEntry> = self.servers.iter().filter(|s| s.owner || s.moderator).cloned().collect();
+                        self.overlay = Some(Overlay::Menu(vec![member_menu(
+                            &nick,
+                            is_friend,
+                            self.in_server,
+                            can_moderate,
+                            is_moderator,
+                            &inviteable_servers,
+                        )]));
                     }
                 } else if let Some(index) = row_in(self.channels_area, col, row) {
                     if let Some((name, is_voice)) = self.space_channels.get(index).cloned() {
@@ -600,9 +640,13 @@ impl TerminalUi {
     }
 
     fn open_main_menu(&mut self) {
+        let is_server_closed = self.servers.iter().find(|s| s.current).map_or(false, |s| s.closed);
         let ctx = MenuContext {
             in_server: self.in_server,
+            is_server_closed,
             in_voice: self.current_voice_channel.is_some(),
+            is_muted: self.is_muted.load(Ordering::Relaxed),
+            is_screen_sharing: self.is_screen_sharing,
             servers: &self.servers,
             friends: &self.friends,
         };
@@ -1443,17 +1487,23 @@ mod tests {
     fn select(ui: &mut TerminalUi, label: &str) -> Vec<UiAction> {
         let Some(Overlay::Menu(stack)) = &ui.overlay else { panic!("nenhum menu aberto") };
         let index = stack.last().unwrap().find(label).unwrap_or_else(|| panic!("item '{}' não está no menu", label));
-        ui.handle_key(key(KeyCode::Char(char::from(b'1' + index as u8))))
+        let mut stack = match ui.overlay.take() {
+            Some(Overlay::Menu(s)) => s,
+            _ => unreachable!(),
+        };
+        stack.last_mut().unwrap().selected = index;
+        ui.activate_menu(stack)
     }
 
     #[test]
     fn test_create_server_through_menu_and_dialog() {
         let mut ui = ui_for("Alice");
         ui.handle_key(key(KeyCode::F(1)));
+        select(&mut ui, "Espaços e Servidores");
         let screen = render(&mut ui);
-        assert!(screen.contains("Criar servidor"), "menu deveria abrir com F1:\n{}", screen);
+        assert!(screen.contains("Criar novo servidor"), "menu deveria abrir com F1:\n{}", screen);
 
-        assert!(ui.handle_key(key(KeyCode::Enter)).is_empty(), "primeiro item pergunta o nome");
+        select(&mut ui, "Criar novo servidor");
         assert!(render(&mut ui).contains("Nome do novo servidor"));
         type_text(&mut ui, "Rust Guild");
         let actions = ui.handle_key(key(KeyCode::Enter));
@@ -1465,7 +1515,8 @@ mod tests {
     fn test_empty_required_answer_keeps_dialog_open() {
         let mut ui = ui_for("Alice");
         ui.handle_key(key(KeyCode::F(1)));
-        ui.handle_key(key(KeyCode::Enter));
+        select(&mut ui, "Espaços e Servidores");
+        select(&mut ui, "Criar novo servidor");
         assert!(ui.handle_key(key(KeyCode::Enter)).is_empty());
         assert!(matches!(ui.overlay, Some(Overlay::Prompt { .. })), "nome é obrigatório");
         ui.handle_key(key(KeyCode::Esc));
@@ -1492,9 +1543,12 @@ mod tests {
             id: "ab".repeat(32),
             current: false,
             owner: true,
+            moderator: false,
             pending: false,
+            closed: false,
         }]));
         ui.handle_key(key(KeyCode::F(1)));
+        select(&mut ui, "Espaços e Servidores");
         select(&mut ui, "Trocar de espaço");
         let screen = render(&mut ui);
         assert!(screen.contains("Rust Guild [dono]"), "{}", screen);
@@ -1508,11 +1562,13 @@ mod tests {
     fn test_server_items_only_in_server() {
         let mut ui = ui_for("Alice");
         ui.handle_key(key(KeyCode::F(1)));
+        select(&mut ui, "Espaços e Servidores");
         assert!(!render(&mut ui).contains("Convidar"));
         ui.handle_key(key(KeyCode::Esc));
 
         ui.handle_event(UiEvent::SpaceChanged { space_name: "🏰 Rust Guild".into(), channels: vec![("geral".into(), false)], is_server: true });
         ui.handle_key(key(KeyCode::F(1)));
+        select(&mut ui, "Espaços e Servidores");
         assert_eq!(sent(&select(&mut ui, "Convidar")), vec!["/server invite"]);
     }
 
@@ -1521,6 +1577,15 @@ mod tests {
         let mut ui = ui_for("Alice");
         ui.handle_event(bob_connected());
         ui.handle_event(UiEvent::SpaceChanged { space_name: "🏰 Rust Guild".into(), channels: vec![("geral".into(), false)], is_server: true });
+        ui.handle_event(UiEvent::ServersChanged(vec![ServerEntry {
+            name: "Rust Guild".into(),
+            id: "123".into(),
+            current: true,
+            owner: true,
+            moderator: false,
+            pending: false,
+            closed: false,
+        }]));
         ui.handle_event(members("geral", &["Bob"]));
         render(&mut ui);
 
@@ -1541,7 +1606,7 @@ mod tests {
     #[test]
     fn test_optional_ban_reason_can_be_empty() {
         let mut ui = ui_for("Alice");
-        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", true)]));
+        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false, true, true, false, &[])]));
         select(&mut ui, "Banir");
         select(&mut ui, "Permanente");
         assert_eq!(sent(&ui.handle_key(key(KeyCode::Enter))), vec!["/server ban Bob perm"]);
@@ -1550,7 +1615,7 @@ mod tests {
     #[test]
     fn test_add_friend_from_member_menu() {
         let mut ui = ui_for("Alice");
-        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false)]));
+        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false, false, false, false, &[])]));
         assert_eq!(sent(&select(&mut ui, "Adicionar aos amigos")), vec!["/friend add Bob"]);
     }
 
@@ -1599,7 +1664,7 @@ mod tests {
     #[test]
     fn test_send_file_from_member_menu_quotes_path() {
         let mut ui = ui_for("Alice");
-        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false)]));
+        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false, false, false, false, &[])]));
         select(&mut ui, "Enviar arquivo");
         type_text(&mut ui, "C:\\fotos\\férias 2026.png");
         assert_eq!(sent(&ui.handle_key(key(KeyCode::Enter))), vec!["/send Bob \"C:\\fotos\\férias 2026.png\""]);

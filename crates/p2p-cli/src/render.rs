@@ -10,7 +10,7 @@ use p2p_core::runtime::{
 };
 
 /// Ajuda dos comandos de servidor
-pub const SERVER_HELP: &str = "Comandos: /server create <nome> | join <id> | accept | list | switch <nome|id|lobby> | info | history \
+pub const SERVER_HELP: &str = "Comandos: /server create <nome> | join <id> | accept | list | switch <nome|id|lobby> | info | history | bans \
 | invite | mod add <par> | mod remove <par> | channel add <nome> [voz] | channel remove <nome> | passport issue <par> [mod] [duração] | passport show | passport flatten \
 | ban <par> [30m|12h|3d|2w|perm] [motivo] | unban <par> | revoke <par> | close (privado) | open (público) \
 | policy <validade> <janela> (ex.: 7d 2d) | tsa add <nome> <url> <chave-base64> | tsa remove <nome> | rotate-key | leave  (atalho: /lobby)";
@@ -425,6 +425,20 @@ fn server(notice: &ServerNotice) -> Vec<String> {
         ServerNotice::InviteManual { id } => one(format!("⚠️ Ninguém no 🌐 Lobby #geral agora. Id do servidor para convite manual: {}", id)),
         ServerNotice::InviteNeedsPassport => {
             one("🔒 Servidor privado: emita o passaporte com /server passport issue <par> para a pessoa conseguir entrar.".to_string())
+        }
+        ServerNotice::Bans { server, bans } => {
+            if bans.is_empty() {
+                one(format!("🔨 Servidor '{}': nenhum membro banido no momento.", server))
+            } else {
+                let mut lines = vec![format!("🔨 Servidor '{}' — {} ban(s) ativo(s):", server, bans.len())];
+                for b in bans {
+                    let dur = b.until.map_or("permanente".to_string(), |u| format!("até {}", fmt_utc(u)));
+                    let name = if b.target_nick.is_empty() { short_id(&b.target).to_string() } else { format!("{} ({})", b.target_nick, short_id(&b.target)) };
+                    let reason = if b.reason.is_empty() { String::new() } else { format!(" — motivo: {}", b.reason) };
+                    lines.push(format!("  • {} — {} por {}{}", name, dur, b.by, reason));
+                }
+                lines
+            }
         }
         ServerNotice::List { lobby_current, servers } => {
             let marker = |on: bool| if on { "▶" } else { " " };

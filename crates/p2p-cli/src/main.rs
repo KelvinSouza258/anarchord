@@ -12,7 +12,7 @@ use clap::Parser;
 
 use p2p_core::files::{FileEvent, FileState};
 
-use p2p_core::runtime::{CoreCommand, CoreConfig, CoreError, CoreEvent, ScreenEvent, ServerCommand, SpaceInfo, VoiceEvent};
+use p2p_core::runtime::{CoreCommand, CoreConfig, CoreError, CoreEvent, ScreenEvent, ServerCommand, ServerNotice, SpaceInfo, VoiceEvent};
 
 use p2p_core::screen::VideoCodec;
 
@@ -34,7 +34,7 @@ use tracing::Level;
 
 use tracing_subscriber::FmtSubscriber;
 
-use ui::menu::{FileUiEntry, FileUiState, FriendUiEntry, ServerEntry};
+use ui::menu::{BanUiEntry, FileUiEntry, FileUiState, FriendUiEntry, ServerEntry};
 
 use ui::{TerminalUi, UiAction, UiEvent};
 
@@ -860,15 +860,18 @@ fn ui_events(event: &CoreEvent) -> Vec<UiEvent> {
         }),
 
         CoreEvent::ServersChanged(servers) => out.push(UiEvent::ServersChanged(
-
             servers
-
                 .iter()
-
-                .map(|s| ServerEntry { name: s.name.clone(), id: s.id.clone(), current: s.current, owner: s.owner, pending: s.pending })
-
+                .map(|s| ServerEntry {
+                    name: s.name.clone(),
+                    id: s.id.clone(),
+                    current: s.current,
+                    owner: s.owner,
+                    moderator: s.moderator,
+                    pending: s.pending,
+                    closed: s.closed,
+                })
                 .collect(),
-
         )),
 
         CoreEvent::Friends(list) => out.push(UiEvent::FriendsChanged(
@@ -1088,7 +1091,30 @@ fn ui_events(event: &CoreEvent) -> Vec<UiEvent> {
                 .collect();
 
             out.push(UiEvent::FilesListed(entries));
+        }
 
+        CoreEvent::Server(ServerNotice::Bans { server, bans }) => {
+            out.push(UiEvent::BansListed {
+                server: server.clone(),
+                bans: bans
+                    .iter()
+                    .map(|b| BanUiEntry {
+                        target: b.target.clone(),
+                        target_nick: b.target_nick.clone(),
+                        until: b.until,
+                        reason: b.reason.clone(),
+                        by: b.by.clone(),
+                    })
+                    .collect(),
+            });
+        }
+
+        CoreEvent::Screen(ScreenEvent::ShareStarted { .. }) => {
+            out.push(UiEvent::ScreenShareActive(true));
+        }
+
+        CoreEvent::Screen(ScreenEvent::ShareStopped) => {
+            out.push(UiEvent::ScreenShareActive(false));
         }
 
         _ => {}
