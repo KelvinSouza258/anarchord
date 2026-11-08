@@ -569,6 +569,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
 
+    // Dados da identidade numa pasta pela pubkey (com migração do formato antigo, se forem dela)
+    let data_dir = data_dir_for(&args.identity_file, &identity.public_key_hex());
+    migrate_legacy_data(&args.identity_file, &identity.public_key_hex(), &data_dir);
+
     let config = CoreConfig {
 
         identity_path: Some(args.identity_file.clone()),
@@ -581,7 +585,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         listen_ip: None,
 
-        servers_dir: servers_dir_for(&args.identity_file),
+        servers_dir: data_dir.join("servers"),
 
         download_dir: download_dir(),
 
@@ -673,7 +677,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             Arc::clone(&muted),
 
-            Some(args.identity_file.with_extension("history")),
+            Some(data_dir.join("history")),
 
         );
 
@@ -1209,11 +1213,11 @@ impl ChatAction {
 
 
 
-/// Pasta dos servidores acompanhados: `<identidade>.servers/`, ao lado do arquivo de identidade.
+/// Pasta de servidores do formato antigo: `<nome>.servers/`, ao lado do arquivo de identidade. Usada
 
-/// Cada identidade tem a sua (ex.: alice.json -> alice.servers/), para nós na mesma pasta não
+/// só para migrar: o nome do arquivo não identifica a identidade (`alice.json[` também dá `alice`),
 
-/// compartilharem chaves de dono.
+/// por isso os dados agora ficam em [`data_dir_for`].
 
 fn servers_dir_for(identity_file: &Path) -> PathBuf {
 
@@ -1221,6 +1225,53 @@ fn servers_dir_for(identity_file: &Path) -> PathBuf {
 
     identity_file.with_file_name(format!("{}.servers", stem))
 
+}
+
+/// Pasta de dados de uma identidade: `<pasta da identidade>/anarchord-data/<pubkey>/`, com
+/// `servers/` (servidores, passaportes, chave de dono, caixa postal) e `history`. É pela pubkey e não
+/// pelo nome do arquivo: duas identidades nunca dividem dados, mesmo com nomes parecidos (ex.:
+/// `alice.json` e `alice.json[`, que dariam o mesmo `alice.servers/`). O nick não entra no nome
+/// porque pode mudar.
+fn data_dir_for(identity_file: &Path, pubkey: &str) -> PathBuf {
+    identity_file.parent().unwrap_or(Path::new("")).join("anarchord-data").join(pubkey)
+}
+
+/// Move os dados do formato antigo (`<nome>.servers/` e `<nome>.history` ao lado da identidade) para
+/// a pasta da pubkey, mas só se forem comprovadamente desta identidade: algum passaporte salvo é dela
+/// ou ela é a dona registrada (Genesis) de algum servidor. Assim uma identidade nova com nome parecido
+/// não herda os dados de outra.
+fn migrate_legacy_data(identity_file: &Path, pubkey: &str, data_dir: &Path) {
+    let legacy_servers = servers_dir_for(identity_file);
+    let new_servers = data_dir.join("servers");
+    if !legacy_servers.is_dir() || new_servers.exists() || !legacy_data_belongs_to(&legacy_servers, pubkey) {
+        return;
+    }
+    let _ = std::fs::create_dir_all(data_dir);
+    if std::fs::rename(&legacy_servers, &new_servers).is_ok() {
+        let legacy_history = identity_file.with_extension("history");
+        if legacy_history.is_file() && !data_dir.join("history").exists() {
+            let _ = std::fs::rename(legacy_history, data_dir.join("history"));
+        }
+    }
+}
+
+/// Algum passaporte salvo na pasta é de `pubkey`, ou `pubkey` é o dono no Genesis de algum servidor
+fn legacy_data_belongs_to(servers_dir: &Path, pubkey: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(servers_dir) else { return false };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        let Some(json) = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok()) else {
+            return false;
+        };
+        if name.ends_with(".passport.json") {
+            json["body"]["holder"].as_str() == Some(pubkey)
+        } else if name.ends_with(".server.json") {
+            json["blocks"][0]["body"]["entries"][0]["Genesis"]["owner"].as_str() == Some(pubkey)
+        } else {
+            false
+        }
+    })
 }
 
 
@@ -1701,6 +1752,12 @@ mod tests {
 
     fn test_servers_dir_is_per_identity() {
 
+        // Formato antigo: o nome do arquivo decide, e nomes parecidos colidem
+        assert_eq!(servers_dir_for(Path::new("alice.json[")), servers_dir_for(Path::new("alice.json")));
+        // Formato novo: a pubkey decide
+        let (alice, typo) = ("a1".repeat(32), "b2".repeat(32));
+        assert_ne!(data_dir_for(Path::new("alice.json"), &alice), data_dir_for(Path::new("alice.json["), &typo));
+        assert_eq!(data_dir_for(Path::new("dados/alice.json"), &alice), PathBuf::from("dados/anarchord-data").join(&alice));
         assert_eq!(servers_dir_for(Path::new("alice.json")), PathBuf::from("alice.servers"));
 
         assert_eq!(servers_dir_for(Path::new("dados/bob.json")), PathBuf::from("dados/bob.servers"));
@@ -1713,6 +1770,29 @@ mod tests {
 
     #[test]
 
+    fn test_legacy_data_migrates_only_to_its_owner() {
+        // Só migra os dados antigos para a identidade a quem eles pertencem (passaporte ou dona)
+        let base = std::env::temp_dir().join(format!("anarchord_migra_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("alice.servers")).unwrap();
+        let (alice, typo) = ("a1".repeat(32), "b2".repeat(32));
+        let passport = serde_json::json!({ "body": { "holder": alice } });
+        std::fs::write(base.join("alice.servers/srv.passport.json"), passport.to_string()).unwrap();
+        std::fs::write(base.join("alice.history"), "oi").unwrap();
+
+        let typo_file = base.join("alice.json[");
+        migrate_legacy_data(&typo_file, &typo, &data_dir_for(&typo_file, &typo));
+        assert!(base.join("alice.servers").exists(), "identidade nova com nome parecido não leva os dados");
+
+        let alice_file = base.join("alice.json");
+        let data = data_dir_for(&alice_file, &alice);
+        migrate_legacy_data(&alice_file, &alice, &data);
+        assert!(data.join("servers/srv.passport.json").exists() && data.join("history").exists(), "a dona leva os dados");
+        assert!(!base.join("alice.servers").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn test_text_commands_become_core_commands() {
 
         let command = |text: &str| parse_user_input(text).into_command();

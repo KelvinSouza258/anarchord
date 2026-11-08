@@ -668,7 +668,18 @@ impl ServerRegistry {
         if self.servers.contains_key(server_id) {
             return Ok(false);
         }
-        self.servers.insert(server_id.to_string(), KnownServer::new(server_id));
+        let mut server = KnownServer::new(server_id);
+        // Voltando a um servidor do qual somos donos (`leave` mantém a chave em disco): a posse volta
+        if let Some(dir) = &self.dir {
+            let key_path = dir.join(format!("{}.owner-key.json", server_id));
+            if key_path.exists() {
+                let key = UserIdentity::load_or_create(&key_path)?;
+                if key.public_key_hex() == server_id {
+                    server.owner_key = Some(key);
+                }
+            }
+        }
+        self.servers.insert(server_id.to_string(), server);
         self.persist(server_id)?;
         Ok(true)
     }
@@ -1453,6 +1464,18 @@ mod tests {
         let mut reg = reg;
         assert!(reg.leave(&id));
         assert!(dir.join(format!("{}.owner-key.json", id)).exists(), "sair nunca apaga a chave");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sair e voltar ao próprio servidor: a chave de dono ficou no disco e a posse volta
+    #[test]
+    fn test_rejoining_own_server_restores_ownership() {
+        let dir = temp_dir("rejoin_owner");
+        let mut reg = ServerRegistry::load(&dir, T0).unwrap();
+        let id = reg.create("Minha", OWNER, T0).unwrap();
+        assert!(reg.leave(&id));
+        assert!(reg.join(&id).unwrap());
+        assert!(reg.get(&id).unwrap().is_owner(), "a chave salva devolve a posse");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
