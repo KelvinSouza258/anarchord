@@ -91,11 +91,17 @@ impl Runtime {
     }
 
     pub(super) fn join_text_channel(&mut self, channel: String) {
-        // No Lobby qualquer nome vira canal; num servidor, qualquer canal existente (texto ou voz, pois todo canal de voz também tem chat de texto)
+        // No Lobby qualquer nome vira canal; num servidor, só é possível entrar por `/join` em canais de texto
+        // (para entrar em canal de voz + texto usa-se `/voice join`, e clicar/entrar num canal de texto desconecta da voz).
         if let Some(server) = self.active.server_id().and_then(|id| self.servers.get(id)) {
-            if !server.has_any_channel(&channel) {
+            if !server.has_channel(&channel, ChannelType::Text) {
                 return self.error(CoreError::NoSuchChannel { name: channel, voice: false });
             }
+        }
+        // Entrar/clicar num canal de texto (`/join`) é uma ordem de saída do canal de voz atual:
+        // o usuário fica somente no canal de texto escolhido.
+        if self.voice.topic.is_some() {
+            self.leave_voice();
         }
         let space = self.active.space.clone();
         self.enter_channel(space, channel);
@@ -103,6 +109,10 @@ impl Runtime {
 
     /// Entra num canal de texto de um espaço (Lobby ou servidor)
     pub(super) fn enter_channel(&mut self, space: Space, channel: String) {
+        // Se mudarmos de espaço (ex.: trocar entre Lobby e Servidor), saímos da sala de voz do espaço anterior
+        if self.active.space != space && self.voice.topic.is_some() {
+            self.leave_voice();
+        }
         self.dm.active_dm_peer = None;
         if let Err(e) = self.active.switch(&mut self.node.swarm.behaviour_mut().gossipsub, space, channel) {
             return self.error(CoreError::Network(format!("{:?}", e)));

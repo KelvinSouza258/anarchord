@@ -17,8 +17,8 @@ const SPEAKING_TIMEOUT: Duration = Duration::from_millis(600);
 #[derive(Default)]
 pub(super) struct VoiceState {
     engine: Option<VoiceEngine>,
-    channel: Option<String>,
-    topic: Option<IdentTopic>,
+    pub(super) channel: Option<String>,
+    pub(super) topic: Option<IdentTopic>,
     /// Nicks presentes na sala de voz (inclui o próprio)
     peers: HashSet<String>,
     /// pubkey -> (nick, último pacote)
@@ -88,8 +88,20 @@ impl Runtime {
         let _ = self.node.swarm.behaviour_mut().gossipsub.unsubscribe(&previous);
         let name = self.voice.channel.take().unwrap_or_default();
         self.voice.peers.clear();
-        self.emit(CoreEvent::Voice(VoiceEvent::Left(name)));
+        self.emit(CoreEvent::Voice(VoiceEvent::Left(name.clone())));
         self.emit_voice_members();
+        // Se o chat ativo ainda era o canal da sala de voz que acabamos de sair,
+        // voltamos para o canal de texto padrão do espaço atual.
+        if self.active.channel == name {
+            let space = self.active.space.clone();
+            let fallback = match &space {
+                crate::community::Space::Lobby => "geral".to_string(),
+                crate::community::Space::Server(id) => self.default_channel(id),
+            };
+            if fallback != name {
+                self.enter_channel(space, fallback);
+            }
+        }
     }
 
     pub(super) fn toggle_mute(&mut self) {

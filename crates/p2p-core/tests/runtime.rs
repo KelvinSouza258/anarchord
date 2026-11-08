@@ -182,21 +182,24 @@ async fn test_two_cores_server_lifecycle() {
                 matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::ChannelAdded { name, voice: true }, .. }) if name == "taverna")
             }).await;
 
-            // Entrar por /join num canal de voz (taverna) deve ser aceito porque todo canal de voz é também de texto
-            alice.send(CoreCommand::JoinChannel("taverna".into()));
-            alice.wait("Alice entrar no chat de texto do canal de voz taverna", |e| {
+            // Entrar num canal de voz (JoinVoice) entra simultaneamente na voz E no chat de texto daquele canal ("taverna")
+            alice.send(CoreCommand::JoinVoice("taverna".into()));
+            alice.wait("Alice entrar na voz de taverna", |e| {
+                matches!(e, CoreEvent::Voice(p2p_core::runtime::VoiceEvent::Joined(ch)) if ch == "taverna")
+            }).await;
+            alice.wait("Alice entrar no chat de texto de taverna junto com a voz", |e| {
                 matches!(e, CoreEvent::ChannelEntered { channel, .. } if channel == "taverna")
             }).await;
 
-            // Entrar por /voice join num canal de voz também deve trocar o canal de texto ativo automaticamente
+            // Clicar/entrar num canal de texto (JoinChannel "geral") é uma ordem de saída do canal de voz:
+            // Alice desconecta automaticamente da voz ("taverna") e fica somente no canal de texto "geral"!
             alice.send(CoreCommand::JoinChannel("geral".into()));
-            alice.wait("Alice voltar para #geral", |e| matches!(e, CoreEvent::ChannelEntered { channel, .. } if channel == "geral")).await;
-            alice.send(CoreCommand::JoinVoice("taverna".into()));
-            alice.wait("Alice entrar na voz e texto de taverna", |e| {
-                matches!(e, CoreEvent::ChannelEntered { channel, .. } if channel == "taverna")
+            alice.wait("Alice sair automaticamente da sala de voz ao clicar num canal de texto", |e| {
+                matches!(e, CoreEvent::Voice(p2p_core::runtime::VoiceEvent::Left(ch)) if ch == "taverna")
             }).await;
-            alice.send(CoreCommand::LeaveVoice);
-            alice.send(CoreCommand::JoinChannel("geral".into()));
+            alice.wait("Alice voltar para o canal de texto #geral", |e| {
+                matches!(e, CoreEvent::ChannelEntered { channel, .. } if channel == "geral")
+            }).await;
 
             // Alice certifica Bob como moderador nível 1
             alice.server(ServerCommand::AddModerator { target: "Bob".into(), level: 1 });

@@ -886,11 +886,7 @@ impl TerminalUi {
             ))));
         } else {
             for (name, is_voice) in &self.space_channels {
-                let active = if *is_voice {
-                    self.current_voice_channel.as_deref() == Some(name.as_str()) || *name == self.current_channel
-                } else {
-                    *name == self.current_channel
-                };
+                let active = *name == self.current_channel || (*is_voice && self.current_voice_channel.as_deref() == Some(name.as_str()));
                 let label = format!("{} {} {}", if active { "▶" } else { " " }, if *is_voice { "🔊" } else { "#" }, name);
                 let style = if active {
                     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)

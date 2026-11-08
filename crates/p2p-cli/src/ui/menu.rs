@@ -258,7 +258,6 @@ pub fn channel_menu(name: &str, is_voice: bool) -> Menu {
     let items = if is_voice {
         vec![
             run("🔊 Entrar na sala de voz", format!("/voice join {}", name)),
-            run("# Abrir apenas o chat de texto", format!("/join {}", name)),
             run("🔇 Sair da sala de voz", "/voice leave"),
         ]
     } else {
@@ -396,7 +395,7 @@ mod tests {
         let mut menu = channel_menu("voz", true);
         assert_eq!(menu.selected, 0);
         menu.up();
-        assert_eq!(menu.selected, 2);
+        assert_eq!(menu.selected, 1);
         menu.down();
         assert_eq!(menu.selected, 0);
     }

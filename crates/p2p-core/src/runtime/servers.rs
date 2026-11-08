@@ -41,7 +41,7 @@ impl Runtime {
         self.publish_gossip(topic, crate::wire::encode(message)).is_ok()
     }
 
-    fn default_channel(&self, server_id: &str) -> String {
+    pub(super) fn default_channel(&self, server_id: &str) -> String {
         self.servers.get(server_id).and_then(|s| s.default_text_channel()).unwrap_or_else(|| "geral".to_string())
     }
 
@@ -150,10 +150,10 @@ impl Runtime {
             .collect();
         for id in ids {
             if self.mls.has_group(&id) {
+                if let Ok(Some(commit)) = e2ee::enforce_membership(&mut self.mls, &self.servers, &id, now) {
+                    self.publish_server_message(&id, &commit);
+                }
                 if self.mls.is_leader(&id) {
-                    if let Ok(Some(commit)) = e2ee::enforce_membership(&mut self.mls, &self.servers, &id, now) {
-                        self.publish_server_message(&id, &commit);
-                    }
                     if self.mls.needs_periodic_rotation(&id, e2ee::DEFAULT_KEY_ROTATION_INTERVAL) {
                         if let Ok(commit) = self.mls.rotate_key(&id) {
                             self.publish_server_message(&id, &ServerMessage::Commit { server_id: id.clone(), commit });
