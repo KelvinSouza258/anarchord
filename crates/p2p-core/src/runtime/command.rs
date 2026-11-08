@@ -83,8 +83,8 @@ pub enum ServerCommand {
     History,
     AddChannel { name: String, voice: bool },
     RemoveChannel(String),
-    /// Emite passaporte de moderador (permissões padrão de moderação)
-    AddModerator { target: String },
+    /// Emite passaporte de moderador (permissões padrão de moderação se `None`, ou personalizadas)
+    AddModerator { target: String, permissions: Option<Vec<crate::community::PassportPermission>> },
     /// Revoga os passaportes de moderação conhecidos (dono)
     RemoveModerator(String),
     /// Ban com duração em segundos (`None` = permanente)

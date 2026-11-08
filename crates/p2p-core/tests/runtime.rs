@@ -202,7 +202,7 @@ async fn test_two_cores_server_lifecycle() {
             }).await;
 
             // Alice emite passaporte de moderador para Bob
-            alice.server(ServerCommand::AddModerator { target: "Bob".into() });
+            alice.server(ServerCommand::AddModerator { target: "Bob".into(), permissions: None });
             alice
                 .wait("Bob certificado", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::ModeratorAdded { .. }, .. })))
                 .await;

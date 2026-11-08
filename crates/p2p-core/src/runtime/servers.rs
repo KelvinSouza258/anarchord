@@ -493,12 +493,16 @@ impl Runtime {
                 let result = self.servers.remove_channel(&id, &name, now);
                 self.publish_change(&id, result, ServerChange::ChannelRemoved(name));
             }
-            ServerCommand::AddModerator { target } => {
+            ServerCommand::AddModerator { target, permissions } => {
                 let id = need_server!();
                 let pubkey = need_peer!(target);
                 let validity_secs = self.servers.get(&id).map_or(0, |s| s.chain().state().passport_validity_secs);
                 let who = self.nick_for(&pubkey);
-                match self.issue_and_offer(&id, &pubkey, PassportPermission::default_moderator(), None) {
+                let mut perms = permissions.unwrap_or_else(PassportPermission::default_moderator);
+                if !perms.is_empty() && !perms.contains(&PassportPermission::EnterServer) {
+                    perms.insert(0, PassportPermission::EnterServer);
+                }
+                match self.issue_and_offer(&id, &pubkey, perms, None) {
                     Ok(()) => self.notice(ServerNotice::Changed { server: self.server_name(&id), change: ServerChange::ModeratorAdded { who, validity_secs } }),
                     Err(e) => self.error(CoreError::Server(e.to_string())),
                 }

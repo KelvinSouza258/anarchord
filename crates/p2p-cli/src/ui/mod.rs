@@ -483,7 +483,7 @@ impl TerminalUi {
                         }
                         return Vec::new();
                     }
-                    KeyCode::Enter | KeyCode::Right => return self.activate_menu(stack),
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ') => return self.activate_menu(stack),
                     KeyCode::Char(c @ '1'..='9') => {
                         let index = c as usize - '1' as usize;
                         if index < menu.items.len() {
@@ -666,6 +666,52 @@ impl TerminalUi {
                 stack.push(submenu);
                 self.overlay = Some(Overlay::Menu(stack));
                 Vec::new()
+            }
+            MenuAction::ToggleCheckbox => {
+                if let Some(menu) = stack.last_mut() {
+                    if let Some(current_item) = menu.items.get_mut(menu.selected) {
+                        if current_item.label.starts_with("[X] ") {
+                            current_item.label = current_item.label.replacen("[X] ", "[ ] ", 1);
+                        } else if current_item.label.starts_with("[ ] ") {
+                            current_item.label = current_item.label.replacen("[ ] ", "[X] ", 1);
+                        }
+                    }
+                }
+                self.overlay = Some(Overlay::Menu(stack));
+                Vec::new()
+            }
+            MenuAction::ApplyPermissions { nick } => {
+                let mut selected_perms = Vec::new();
+                if let Some(menu) = stack.last() {
+                    for item in &menu.items {
+                        if item.label.starts_with("[X] ") {
+                            if item.label.contains("EnterServer") {
+                                selected_perms.push("enter");
+                            }
+                            if item.label.contains("Ban") {
+                                selected_perms.push("ban");
+                            }
+                            if item.label.contains("IssueMember") {
+                                selected_perms.push("issue");
+                            }
+                            if item.label.contains("Delegate") {
+                                selected_perms.push("delegate");
+                            }
+                            if item.label.contains("ManageChannels") {
+                                selected_perms.push("channels");
+                            }
+                            if item.label.contains("ManageConfig") {
+                                selected_perms.push("config");
+                            }
+                        }
+                    }
+                }
+                if selected_perms.is_empty() {
+                    self.submit_line(&format!("/server mod remove {}", nick))
+                } else {
+                    let cmd = format!("/server mod add {} {}", nick, selected_perms.join(" "));
+                    self.submit_line(&cmd)
+                }
             }
             MenuAction::Help => {
                 self.overlay = Some(Overlay::Help);
@@ -1617,6 +1663,28 @@ mod tests {
         let mut ui = ui_for("Alice");
         ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false, false, false, false, &[])]));
         assert_eq!(sent(&select(&mut ui, "Adicionar aos amigos")), vec!["/friend add Bob"]);
+    }
+
+    #[test]
+    fn test_permissions_menu_checkbox_toggle_and_apply() {
+        let mut ui = ui_for("Alice");
+        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false, true, true, false, &[])]));
+        select(&mut ui, "Permissões e Moderação");
+        assert!(render(&mut ui).contains("Acessar Servidor"));
+
+        // Alterna "Gerenciar Canais" de [ ] para [X]
+        select(&mut ui, "Gerenciar Canais");
+        let Some(Overlay::Menu(stack)) = &ui.overlay else { panic!("menu aberto") };
+        assert!(stack.last().unwrap().items.iter().any(|i| i.label.starts_with("[X]") && i.label.contains("Gerenciar Canais")));
+
+        // Alterna "Banir Membros" de [X] para [ ]
+        select(&mut ui, "Banir Membros");
+        let Some(Overlay::Menu(stack)) = &ui.overlay else { panic!("menu aberto") };
+        assert!(stack.last().unwrap().items.iter().any(|i| i.label.starts_with("[ ]") && i.label.contains("Banir Membros")));
+
+        // Aplica as permissões selecionadas
+        let actions = select(&mut ui, "Aplicar Permissões");
+        assert_eq!(sent(&actions), vec!["/server mod add Bob enter issue channels"]);
     }
 
     #[test]

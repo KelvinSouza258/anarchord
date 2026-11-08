@@ -32,9 +32,30 @@ pub fn parse_server_command(rest: &str) -> ServerCommand {
         }
         "mod" => {
             let mut parts = args.split_whitespace();
-            match (parts.next(), parts.next(), parts.next()) {
-                (Some("add"), Some(target), None) => Some(ServerCommand::AddModerator { target: target.to_string() }),
-                (Some("remove"), Some(target), None) => Some(ServerCommand::RemoveModerator(target.to_string())),
+            match parts.next() {
+                Some("add") => parts.next().and_then(|target| {
+                    let rest: Vec<&str> = parts.collect();
+                    let permissions = if rest.is_empty() {
+                        None
+                    } else {
+                        let parsed: Vec<_> = rest
+                            .into_iter()
+                            .map(p2p_core::community::PassportPermission::parse_permission)
+                            .collect::<Option<Vec<_>>>()?;
+                        Some(parsed)
+                    };
+                    Some(ServerCommand::AddModerator {
+                        target: target.to_string(),
+                        permissions,
+                    })
+                }),
+                Some("remove") => parts.next().and_then(|target| {
+                    if parts.next().is_none() {
+                        Some(ServerCommand::RemoveModerator(target.to_string()))
+                    } else {
+                        None
+                    }
+                }),
                 _ => None,
             }
         }
@@ -113,7 +134,17 @@ mod tests {
         assert_eq!(parse_server_command("switch lobby"), ServerCommand::Switch("lobby".into()));
         assert_eq!(parse_server_command("channel add #jogos"), ServerCommand::AddChannel { name: "jogos".into(), voice: false });
         assert_eq!(parse_server_command("channel add papo voz"), ServerCommand::AddChannel { name: "papo".into(), voice: true });
-        assert_eq!(parse_server_command("mod add Bob"), ServerCommand::AddModerator { target: "Bob".into() });
+        assert_eq!(parse_server_command("mod add Bob"), ServerCommand::AddModerator { target: "Bob".into(), permissions: None });
+        assert_eq!(
+            parse_server_command("mod add Bob ban channels"),
+            ServerCommand::AddModerator {
+                target: "Bob".into(),
+                permissions: Some(vec![
+                    p2p_core::community::PassportPermission::Ban,
+                    p2p_core::community::PassportPermission::ManageChannels,
+                ]),
+            }
+        );
         assert_eq!(parse_server_command("mod remove Bob"), ServerCommand::RemoveModerator("Bob".into()));
         assert_eq!(
             parse_server_command("ban Bob spam no canal"),

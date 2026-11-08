@@ -61,6 +61,10 @@ pub enum MenuAction {
     Ask { prompt: String, template: String },
     /// Abre um submenu
     Submenu(Menu),
+    /// Alterna um item de checkbox no menu atual
+    ToggleCheckbox,
+    /// Aplica permissões selecionadas via checkboxes
+    ApplyPermissions { nick: String },
     /// Abre a tela de ajuda
     Help,
 }
@@ -358,6 +362,10 @@ pub fn member_menu(
             run("🛡️ Tornar moderador", format!("/server mod add {}", nick))
         };
         items.extend([
+            MenuItem {
+                label: "🛡️ Permissões e Moderação ▸".into(),
+                action: MenuAction::Submenu(permissions_menu(nick, is_moderator)),
+            },
             mod_item,
             MenuItem { label: "🔨 Banir ▸".into(), action: MenuAction::Submenu(ban_menu(nick)) },
             run("🎫 Emitir passaporte de membro", format!("/server passport issue {}", nick)),
@@ -366,6 +374,49 @@ pub fn member_menu(
     }
 
     Menu::new(format!(" {} ", nick), items)
+}
+
+/// Submenu interativo com checkboxes para seleção de permissões de moderador
+pub fn permissions_menu(nick: &str, _is_moderator: bool) -> Menu {
+    let items = vec![
+        MenuItem {
+            label: "[X] 🚪 Acessar Servidor (EnterServer)".into(),
+            action: MenuAction::ToggleCheckbox,
+        },
+        MenuItem {
+            label: "[X] 🔨 Banir Membros (Ban)".into(),
+            action: MenuAction::ToggleCheckbox,
+        },
+        MenuItem {
+            label: "[X] 🎫 Emitir Membro (IssueMember)".into(),
+            action: MenuAction::ToggleCheckbox,
+        },
+        MenuItem {
+            label: "[ ] 👑 Delegar Moderadores (Delegate)".into(),
+            action: MenuAction::ToggleCheckbox,
+        },
+        MenuItem {
+            label: "[ ] 💬 Gerenciar Canais (ManageChannels)".into(),
+            action: MenuAction::ToggleCheckbox,
+        },
+        MenuItem {
+            label: "[ ] ⚙️ Gerenciar Servidor (ManageConfig)".into(),
+            action: MenuAction::ToggleCheckbox,
+        },
+        MenuItem {
+            label: "💾 Aplicar Permissões Selecionadas".into(),
+            action: MenuAction::ApplyPermissions { nick: nick.to_string() },
+        },
+        MenuItem {
+            label: "🛡️ Aplicar Perfil Padrão (Ban + Convidar)".into(),
+            action: MenuAction::Run(format!("/server mod add {}", nick)),
+        },
+        MenuItem {
+            label: "❌ Revogar Moderação".into(),
+            action: MenuAction::Run(format!("/server mod remove {}", nick)),
+        },
+    ];
+    Menu::new(format!(" Permissões de {} ", nick), items)
 }
 
 /// Menu interativo de membros banidos com desbanimento em 1 clique
@@ -625,6 +676,22 @@ mod tests {
         assert_eq!(menu.items.len(), 1);
         assert!(menu.items[0].label.contains("Desbanir Spammer"));
         assert_eq!(menu.items[0].action, MenuAction::Run("/server unban 1122334455667788".into()));
+    }
+
+    #[test]
+    fn test_permissions_menu_structure_and_actions() {
+        let menu = permissions_menu("Carol", false);
+        assert!(menu.find("Acessar Servidor").is_some());
+        assert!(menu.find("Banir Membros").is_some());
+        assert!(menu.find("Gerenciar Canais").is_some());
+        assert!(menu.find("Gerenciar Servidor").is_some());
+        assert!(menu.find("Aplicar Permissões").is_some());
+
+        let ban_item = &menu.items[menu.find("Banir Membros").unwrap()];
+        assert_eq!(ban_item.action, MenuAction::ToggleCheckbox);
+
+        let apply_item = &menu.items[menu.find("Aplicar Permissões").unwrap()];
+        assert_eq!(apply_item.action, MenuAction::ApplyPermissions { nick: "Carol".into() });
     }
 
     #[test]

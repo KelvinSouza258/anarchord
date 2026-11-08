@@ -73,6 +73,45 @@ impl PassportPermission {
     pub fn is_moderation(permissions: &[Self]) -> bool {
         permissions.iter().any(|p| *p != PassportPermission::EnterServer)
     }
+
+    /// Reconhece uma permissão a partir de código textual ou alias em PT/EN
+    pub fn parse_permission(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "enterserver" | "enter" | "acesso" | "entrar" => Some(PassportPermission::EnterServer),
+            "issuemember" | "issue" | "convidar" | "membro" => Some(PassportPermission::IssueMember),
+            "delegate" | "delegar" => Some(PassportPermission::Delegate),
+            "ban" | "banir" => Some(PassportPermission::Ban),
+            "managechannels" | "channels" | "canais" => Some(PassportPermission::ManageChannels),
+            "manageconfig" | "config" | "configuracao" | "configuracoes" | "configurações" => {
+                Some(PassportPermission::ManageConfig)
+            }
+            _ => None,
+        }
+    }
+
+    /// Identificador textual curto para linha de comando e serialização
+    pub fn code(&self) -> &'static str {
+        match self {
+            PassportPermission::EnterServer => "enter",
+            PassportPermission::IssueMember => "issue",
+            PassportPermission::Delegate => "delegate",
+            PassportPermission::Ban => "ban",
+            PassportPermission::ManageChannels => "channels",
+            PassportPermission::ManageConfig => "config",
+        }
+    }
+
+    /// Rótulo visual descritivo para menus da interface
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            PassportPermission::EnterServer => "🚪 Acessar Servidor (EnterServer)",
+            PassportPermission::IssueMember => "🎫 Convidar/Emitir Membros (IssueMember)",
+            PassportPermission::Delegate => "👑 Delegar Moderadores (Delegate)",
+            PassportPermission::Ban => "🔨 Banir Membros (Ban)",
+            PassportPermission::ManageChannels => "💬 Gerenciar Canais (ManageChannels)",
+            PassportPermission::ManageConfig => "⚙️ Gerenciar Configurações (ManageConfig)",
+        }
+    }
 }
 
 /// Corpo de dados canônico de um passaporte do servidor
