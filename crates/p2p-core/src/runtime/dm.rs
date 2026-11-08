@@ -599,6 +599,15 @@ impl Runtime {
                             now,
                         ) {
                             DmFirewallVerdict::Allowed => {
+                                if let Some(invite) = super::parse_invite(&payload.text) {
+                                    let known = self.servers.get(&invite).is_some();
+                                    self.emit(CoreEvent::InviteReceived {
+                                        from: payload.sender_nick.clone(),
+                                        server_id: invite.clone(),
+                                        known,
+                                    });
+                                    self.last_invite = Some(invite);
+                                }
                                 self.emit(CoreEvent::DirectMessage {
                                     peer_pubkey: sender_pk,
                                     peer_name,
@@ -867,6 +876,15 @@ impl Runtime {
                     now,
                 ) {
                     DmFirewallVerdict::Allowed => {
+                        if let Some(invite) = super::parse_invite(&payload.text) {
+                            let known = self.servers.get(&invite).is_some();
+                            self.emit(CoreEvent::InviteReceived {
+                                from: payload.sender_nick.clone(),
+                                server_id: invite.clone(),
+                                known,
+                            });
+                            self.last_invite = Some(invite);
+                        }
                         self.emit(CoreEvent::DirectMessage {
                             peer_pubkey: sender_pk,
                             peer_name,
@@ -1703,5 +1721,72 @@ mod tests {
         // Alice desbloqueia Bob manualmente via unblock_peer
         runtime.unblock_peer(&bob_pk);
         assert!(runtime.dm.is_under_cooldown(&bob_pk, now).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_dm_invite_populates_last_invite_and_emits_event() {
+        let (tx, mut rx) = unbounded_channel();
+        let temp = std::env::temp_dir().join(format!("test_dm_invite_{}", rand::random::<u32>()));
+        let config = CoreConfig::new(
+            UserIdentity::generate_with_nick("Alice"),
+            temp.join("servers"),
+            temp.join("downloads"),
+        );
+        let mut runtime = Runtime::new(config, tx).unwrap();
+        let alice_pk = runtime.my_pubkey();
+
+        let bob = UserIdentity::generate_with_nick("Bob");
+        let server_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // 1. Bob envia convite de servidor via DM online
+        let invite_text = format!("📨 Convite para o servidor 'Rust': /server join {}", server_id);
+        let env = DirectMessageEnvelope::seal(&bob, &alice_pk, &invite_text, 1000, None).unwrap();
+        runtime.on_dm_wire_message(DmWireMessage::Message(env));
+
+        assert_eq!(runtime.last_invite.as_deref(), Some(server_id));
+
+        let mut got_invite_evt = false;
+        let mut got_dm_evt = false;
+        while let Ok(evt) = rx.try_recv() {
+            match evt {
+                CoreEvent::InviteReceived { from, server_id: sid, known } => {
+                    assert_eq!(from, "Bob");
+                    assert_eq!(sid, server_id);
+                    assert!(!known);
+                    got_invite_evt = true;
+                }
+                CoreEvent::DirectMessage { text, .. } => {
+                    assert_eq!(text, invite_text);
+                    got_dm_evt = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(got_invite_evt, "Deveria emitir CoreEvent::InviteReceived ao receber convite via DM");
+        assert!(got_dm_evt, "Deveria emitir CoreEvent::DirectMessage ao receber DM");
+
+        // 2. Convite via envelope offline da Mailbox
+        let server_id2 = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        let offline_text = format!("/server join {}", server_id2);
+        let offline_env = StoredEnvelope::create_signed_and_sealed(
+            &bob,
+            &alice_pk,
+            &offline_text,
+            2000,
+            None,
+        ).unwrap();
+
+        runtime.receive_sealed_envelope(offline_env, 2000);
+        assert_eq!(runtime.last_invite.as_deref(), Some(server_id2));
+
+        let mut got_offline_invite = false;
+        while let Ok(evt) = rx.try_recv() {
+            if let CoreEvent::InviteReceived { server_id: sid, .. } = evt {
+                if sid == server_id2 {
+                    got_offline_invite = true;
+                }
+            }
+        }
+        assert!(got_offline_invite, "Deveria emitir CoreEvent::InviteReceived para convite offline");
     }
 }
