@@ -252,7 +252,11 @@ impl UserIdentity {
             if let Ok(doc) = serde_json::from_slice::<IdentityDocument>(&data) {
                 let identity = Self::from_document(&doc)?;
                 if !was_protected && crate::keystore::is_native_keystore_available() {
+                    // Migra automaticamente texto claro -> protegido por cofre nativo
                     let _ = identity.save_to(path);
+                } else if was_protected && crate::keystore::is_keystore_encryption_disabled() {
+                    // Converte automaticamente protegido -> texto claro normal antigo
+                    let _ = identity.save_to_plain(path);
                 }
                 return Ok(identity);
             }
@@ -467,6 +471,20 @@ impl UserIdentity {
         let doc = self.to_document()?;
         let json_text = serde_json::to_string_pretty(&doc)?;
         crate::keystore::write_protected(path, json_text.as_bytes())?;
+        Ok(())
+    }
+
+    /// Salva a identidade forçadamente em texto claro normal antigo (sem cifra DPAPI)
+    pub fn save_to_plain<P: AsRef<Path>>(&self, path: P) -> Result<(), IdentityError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let doc = self.to_document()?;
+        let json_text = serde_json::to_string_pretty(&doc)?;
+        crate::keystore::write_plain(path, json_text.as_bytes())?;
         Ok(())
     }
 

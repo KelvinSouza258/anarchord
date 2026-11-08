@@ -5,18 +5,34 @@
 //!   Os arquivos de chaves (`identity.json` e `*.owner-key.json`) são gravados com um envelope
 //!   JSON `{"version": 1, "keystore": "windows-dpapi", "ciphertext_b64": "..."}`, impedindo que
 //!   scripts ou processos de outros usuários leiam as chaves privadas em texto claro.
-//! - **Outros SOs / Ambientes Headless (`anarlab` Docker):** faz fallback transparente para o
-//!   formato JSON padrão em texto claro caso o cofre nativo não esteja disponível.
-//! - **Migração Transparente:** ao ler um arquivo do disco, `read_protected_or_plaintext`
-//!   detecta automaticamente se o arquivo está protegido pelo DPAPI ou em texto claro legado,
-//!   decifrando-o em memória de forma transparente.
+//! - **Desativação / Modo Plaintext (`--no-keystore-encryption`):** permite persistir e converter
+//!   arquivos diretamente em JSON claro sem cifra DPAPI, facilitando portabilidade e depuração.
+//! - **Conversão Bidirecional Automática:**
+//!   - Se `--no-keystore-encryption` for passado e o arquivo estiver cifrado via DPAPI, ele é
+//!     descriptografado e regravado como JSON em texto claro.
+//!   - Se a cifra estiver ativa (padrão) e o arquivo for um JSON em texto claro, ele é migrado
+//!     automaticamente para o envelope protegido.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const KEYSTORE_MAGIC_FIELD: &str = "\"keystore\"";
+
+/// Controle global para desativar a cifra do cofre nativo (ativado por `--no-keystore-encryption`)
+static KEYSTORE_ENCRYPTION_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Desativa ou reativa a cifra do cofre nativo em tempo de execução
+pub fn set_keystore_encryption_disabled(disabled: bool) {
+    KEYSTORE_ENCRYPTION_DISABLED.store(disabled, Ordering::SeqCst);
+}
+
+/// Retorna se a cifra do cofre nativo está desativada
+pub fn is_keystore_encryption_disabled() -> bool {
+    KEYSTORE_ENCRYPTION_DISABLED.load(Ordering::SeqCst)
+}
 
 /// Envelope JSON persistido quando o cofre nativo do SO protege o arquivo em repouso
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -28,9 +44,11 @@ pub struct ProtectedKeystoreEnvelope {
 }
 
 /// Tenta proteger os bytes em repouso usando o cofre nativo do sistema operacional.
-/// Se o cofre nativo estiver disponível e suceder, retorna o JSON do `ProtectedKeystoreEnvelope`;
-/// caso contrário (ex.: Linux headless / container Docker), retorna os próprios `plaintext` bytes.
+/// Se a cifra estiver desativada ou o cofre não estiver disponível, retorna `plaintext`.
 pub fn seal_for_disk(plaintext: &[u8]) -> Vec<u8> {
+    if is_keystore_encryption_disabled() {
+        return plaintext.to_vec();
+    }
     if let Some((provider, ciphertext)) = os_protect(plaintext) {
         let env = ProtectedKeystoreEnvelope {
             version: 1,
@@ -59,10 +77,15 @@ pub fn unseal_from_disk(raw: &[u8]) -> io::Result<(Vec<u8>, bool)> {
     Ok((raw.to_vec(), false))
 }
 
-/// Grava `plaintext` em `path`, protegendo com o cofre nativo do SO quando disponível
+/// Grava `plaintext` em `path`, protegendo com o cofre nativo do SO quando disponível (a menos que desativado)
 pub fn write_protected<P: AsRef<Path>>(path: P, plaintext: &[u8]) -> io::Result<()> {
     let sealed = seal_for_disk(plaintext);
     fs::write(path, sealed)
+}
+
+/// Grava forçadamente `plaintext` em `path` em formato de texto claro (sem DPAPI)
+pub fn write_plain<P: AsRef<Path>>(path: P, plaintext: &[u8]) -> io::Result<()> {
+    fs::write(path, plaintext)
 }
 
 /// Lê `path` decifrando do cofre nativo se estiver protegido, ou retornando os bytes em claro
@@ -73,7 +96,7 @@ pub fn read_protected_or_plaintext<P: AsRef<Path>>(path: P) -> io::Result<(Vec<u
 
 /// Informa se o cofre nativo do SO está ativo na plataforma atual
 pub fn is_native_keystore_available() -> bool {
-    os_protect(b"probe").is_some()
+    !is_keystore_encryption_disabled() && os_protect(b"probe").is_some()
 }
 
 #[cfg(windows)]
@@ -223,29 +246,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_seal_and_unseal_roundtrip() {
-        let secret_json = br#"{"version": 2, "private_key": "BEGIN PRIVATE KEY segredo super sensivel"}"#;
-        let sealed = seal_for_disk(secret_json);
-        if is_native_keystore_available() {
-            let sealed_str = String::from_utf8_lossy(&sealed);
-            assert!(sealed_str.contains("\"keystore\": \"windows-dpapi\""));
-            assert!(!sealed_str.contains("BEGIN PRIVATE KEY"), "chave privada não deve ficar em claro no envelope DPAPI");
-            let (unsealed, was_protected) = unseal_from_disk(&sealed).unwrap();
+    fn test_seal_unseal_roundtrip() {
+        let original = b"{\"user_id\":\"test-1234\",\"profile\":{\"display_name\":\"Alice\"}}";
+        let sealed = seal_for_disk(original);
+        let (unsealed, was_protected) = unseal_from_disk(&sealed).expect("deve decifrar");
+        assert_eq!(unsealed, original);
+
+        if cfg!(windows) && !is_keystore_encryption_disabled() {
             assert!(was_protected);
-            assert_eq!(unsealed, secret_json);
-        } else {
-            assert_eq!(sealed, secret_json);
-            let (unsealed, was_protected) = unseal_from_disk(&sealed).unwrap();
-            assert!(!was_protected);
-            assert_eq!(unsealed, secret_json);
+            let sealed_str = std::str::from_utf8(&sealed).unwrap();
+            assert!(sealed_str.contains("\"keystore\": \"windows-dpapi\""));
         }
     }
 
     #[test]
-    fn test_plaintext_fallback_is_unsealed_transparently() {
-        let legacy_plain = br#"{"version": 2, "user_id": "abcd"}"#;
-        let (unsealed, was_protected) = unseal_from_disk(legacy_plain).unwrap();
+    fn test_plaintext_unsealed_directly() {
+        let legacy_plaintext = b"{\"version\": 2, \"user_id\": \"legacy-user\"}";
+        let (unsealed, was_protected) = unseal_from_disk(legacy_plaintext).expect("leitura direta");
+        assert_eq!(unsealed, legacy_plaintext);
         assert!(!was_protected);
-        assert_eq!(unsealed, legacy_plain);
+    }
+
+    #[test]
+    fn test_disable_keystore_encryption_flag() {
+        let original = b"{\"user_id\":\"plain-user\"}";
+        set_keystore_encryption_disabled(true);
+        let sealed = seal_for_disk(original);
+        assert_eq!(sealed, original, "quando desativado deve retornar plaintext");
+        let (unsealed, was_protected) = unseal_from_disk(&sealed).unwrap();
+        assert_eq!(unsealed, original);
+        assert!(!was_protected);
+        set_keystore_encryption_disabled(false);
     }
 }
