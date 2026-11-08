@@ -67,7 +67,8 @@ impl Runtime {
                 == false;
             if has_peers_in_ctrl {
                 if let Ok(key_package) = self.mls.key_package() {
-                    if self.publish_server_message(&server_id, &ServerMessage::KeyPackage { server_id: server_id.clone(), key_package }) {
+                    let passport = self.servers.get(&server_id).and_then(|s| s.my_passport().cloned());
+                    if self.publish_server_message(&server_id, &ServerMessage::KeyPackage { server_id: server_id.clone(), key_package, passport }) {
                         self.last_key_package.insert(server_id.clone(), std::time::Instant::now());
                     }
                 }
@@ -177,7 +178,8 @@ impl Runtime {
                     .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))
                 {
                     if let Ok(key_package) = self.mls.key_package() {
-                        if self.publish_server_message(&id, &ServerMessage::KeyPackage { server_id: id.clone(), key_package }) {
+                        let passport = self.servers.get(&id).and_then(|s| s.my_passport().cloned());
+                        if self.publish_server_message(&id, &ServerMessage::KeyPackage { server_id: id.clone(), key_package, passport }) {
                             self.last_key_package.insert(id, std::time::Instant::now());
                         } else {
                             // Ninguém inscrito no tópico de controle: cria o grupo imediatamente!
@@ -415,6 +417,84 @@ impl Runtime {
                     Err(e) => self.error(CoreError::Server(e.to_string())),
                 }
             }
+            ServerCommand::IssuePassport { target, level, duration } => {
+                let id = need_server!();
+                let target_pk = need_peer!(target);
+                let perms = match level {
+                    0 | 1 => community::passport::PassportPermission::all(),
+                    2..=254 => community::passport::PassportPermission::default_moderator(),
+                    _ => community::passport::PassportPermission::member(),
+                };
+                let Some(server) = self.servers.get(&id) else { return };
+                let passport_res = if let Some(owner_key) = server.owner_key() {
+                    Ok(community::ServerPassport::issue_root(
+                        owner_key,
+                        &target_pk,
+                        level,
+                        perms,
+                        now,
+                        duration.map(|d| now + d),
+                    ))
+                } else if let Some(my_p) = server.my_passport() {
+                    let dur = duration.unwrap_or(7 * 86_400);
+                    my_p.issue_subordinate(
+                        &self.identity,
+                        &target_pk,
+                        level,
+                        perms,
+                        now,
+                        now + dur,
+                    )
+                } else {
+                    return self.error(CoreError::Server("Você não possui passaporte ou chave de dono neste servidor".into()));
+                };
+                match passport_res {
+                    Ok(passport) => {
+                        self.publish_server_message(&id, &ServerMessage::PassportOffer {
+                            server_id: id.clone(),
+                            target: target_pk.clone(),
+                            passport,
+                        });
+                        self.notice(ServerNotice::PassportUpdated { server: self.server_name(&id) });
+                    }
+                    Err(e) => self.error(CoreError::Server(e.to_string())),
+                }
+            }
+            ServerCommand::ShowPassport => {
+                let id = need_server!();
+                let Some(server) = self.servers.get(&id) else { return };
+                if let Some(p) = server.my_passport() {
+                    let perms = p.body.permissions.iter().map(|p| format!("{:?}", p)).collect();
+                    self.notice(ServerNotice::PassportInfo {
+                        server: self.server_name(&id),
+                        holder: p.body.holder.clone(),
+                        issuer: p.body.issuer.clone(),
+                        level: p.body.level,
+                        chain_depth: p.chain_depth(),
+                        expires_at: p.effective_expires_at(),
+                        permissions: perms,
+                    });
+                } else {
+                    self.error(CoreError::Server("Você ainda não possui um passaporte registrado neste servidor".into()));
+                }
+            }
+            ServerCommand::FlattenPassport => {
+                let id = need_server!();
+                let Some(server) = self.servers.get(&id) else { return };
+                if let Some(p) = server.my_passport() {
+                    if p.chain_depth() <= 1 {
+                        self.notice(ServerNotice::PassportUpdated { server: self.server_name(&id) });
+                    } else {
+                        self.publish_server_message(&id, &ServerMessage::FlattenRequest {
+                            server_id: id.clone(),
+                            passport: p.clone(),
+                        });
+                        self.notice(ServerNotice::PassportUpdated { server: self.server_name(&id) });
+                    }
+                } else {
+                    self.error(CoreError::Server("Você não possui passaporte neste servidor".into()));
+                }
+            }
         }
     }
 
@@ -445,9 +525,10 @@ impl Runtime {
 
         // Grupo cifrado (MLS): entrada, troca de chave, boas-vindas e convergência de grupos
         match &message {
-            ServerMessage::KeyPackage { server_id, key_package } => {
+            ServerMessage::KeyPackage { server_id, key_package, passport } => {
                 let Some(from) = from_pubkey else { return };
-                match e2ee::admit_from_key_package(&mut self.mls, &self.servers, server_id, from, key_package, now) {
+                let signer = &self.identity;
+                match e2ee::admit_from_key_package(&mut self.mls, &self.servers, server_id, from, key_package, passport.as_ref(), Some(signer), now) {
                     Ok(messages) => {
                         for m in &messages {
                             self.publish_server_message(server_id, m);
@@ -487,7 +568,8 @@ impl Runtime {
                     {
                         self.mls.drop_group(server_id);
                         if let Ok(key_package) = self.mls.key_package() {
-                            if self.publish_server_message(server_id, &ServerMessage::KeyPackage { server_id: server_id.clone(), key_package }) {
+                            let passport = self.servers.get(server_id).and_then(|s| s.my_passport().cloned());
+                            if self.publish_server_message(server_id, &ServerMessage::KeyPackage { server_id: server_id.clone(), key_package, passport }) {
                                 self.last_key_package.insert(server_id.clone(), std::time::Instant::now());
                             }
                         }
@@ -498,8 +580,21 @@ impl Runtime {
                 }
                 return;
             }
-            ServerMessage::Welcome { server_id, target, welcome } => {
+            ServerMessage::Welcome { server_id, target, welcome, passport } => {
                 if *target == me {
+                    let mut passport_updated = false;
+                    if let Some(p) = passport {
+                        if let Some(server) = self.servers.get_mut(server_id) {
+                            if p.body.holder == me && server.effective_state(now).verify_passport(p, now).is_ok() {
+                                server.set_my_passport(p.clone());
+                                passport_updated = true;
+                            }
+                        }
+                        if passport_updated {
+                            let _ = self.servers.persist(server_id);
+                            self.notice(ServerNotice::PassportUpdated { server: self.server_name(server_id) });
+                        }
+                    }
                     let Some(server) = self.servers.get(server_id).filter(|s| s.has_chain()) else { return };
                     let had_group = self.mls.has_group(server_id);
                     let res = self.mls.join_with_validator(server_id, welcome, |sender_pk, members| {
@@ -512,8 +607,55 @@ impl Runtime {
                             if !had_group {
                                 self.notice(ServerNotice::KeyReceived { server: self.server_name(server_id) });
                             }
+                            let needs_flatten = self.servers.get(server_id).and_then(|s| s.my_passport()).map(|p| (p.chain_depth() > 1, p.clone()));
+                            if let Some((true, my_p)) = needs_flatten {
+                                self.publish_server_message(server_id, &ServerMessage::FlattenRequest {
+                                    server_id: server_id.clone(),
+                                    passport: my_p,
+                                });
+                            }
                         }
                         Err(e) => tracing::debug!("Welcome MLS recusado: {}", e),
+                    }
+                }
+                return;
+            }
+            ServerMessage::PassportOffer { server_id, target, passport } => {
+                if *target == me {
+                    let mut updated = false;
+                    if let Some(server) = self.servers.get_mut(server_id) {
+                        if passport.body.holder == me && server.effective_state(now).verify_passport(passport, now).is_ok() {
+                            server.set_my_passport(passport.clone());
+                            updated = true;
+                        }
+                    }
+                    if updated {
+                        let _ = self.servers.persist(server_id);
+                        self.notice(ServerNotice::PassportUpdated { server: self.server_name(server_id) });
+                    }
+                }
+                return;
+            }
+            ServerMessage::FlattenRequest { server_id, passport } => {
+                if let Some(server) = self.servers.get(server_id) {
+                    if let Some(owner_key) = server.owner_key() {
+                        if let Ok(flattened) = passport.flatten_with_server_key(owner_key, now) {
+                            self.publish_server_message(server_id, &ServerMessage::PassportOffer {
+                                server_id: server_id.clone(),
+                                target: passport.body.holder.clone(),
+                                passport: flattened,
+                            });
+                        }
+                    } else if let Some(my_p) = server.my_passport() {
+                        if my_p.body.level < passport.body.level && my_p.allows(community::passport::PassportPermission::IssueMember) {
+                            if let Ok(flattened) = passport.flatten_with_superior(&self.identity, my_p, now) {
+                                self.publish_server_message(server_id, &ServerMessage::PassportOffer {
+                                    server_id: server_id.clone(),
+                                    target: passport.body.holder.clone(),
+                                    passport: flattened,
+                                });
+                            }
+                        }
                     }
                 }
                 return;
@@ -542,7 +684,8 @@ impl Runtime {
                 // enviamos KeyPackage para convergir para o grupo vencedor!
                 if !current_set.contains(&me) || (!candidate_set.contains(&me) && e2ee::should_adopt_group(&current_set, &candidate_set)) {
                     if let Ok(key_package) = self.mls.key_package() {
-                        if self.publish_server_message(server_id, &ServerMessage::KeyPackage { server_id: server_id.clone(), key_package }) {
+                        let passport = self.servers.get(server_id).and_then(|s| s.my_passport().cloned());
+                        if self.publish_server_message(server_id, &ServerMessage::KeyPackage { server_id: server_id.clone(), key_package, passport }) {
                             self.last_key_package.insert(server_id.clone(), std::time::Instant::now());
                         }
                     }

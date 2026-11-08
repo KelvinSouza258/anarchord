@@ -59,6 +59,20 @@ pub fn parse_server_command(rest: &str) -> ServerCommand {
         "close" => Some(ServerCommand::Close),
         "open" => Some(ServerCommand::Open),
         "rotate-key" | "rotate" => Some(ServerCommand::RotateKey),
+        "passport" => {
+            let mut parts = args.split_whitespace();
+            match parts.next() {
+                Some("issue") => {
+                    let target = parts.next().unwrap_or_default();
+                    let level = parts.next().and_then(|l| l.parse::<u8>().ok()).unwrap_or(255);
+                    let duration = parts.next().and_then(parse_duration).flatten();
+                    non_empty(target).map(|target| ServerCommand::IssuePassport { target, level, duration })
+                }
+                Some("show") => Some(ServerCommand::ShowPassport),
+                Some("flatten") => Some(ServerCommand::FlattenPassport),
+                _ => None,
+            }
+        }
         "policy" => {
             let mut parts = args.split_whitespace();
             match (parts.next().and_then(parse_duration), parts.next().and_then(parse_duration)) {
@@ -112,6 +126,16 @@ mod tests {
             parse_server_command("policy 7d 2d"),
             ServerCommand::Policy { validity: 7 * 86_400, renewal_window: 2 * 86_400 }
         );
+        assert_eq!(
+            parse_server_command("passport issue Carol 255 3d"),
+            ServerCommand::IssuePassport { target: "Carol".into(), level: 255, duration: Some(3 * 86_400) }
+        );
+        assert_eq!(
+            parse_server_command("passport issue Bob 2"),
+            ServerCommand::IssuePassport { target: "Bob".into(), level: 2, duration: None }
+        );
+        assert_eq!(parse_server_command("passport show"), ServerCommand::ShowPassport);
+        assert_eq!(parse_server_command("passport flatten"), ServerCommand::FlattenPassport);
     }
 
     #[test]

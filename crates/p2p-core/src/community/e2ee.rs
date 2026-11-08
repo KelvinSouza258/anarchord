@@ -534,6 +534,8 @@ pub fn admit_from_key_package(
     server_id: &str,
     from_pubkey: &str,
     key_package: &[u8],
+    passport: Option<&super::ServerPassport>,
+    signer_identity: Option<&crate::identity::UserIdentity>,
     now: u64,
 ) -> Result<Vec<super::ServerMessage>, E2eeError> {
     let server = registry.get(server_id).filter(|s| s.has_chain()).ok_or(E2eeError::NotOwner)?;
@@ -544,10 +546,10 @@ pub fn admit_from_key_package(
         return Err(E2eeError::NotOwner);
     }
     let me = groups.me().to_string();
-    if server.is_banned(&me, now) || !server.is_allowed(&me, now) {
+    if server.is_banned(&me, now) || !server.is_allowed_with_passport(&me, server.my_passport(), now) {
         return Err(E2eeError::NotAllowed);
     }
-    if server.is_banned(from_pubkey, now) || !server.is_allowed(from_pubkey, now) {
+    if server.is_banned(from_pubkey, now) || !server.is_allowed_with_passport(from_pubkey, passport, now) {
         return Err(E2eeError::NotAllowed);
     }
     let key = (server_id.to_string(), from_pubkey.to_string());
@@ -558,9 +560,43 @@ pub fn admit_from_key_package(
     }
     let (commits, welcome) = groups.add_member(server_id, key_package, from_pubkey)?;
     groups.recently_added.insert(key, std::time::Instant::now());
+
+    // Se o solicitante não possuía passaporte e o servidor é público/aberto,
+    // o líder pode emitir automaticamente um passaporte inicial de membro para ele:
+    let issued_passport = if passport.is_none() {
+        if let Some(owner_key) = server.owner_key() {
+            Some(super::ServerPassport::issue_root(
+                owner_key,
+                from_pubkey,
+                super::MEMBER_LEVEL,
+                super::passport::PassportPermission::member(),
+                now,
+                Some(now + super::chain::DEFAULT_CERT_VALIDITY_SECS),
+            ))
+        } else if let (Some(my_passport), Some(signer)) = (server.my_passport(), signer_identity) {
+            my_passport.issue_subordinate(
+                signer,
+                from_pubkey,
+                super::MEMBER_LEVEL,
+                super::passport::PassportPermission::member(),
+                now,
+                now + super::chain::DEFAULT_CERT_VALIDITY_SECS,
+            ).ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut out: Vec<super::ServerMessage> =
         commits.into_iter().map(|commit| super::ServerMessage::Commit { server_id: server_id.to_string(), commit }).collect();
-    out.push(super::ServerMessage::Welcome { server_id: server_id.to_string(), target: from_pubkey.to_string(), welcome });
+    out.push(super::ServerMessage::Welcome {
+        server_id: server_id.to_string(),
+        target: from_pubkey.to_string(),
+        welcome,
+        passport: issued_passport,
+    });
     Ok(out)
 }
 
@@ -942,13 +978,13 @@ mod tests {
         bob.create_group(&server).unwrap();
         let carol_pk = carol_id.public_key_hex();
         let kp = carol.key_package().unwrap();
-        let msgs = admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp, T0).unwrap();
+        let msgs = admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp, None, None, T0).unwrap();
         assert!(matches!(msgs.last(), Some(ServerMessage::Welcome { target, .. }) if *target == carol_pk));
         assert!(bob.members(&server).contains(&carol_pk));
 
         // Pedido repetido logo depois de admitida: ignorado (sem nova troca de chave)
         let kp_again = carol.key_package().unwrap();
-        assert!(admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp_again, T0).unwrap().is_empty());
+        assert!(admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp_again, None, None, T0).unwrap().is_empty());
 
         // Dono bane Carol na cadeia e o bloco chega para Bob -> Bob (líder MLS) remove Carol do grupo!
         let ban_block = owner_registry.moderate(&server, &owner_id, ModKind::Ban { until: None }, &carol_pk, "", T0 + 1).unwrap();
@@ -959,7 +995,7 @@ mod tests {
 
         // Banida não é readmitida pelo líder Bob
         let kp = carol.key_package().unwrap();
-        assert!(matches!(admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp, T0 + 4), Err(E2eeError::NotAllowed)));
+        assert!(matches!(admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp, None, None, T0 + 4), Err(E2eeError::NotAllowed)));
     }
 
     /// Garante que o grupo MLS é 100% efêmero em memória: nenhum arquivo `mls-state.json` é criado

@@ -259,6 +259,8 @@ pub enum ServerNotice {
     /// (líder) entregou a chave do grupo cifrado a alguém
     KeyGranted { to: String },
     KeyReceived { server: String },
+    /// Passaporte do servidor recebido, renovado ou achatado com sucesso
+    PassportUpdated { server: String },
     /// Chave do grupo MLS rotacionada para uma nova época
     KeyRotated { server: String, epoch: u64 },
     RemovedFromGroup { server: String },
@@ -269,6 +271,16 @@ pub enum ServerNotice {
     InviteNeedsAllow,
     List { lobby_current: bool, servers: Vec<ServerListEntry> },
     Info(ServerInfo),
+    /// Detalhes do passaporte criptográfico local
+    PassportInfo {
+        server: String,
+        holder: String,
+        issuer: String,
+        level: u8,
+        chain_depth: usize,
+        expires_at: Option<UtcSecs>,
+        permissions: Vec<String>,
+    },
     History(Vec<HistoryEntry>),
     Help,
 }

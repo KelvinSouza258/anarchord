@@ -99,5 +99,11 @@ pub enum ServerCommand {
     Policy { validity: u64, renewal_window: u64 },
     /// Rotaciona imediatamente a chave de época do grupo MLS atual (executado pelo líder)
     RotateKey,
+    /// Emite um passaporte criptográfico do servidor para um par
+    IssuePassport { target: String, level: u8, duration: Option<u64> },
+    /// Exibe os detalhes criptográficos do passaporte deste nó no servidor atual
+    ShowPassport,
+    /// Solicita o achatamento de cadeia do passaporte local caso haja autoridade superior online
+    FlattenPassport,
     Help,
 }

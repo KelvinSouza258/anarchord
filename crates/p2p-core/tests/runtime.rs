@@ -435,3 +435,119 @@ async fn test_two_cores_see_each_other_in_same_channel_on_connect() {
         })
         .await;
 }
+
+
+/// Testa o fluxo completo de Passaportes do Servidor (ServerPassport):
+/// 1. Alice cria servidor e gera passaporte de dono automático;
+/// 2. Alice e Bob se conectam;
+/// 3. Alice emite passaporte de moderador para Bob;
+/// 4. Bob recebe e armazena o passaporte com sucesso;
+/// 5. Bob consulta seu passaporte via ShowPassport e obtém PassportInfo.
+#[tokio::test]
+async fn test_server_passport_issuance_acceptance_and_flattening() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let room = format!("geral-{}", rand_suffix());
+            let alice_id = UserIdentity::generate_with_nick("Alice");
+            let bob_id = UserIdentity::generate_with_nick("Bob");
+            let bob_pubkey = bob_id.public_key_hex();
+
+            let (mut alice, alice_task) = start_with_dirs(
+                "Alice",
+                alice_id,
+                temp_dir("alice_passport_srv"),
+                temp_dir("alice_passport_down"),
+                room.clone(),
+                None,
+            );
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+
+            let (mut bob, bob_task) = start_with_dirs(
+                "Bob",
+                bob_id,
+                temp_dir("bob_passport_srv"),
+                temp_dir("bob_passport_down"),
+                room.clone(),
+                Some(alice_port),
+            );
+            tokio::task::spawn_local(bob_task.run());
+
+            // Alice e Bob se conectam no Swarm
+            alice
+                .wait("Alice identificar Bob", |e| {
+                    matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Bob")
+                })
+                .await;
+            bob
+                .wait("Bob identificar Alice", |e| {
+                    matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Alice")
+                })
+                .await;
+
+            // 1. Alice cria o servidor
+            alice.server(ServerCommand::Create("Fortaleza".to_string()));
+            let created = alice
+                .wait("Alice criar servidor Fortaleza", |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))
+                })
+                .await;
+            let server_id = match created {
+                CoreEvent::Server(ServerNotice::Created { id, .. }) => id,
+                _ => unreachable!(),
+            };
+
+            // Bob passa a acompanhar o servidor aberto (recebe Welcome + passaporte automático de membro)
+            bob.server(ServerCommand::Join(server_id.clone()));
+
+            // Bob recebe passaporte automático inicial de membro (nível 255)
+            bob
+                .wait("Bob receber passaporte inicial de membro", |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::PassportUpdated { .. }))
+                })
+                .await;
+
+            bob.server(ServerCommand::ShowPassport);
+            let initial_info = bob
+                .wait("Bob receber PassportInfo inicial", |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::PassportInfo { level: 255, .. }))
+                })
+                .await;
+            assert!(matches!(initial_info, CoreEvent::Server(ServerNotice::PassportInfo { level: 255, .. })));
+
+            // 2. Alice promove Bob emitindo passaporte de moderador (nível 2)
+            alice.server(ServerCommand::IssuePassport {
+                target: "Bob".to_string(),
+                level: 2,
+                duration: Some(7 * 86_400),
+            });
+
+            // 3. Bob recebe a oferta do novo passaporte e consulta a promoção para nível 2
+            bob.drain(Duration::from_millis(300)).await;
+            bob.server(ServerCommand::ShowPassport);
+            let promoted_info = bob
+                .wait("Bob receber PassportInfo nível 2", |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::PassportInfo { level: 2, .. }))
+                })
+                .await;
+
+            match promoted_info {
+                CoreEvent::Server(ServerNotice::PassportInfo {
+                    holder,
+                    level,
+                    chain_depth,
+                    permissions,
+                    ..
+                }) => {
+                    assert_eq!(holder, bob_pubkey);
+                    assert_eq!(level, 2);
+                    assert_eq!(chain_depth, 1);
+                    assert!(permissions.contains(&"EnterServer".to_string()));
+                    assert!(permissions.contains(&"Ban".to_string()));
+                }
+                _ => unreachable!(),
+            }
+        })
+        .await;
+}

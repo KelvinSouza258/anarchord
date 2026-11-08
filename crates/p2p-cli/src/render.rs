@@ -11,7 +11,7 @@ use p2p_core::runtime::{
 
 /// Ajuda dos comandos de servidor
 pub const SERVER_HELP: &str = "Comandos: /server create <nome> | join <id> | accept | list | switch <nome|id|lobby> | info | history \
-| invite | channel add <nome> [voz] | channel remove <nome> | mod add <par> [nível] | mod remove <par> \
+| invite | channel add <nome> [voz] | channel remove <nome> | passport issue <par> [nível] [duração] | passport show | passport flatten \
 | ban <par> [30m|12h|3d|2w|perm] [motivo] | unban <par> | allow <par> | disallow <par> | close | open \
 | policy <validade> <janela> (ex.: 7d 2d) | rotate-key | leave  (atalho: /lobby)";
 
@@ -388,6 +388,21 @@ fn server(notice: &ServerNotice) -> Vec<String> {
         ServerNotice::Role { server, level: Some(level) } => one(format!("🛡️ Você agora é moderador nível {} em '{}'.", level, server)),
         ServerNotice::Role { server, level: None } => one(format!("🛡️ Você não é mais moderador em '{}'.", server)),
         ServerNotice::KeyGranted { to } => one(format!("🔐 {} recebeu a chave do grupo cifrado.", to)),
+        ServerNotice::PassportUpdated { server } => one(format!("🎫 Passaporte de '{}' atualizado com sucesso.", server)),
+        ServerNotice::PassportInfo { server, holder, issuer, level, chain_depth, expires_at, permissions } => {
+            let exp_str = match expires_at {
+                Some(exp) => fmt_utc(*exp),
+                None => "Vitalício (Sem expiração)".to_string(),
+            };
+            vec![
+                format!("🎫 Passaporte do Servidor '{}':", server),
+                format!("   Titular: {}", short_id(holder)),
+                format!("   Emissor: {}", short_id(issuer)),
+                format!("   Nível: {} (Profundidade da cadeia: {} elos)", level, chain_depth),
+                format!("   Validade: {}", exp_str),
+                format!("   Permissões: {}", permissions.join(", ")),
+            ]
+        }
         ServerNotice::KeyReceived { server } => {
             one(format!("🔐 Chave do grupo de '{}' recebida: chat, voz e tela cifrados de ponta a ponta.", server))
         }

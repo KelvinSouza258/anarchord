@@ -14,6 +14,7 @@
 //!   vence o de menor hash, de forma determinística, e os membros convergem.
 
 use super::cert::{ModAction, ModKind, ModeratorCert, UtcSecs};
+use super::passport::{PassportError, ServerPassport};
 use crate::identity::{verify_signature_hex, UserIdentity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -338,9 +339,41 @@ impl ServerState {
         self.bans.iter().filter(|(pk, _)| self.is_banned(pk, at)).collect()
     }
 
+    /// Valida se um passaporte do servidor é aceito e não possui nenhum emissor ou titular banido ou revogado
+    pub fn verify_passport(&self, passport: &ServerPassport, at: UtcSecs) -> Result<(), PassportError> {
+        passport.verify_at(&self.server_id, at)?;
+        for participant in passport.all_participants() {
+            if self.is_banned(&participant, at) {
+                return Err(PassportError::RevokedOrBanned(participant));
+            }
+        }
+        for serial in passport.all_serials() {
+            if self.revoked.contains(&serial) {
+                return Err(PassportError::RevokedOrBanned(serial));
+            }
+        }
+        Ok(())
+    }
+
+    /// Pode participar: servidor aberto, ou dono, moderador ativo, passaporte válido ou na allow-list
+    pub fn is_allowed_with_passport(&self, pubkey: &str, passport: Option<&ServerPassport>, at: UtcSecs) -> bool {
+        if self.is_banned(pubkey, at) {
+            return false;
+        }
+        if pubkey == self.server_id || (!self.owner.is_empty() && pubkey == self.owner) {
+            return true;
+        }
+        if let Some(p) = passport {
+            if p.body.holder == pubkey && self.verify_passport(p, at).is_ok() {
+                return true;
+            }
+        }
+        !self.closed || self.allow_list.contains(pubkey) || self.level_of(pubkey, at).is_some()
+    }
+
     /// Pode participar: servidor aberto, ou dono, moderador ativo ou na allow-list
     pub fn is_allowed(&self, pubkey: &str, at: UtcSecs) -> bool {
-        !self.closed || self.allow_list.contains(pubkey) || self.level_of(pubkey, at).is_some()
+        self.is_allowed_with_passport(pubkey, None, at)
     }
 
     /// Certificados que entraram na janela de renovação e ainda não têm sucessor mais longo

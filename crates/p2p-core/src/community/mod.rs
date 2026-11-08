@@ -12,9 +12,11 @@
 pub mod cert;
 pub mod chain;
 pub mod e2ee;
+pub mod passport;
 
 pub use cert::{format_duration, parse_duration, ModAction, ModKind, ModeratorCert, Permission, UtcSecs};
 pub use chain::{AppendResult, BanState, Block, Channel, ChannelType, Entry, Rejection, ServerChain, ServerState};
+pub use passport::{PassportError, PassportPermission, ServerPassport, MEMBER_LEVEL};
 
 use crate::identity::{hex_decode_32, UserIdentity};
 use cert::default_permissions;
@@ -123,11 +125,13 @@ pub enum ServerMessage {
     ChainRequest { server_id: String, from_height: u64 },
     /// Ação de moderador ainda não incluída na cadeia
     Action(ModAction),
-    /// Pedido de entrada no grupo cifrado (MLS): pacote de chave de quem publicou
+    /// Pedido de entrada no grupo cifrado (MLS): pacote de chave de quem publicou acompanhado de seu passaporte
     KeyPackage {
         server_id: String,
         #[serde(with = "crate::b64")]
         key_package: Vec<u8>,
+        #[serde(default)]
+        passport: Option<ServerPassport>,
     },
     /// Commit MLS do líder (adiciona/remove membros ou rotaciona a chave do grupo)
     Commit {
@@ -141,6 +145,8 @@ pub enum ServerMessage {
         target: String,
         #[serde(with = "crate::b64")]
         welcome: Vec<u8>,
+        #[serde(default)]
+        passport: Option<ServerPassport>,
     },
     /// Anúncio de presença do grupo MLS ativo (líder, época e membros) para convergência determinística
     GroupAnnounce {
@@ -148,6 +154,17 @@ pub enum ServerMessage {
         epoch: u64,
         leader: String,
         members: Vec<String>,
+    },
+    /// Oferta/entrega de Passaporte (renovação, convite ou achatamento de cadeia)
+    PassportOffer {
+        server_id: String,
+        target: String,
+        passport: ServerPassport,
+    },
+    /// Solicitação de Achatamento Oportunista de Cadeia
+    FlattenRequest {
+        server_id: String,
+        passport: ServerPassport,
     },
 }
 
@@ -193,13 +210,21 @@ pub struct KnownServer {
     chain: ServerChain,
     /// Presente só se este nó é o dono
     owner_key: Option<UserIdentity>,
+    /// Passaporte do nó local neste servidor (emitido pela raiz ou por moderador)
+    my_passport: Option<ServerPassport>,
     /// Ações de moderadores recebidas e ainda não incluídas na cadeia (por id)
     pending: BTreeMap<String, ModAction>,
 }
 
 impl KnownServer {
     fn new(server_id: &str) -> Self {
-        Self { server_id: server_id.to_string(), chain: ServerChain::new(server_id), owner_key: None, pending: BTreeMap::new() }
+        Self {
+            server_id: server_id.to_string(),
+            chain: ServerChain::new(server_id),
+            owner_key: None,
+            my_passport: None,
+            pending: BTreeMap::new(),
+        }
     }
 
     pub fn has_chain(&self) -> bool {
@@ -220,6 +245,22 @@ impl KnownServer {
 
     pub fn is_owner(&self) -> bool {
         self.owner_key.is_some()
+    }
+
+    pub fn owner_key(&self) -> Option<&UserIdentity> {
+        self.owner_key.as_ref()
+    }
+
+    pub fn my_passport(&self) -> Option<&ServerPassport> {
+        self.my_passport.as_ref()
+    }
+
+    pub fn set_my_passport(&mut self, passport: ServerPassport) {
+        self.my_passport = Some(passport);
+    }
+
+    pub fn is_allowed_with_passport(&self, pubkey: &str, passport: Option<&ServerPassport>, now: UtcSecs) -> bool {
+        self.effective_state(now).is_allowed_with_passport(pubkey, passport, now)
     }
 
     pub fn channels(&self) -> Vec<Channel> {
@@ -375,6 +416,12 @@ impl ServerRegistry {
                     server.owner_key = Some(key);
                 }
             }
+            let passport_path = dir.join(format!("{}.passport.json", id));
+            if passport_path.exists() {
+                if let Ok(passport) = serde_json::from_slice::<ServerPassport>(&std::fs::read(&passport_path)?) {
+                    server.my_passport = Some(passport);
+                }
+            }
             registry.servers.insert(id.to_string(), server);
         }
         Ok(registry)
@@ -382,6 +429,10 @@ impl ServerRegistry {
 
     pub fn get(&self, server_id: &str) -> Option<&KnownServer> {
         self.servers.get(server_id)
+    }
+
+    pub fn get_mut(&mut self, server_id: &str) -> Option<&mut KnownServer> {
+        self.servers.get_mut(server_id)
     }
 
     pub fn list(&self) -> impl Iterator<Item = &KnownServer> {
@@ -418,6 +469,15 @@ impl ServerRegistry {
                 renewal_window_secs: DEFAULT_RENEWAL_WINDOW_SECS,
             }],
         );
+        let passport = ServerPassport::issue_root(
+            &key,
+            owner_pubkey,
+            1,
+            PassportPermission::all(),
+            now,
+            None,
+        );
+        server.my_passport = Some(passport);
         server.owner_key = Some(key);
         self.servers.insert(id.clone(), server);
         self.persist(&id)?;
@@ -443,6 +503,7 @@ impl ServerRegistry {
         let removed = self.servers.remove(server_id).is_some();
         if let (true, Some(dir)) = (removed, &self.dir) {
             let _ = std::fs::remove_file(dir.join(format!("{}.server.json", server_id)));
+            let _ = std::fs::remove_file(dir.join(format!("{}.passport.json", server_id)));
         }
         removed
     }
@@ -500,8 +561,10 @@ impl ServerRegistry {
             ServerMessage::KeyPackage { .. }
             | ServerMessage::Commit { .. }
             | ServerMessage::Welcome { .. }
-            | ServerMessage::GroupAnnounce { .. } => {
-                vec![ServerEvent::Ignored("mensagem do grupo cifrado (tratada por e2ee)".into())]
+            | ServerMessage::GroupAnnounce { .. }
+            | ServerMessage::PassportOffer { .. }
+            | ServerMessage::FlattenRequest { .. } => {
+                vec![ServerEvent::Ignored("mensagem do grupo cifrado ou passaporte (tratada por e2ee/runtime)".into())]
             }
             ServerMessage::Action(action) => {
                 let server_id = action.body.server_id.clone();
@@ -691,7 +754,7 @@ impl ServerRegistry {
             .collect()
     }
 
-    fn persist(&self, server_id: &str) -> Result<(), CommunityError> {
+    pub fn persist(&self, server_id: &str) -> Result<(), CommunityError> {
         let (Some(dir), Some(server)) = (&self.dir, self.servers.get(server_id)) else { return Ok(()) };
         let stored = StoredServer {
             server_id: server_id.to_string(),
@@ -699,6 +762,9 @@ impl ServerRegistry {
             pending: server.pending.values().cloned().collect(),
         };
         std::fs::write(dir.join(format!("{}.server.json", server_id)), serde_json::to_vec_pretty(&stored)?)?;
+        if let Some(passport) = &server.my_passport {
+            std::fs::write(dir.join(format!("{}.passport.json", server_id)), serde_json::to_vec_pretty(passport)?)?;
+        }
         Ok(())
     }
 }
