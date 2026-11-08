@@ -80,6 +80,20 @@ pub fn parse_server_content_topic(topic: &str) -> Option<&str> {
     (content && is_valid_server_id(id)).then_some(id)
 }
 
+/// Id do grupo cifrado (MLS) de uma sala. Cada canal do servidor tem o próprio grupo, líder e chave:
+/// trocar de canal é sair de um grupo e entrar em outro.
+pub fn room_id(server_id: &str, channel: &str) -> String {
+    format!("{}/{}", server_id, channel)
+}
+
+/// Sala de um tópico de conteúdo de servidor (canal de texto ou de voz): (id do servidor, canal).
+/// O tópico de telas é do servidor inteiro e não tem sala própria.
+pub fn parse_room_topic(topic: &str) -> Option<(&str, &str)> {
+    let rest = topic.strip_prefix(TOPIC_PREFIX)?.strip_prefix("/server/")?;
+    let (id, channel) = rest.split_once("/channel/").or_else(|| rest.split_once("/voice/"))?;
+    (is_valid_server_id(id) && !channel.is_empty()).then_some((id, channel))
+}
+
 /// Se o tópico é de um canal de texto de servidor, devolve (id do servidor, canal)
 pub fn parse_server_channel_topic(topic: &str) -> Option<(&str, &str)> {
     let rest = topic.strip_prefix(TOPIC_PREFIX)?.strip_prefix("/server/")?;
@@ -139,17 +153,21 @@ pub enum ServerMessage {
     },
     /// Ação de moderador ainda não incluída na cadeia
     Action(ModAction),
-    /// Pedido de entrada no grupo cifrado (MLS): pacote de chave de quem publicou acompanhado de seu passaporte
+    /// Pedido de entrada no grupo cifrado (MLS) da sala `room`: pacote de chave de quem publicou com o passaporte
     KeyPackage {
         server_id: String,
+        /// Sala (canal) do grupo cifrado
+        room: String,
         #[serde(with = "crate::b64")]
         key_package: Vec<u8>,
         #[serde(default)]
         passport: Option<ServerPassport>,
     },
-    /// Commit MLS do líder (adiciona/remove membros ou rotaciona a chave do grupo)
+    /// Commit MLS do líder da sala (adiciona/remove membros ou rotaciona a chave do grupo)
     Commit {
         server_id: String,
+        /// Sala (canal) do grupo cifrado
+        room: String,
         #[serde(with = "crate::b64")]
         commit: Vec<u8>,
     },
@@ -157,15 +175,19 @@ pub enum ServerMessage {
     /// (quem entra valida o grupo e os Commits seguintes do líder com eles)
     Welcome {
         server_id: String,
+        /// Sala (canal) do grupo cifrado
+        room: String,
         target: String,
         #[serde(with = "crate::b64")]
         welcome: Vec<u8>,
         #[serde(default)]
         member_passports: Vec<ServerPassport>,
     },
-    /// Anúncio de presença do grupo MLS ativo (líder, época e membros) para convergência determinística
+    /// Anúncio do grupo MLS da sala (líder, época e membros) para convergência determinística
     GroupAnnounce {
         server_id: String,
+        /// Sala (canal) do grupo cifrado
+        room: String,
         epoch: u64,
         leader: String,
         members: Vec<String>,
@@ -181,6 +203,9 @@ pub enum ServerMessage {
         server_id: String,
         passport: ServerPassport,
     },
+    /// Quem publica saiu do grupo cifrado da sala (trocou de sala, `/server leave` ou encerramento).
+    /// É só um atalho: quem volta sem esse aviso ter chegado é readmitido pelo próprio `KeyPackage`.
+    GroupLeave { server_id: String, room: String },
     /// Quem não tem passaporte pede um. Em servidor público, moderadores com `IssueMember`
     /// online emitem automaticamente.
     AccessRequest { server_id: String },
@@ -327,13 +352,24 @@ impl KnownServer {
             Some(known) => {
                 state.verify_passport(known, now).is_err()
                     || passport.body.issued_at > known.body.issued_at
-                    || (passport.body.issued_at == known.body.issued_at && passport.stamps.len() > known.stamps.len())
+                    // Mesmo passaporte com mais carimbos; um diferente emitido no mesmo segundo não substitui
+                    || (passport.body.serial == known.body.serial && passport.stamps.len() > known.stamps.len())
             }
         };
         if replace {
             self.passports.insert(passport.body.holder.clone(), passport.clone());
         }
         replace
+    }
+
+    /// Guarda um passaporte que este nó acabou de emitir: é o mais recente do titular por definição,
+    /// mesmo emitido no mesmo segundo de outro (onde `learn_passport` não sabe desempatar)
+    pub fn remember_issued(&mut self, passport: &ServerPassport, now: UtcSecs) -> bool {
+        if !self.has_chain() || self.chain.state().verify_passport(passport, now).is_err() {
+            return false;
+        }
+        self.passports.insert(passport.body.holder.clone(), passport.clone());
+        true
     }
 
     pub fn channels(&self) -> Vec<Channel> {
@@ -662,6 +698,17 @@ impl ServerRegistry {
         if !ok || server.my_passport.as_ref() == Some(passport) {
             return false;
         }
+        // Reenvios atrasados não trocam um passaporte mais novo (ex.: o de moderador) por um antigo
+        if let Some(current) = &server.my_passport {
+            let current_valid = if server.has_chain() {
+                server.effective_state(now).verify_passport(current, now).is_ok()
+            } else {
+                current.verify_at(server_id, now).is_ok()
+            };
+            if current_valid && passport.body.issued_at < current.body.issued_at {
+                return false;
+            }
+        }
         server.set_my_passport(passport.clone());
         let _ = self.persist(server_id);
         true
@@ -740,6 +787,7 @@ impl ServerRegistry {
             | ServerMessage::PassportOffer { .. }
             | ServerMessage::FlattenRequest { .. }
             | ServerMessage::AccessRequest { .. }
+            | ServerMessage::GroupLeave { .. }
             | ServerMessage::StampRequest { .. } => {
                 vec![ServerEvent::Ignored("mensagem do grupo cifrado, passaporte ou carimbo (tratada pelo runtime)".into())]
             }
@@ -823,7 +871,13 @@ impl ServerRegistry {
     pub fn answer_access_request(&self, server_id: &str, issuer: &UserIdentity, requester: &str, now: UtcSecs) -> Option<ServerMessage> {
         let server = self.servers.get(server_id).filter(|s| s.has_chain())?;
         let state = server.effective_state(now);
-        if state.closed || state.is_banned(requester, now) || server.is_allowed(requester, now) {
+        // Já tem passaporte válido conhecido (a entrega anterior pode ter se perdido, ex.: pedido
+        // feito antes de a malha do tópico se formar): reenvia o mesmo, em vez de ignorar ou emitir outro
+        if server.is_allowed(requester, now) {
+            let passport = server.passport_of(requester)?.clone();
+            return Some(ServerMessage::PassportOffer { server_id: server_id.to_string(), target: requester.to_string(), passport });
+        }
+        if state.closed || state.is_banned(requester, now) {
             return None;
         }
         let can_issue = server.is_owner() || server.my_passport().is_some_and(|p| p.allows(PassportPermission::IssueMember));
@@ -1127,6 +1181,10 @@ mod tests {
         assert_eq!(parse_server_content_topic(&channel_topic(&space, "geral")), Some(id.as_str()));
         assert_eq!(parse_server_channel_topic(&channel_topic(&space, "geral")), Some((id.as_str(), "geral")));
         assert_eq!(parse_server_channel_topic(&voice_topic(&space, "voz")), None, "voz não é canal de texto");
+        assert_eq!(parse_room_topic(&channel_topic(&space, "geral")), Some((id.as_str(), "geral")));
+        assert_eq!(parse_room_topic(&voice_topic(&space, "voz")), Some((id.as_str(), "voz")));
+        assert_eq!(parse_room_topic(&screen_topic(&space)), None, "tela não tem sala própria");
+        assert_ne!(room_id(&id, "geral"), room_id(&id, "voz"), "cada sala tem o próprio grupo");
         assert_eq!(parse_server_channel_topic(&channel_topic(&Space::Lobby, "geral")), None);
         assert_eq!(parse_server_content_topic(&voice_topic(&space, "voz")), Some(id.as_str()));
         assert_eq!(parse_server_content_topic(&screen_topic(&space)), Some(id.as_str()));
@@ -1249,6 +1307,10 @@ mod tests {
         let issuer = UserIdentity::generate();
         let Some(ServerMessage::PassportOffer { passport, .. }) = owner.answer_access_request(&id, &issuer, &guest, T0 + 1) else { panic!() };
         assert_eq!(passport.body.expires_at, Some(T0 + 1 + 7 * 86_400), "passaporte automático usa a validade da política");
+        // A entrega pode se perder: novo pedido de quem já tem passaporte conhecido recebe o mesmo de novo
+        owner.get_mut(&id).unwrap().learn_passport(&passport, T0 + 1);
+        let Some(ServerMessage::PassportOffer { passport: again, .. }) = owner.answer_access_request(&id, &issuer, &guest, T0 + 30) else { panic!() };
+        assert_eq!(again.body.serial, passport.body.serial, "reenvia, não emite outro");
         assert!(owner.get(&id).unwrap().chain().state().verify_passport(&passport, T0 + 1).is_ok());
 
         let banned = pk(&UserIdentity::generate());
@@ -1295,6 +1357,8 @@ mod tests {
         fresh.join(&id).unwrap();
         let passport = owner.issue_passport(&id, &UserIdentity::generate(), &pk(&newcomer), PassportPermission::member(), None, T0).unwrap();
         assert!(fresh.accept_my_passport(&id, &pk(&newcomer), &passport, T0), "aceito só pela assinatura");
+        let older = owner.issue_passport(&id, &UserIdentity::generate(), &pk(&newcomer), PassportPermission::member(), None, T0 - 10).unwrap();
+        assert!(!fresh.accept_my_passport(&id, &pk(&newcomer), &older, T0), "reenvio antigo não substitui o atual");
         let Some(ServerMessage::ChainRequest { passport: Some(sent), .. }) = fresh.chain_request(&id) else { panic!() };
         assert_eq!(sent, passport);
     }

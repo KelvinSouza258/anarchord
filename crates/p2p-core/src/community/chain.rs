@@ -457,7 +457,7 @@ impl ServerState {
     /// Passaporte emitido depois do ban de forma que o libera: pela Chave do Servidor depois do
     /// início do ban, ou por qualquer emissor depois do fim do prazo
     fn cleared(&self, passport: &ServerPassport, ban: &BanState) -> bool {
-        (passport.body.issuer == self.server_id && passport.body.issued_at >= ban.starts_at)
+        (passport.body.issuer == self.server_id && passport.body.issued_at > ban.starts_at)
             || ban.until.is_some_and(|until| passport.body.issued_at >= until)
     }
 

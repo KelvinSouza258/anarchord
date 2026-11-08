@@ -200,6 +200,8 @@ async fn test_two_cores_server_lifecycle() {
             alice.wait("Alice voltar para o canal de texto #geral", |e| {
                 matches!(e, CoreEvent::ChannelEntered { channel, .. } if channel == "geral")
             }).await;
+            // Cada sala tem o próprio grupo cifrado: Alice voltou para o grupo de #geral (Bob a readmite)
+            assert!(exchange(&mut alice, &mut bob, "de volta ao geral").await, "Alice e Bob no mesmo grupo de #geral");
 
             // Alice emite passaporte de moderador para Bob
             alice.server(ServerCommand::AddModerator { target: "Bob".into(), permissions: None });
@@ -246,7 +248,8 @@ async fn test_two_cores_server_lifecycle() {
             let text: Vec<&str> = history.iter().map(|h| h.description.as_str()).collect();
             let joined = text.join("\n");
             assert!(joined.contains("criado 'Rust Guild'"), "{}", joined);
-            assert!(joined.contains("revogado"), "{}", joined);
+            let alice_errors: Vec<&CoreEvent> = alice.seen.iter().filter(|e| matches!(e, CoreEvent::Error(_))).collect();
+            assert!(joined.contains("revogado"), "{}\nerros de Alice: {:?}", joined, alice_errors);
             assert!(joined.contains("dono baniu"), "{}", joined);
 
             alice.send(CoreCommand::Shutdown);
@@ -660,6 +663,161 @@ async fn test_private_server_direct_invite_with_passport() {
             bob.server(ServerCommand::Accept);
             bob.wait("Bob entrar no servidor privado", in_server(id.clone())).await;
             bob.wait("Bob receber chave do grupo MLS", |e| matches!(e, CoreEvent::Server(ServerNotice::KeyReceived { .. }))).await;
+        })
+        .await;
+}
+
+/// O líder do grupo cifrado cai e volta (como num Ctrl+C) enquanto o outro membro continua com o
+/// grupo antigo: ao voltar, ele é readmitido com chave nova e os dois voltam a conversar
+#[tokio::test]
+async fn test_leader_restart_is_readmitted_with_new_key() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (alice_ident, bob_ident) = (UserIdentity::generate_with_nick("Alice"), UserIdentity::generate_with_nick("Bob"));
+            let (alice_srv, alice_down, bob_srv, bob_down) = (temp_dir("la_srv"), temp_dir("la_down"), temp_dir("lb_srv"), temp_dir("lb_down"));
+            let room = format!("teste-{}", rand_suffix());
+            let in_server = |id: String| move |e: &CoreEvent| matches!(e, CoreEvent::ChannelEntered { space: SpaceInfo::Server { id: sid, .. }, .. } if *sid == id);
+
+            let (mut alice, alice_task) = start_with_dirs("Alice", alice_ident.clone(), alice_srv.clone(), alice_down.clone(), room.clone(), None);
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+            let (mut bob, bob_task) = start_with_dirs("Bob", bob_ident.clone(), bob_srv.clone(), bob_down.clone(), room.clone(), Some(alice_port));
+            let bob_port = bob_task.listen_port();
+            tokio::task::spawn_local(bob_task.run());
+            alice.wait("Alice identificar Bob", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Bob")).await;
+            alice.server(ServerCommand::Create("Guilda".into()));
+            let CoreEvent::Server(ServerNotice::Created { id, .. }) =
+                alice.wait("servidor criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))).await
+            else {
+                unreachable!()
+            };
+            bob.server(ServerCommand::Join(id.clone()));
+            bob.wait("Bob receber a chave", |e| matches!(e, CoreEvent::Server(ServerNotice::KeyReceived { .. }))).await;
+            bob.wait("Bob ver quem lidera", |e| matches!(e, CoreEvent::Server(ServerNotice::LeaderChanged { leader: Some(_), .. }))).await;
+
+            // Reinicia só quem for o líder (menor pubkey); o outro fica com o grupo antigo
+            let alice_leads = alice_ident.public_key_hex() < bob_ident.public_key_hex();
+            let (leader, member) = if alice_leads { (&mut alice, &mut bob) } else { (&mut bob, &mut alice) };
+            leader.send(CoreCommand::Shutdown);
+            leader.wait("líder cair", |e| matches!(e, CoreEvent::Stopped)).await;
+            let (mut leader, leader_task) = if alice_leads {
+                start_with_dirs("Alice", alice_ident, alice_srv, alice_down, room.clone(), Some(bob_port))
+            } else {
+                start_with_dirs("Bob", bob_ident, bob_srv, bob_down, room.clone(), Some(alice_port))
+            };
+            tokio::task::spawn_local(leader_task.run());
+            leader.server(ServerCommand::Switch(id.clone()));
+            leader.wait("líder voltar ao servidor", in_server(id.clone())).await;
+
+            assert!(exchange(&mut leader, member, "de volta").await, "o líder que voltou deveria ser lido");
+            assert!(exchange(member, &mut leader, "bem-vindo").await, "o líder que voltou deveria ler");
+        })
+        .await;
+}
+
+/// Repete o envio até a mensagem chegar (a malha do tópico leva um tempo para se formar)
+async fn exchange(from: &mut Peer, to: &mut Peer, text: &str) -> bool {
+    for _ in 0..30 {
+        from.send(CoreCommand::SendMessage(text.into()));
+        to.drain(Duration::from_millis(500)).await;
+        if to.seen.iter().any(|e| chat_text(e) == Some(text)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Só participa (e pode liderar) o grupo cifrado quem está no servidor: Bob ir para o Lobby o tira do
+/// grupo, e Alice passa a liderar mesmo que a pubkey de Bob seja menor
+#[tokio::test]
+async fn test_member_in_lobby_is_not_in_group_nor_leader() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut alice, alice_task) = start("Alice", None);
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+            let (mut bob, bob_task) = start("Bob", Some(alice_port));
+            tokio::task::spawn_local(bob_task.run());
+            alice.wait("Alice identificar Bob", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Bob")).await;
+            alice.server(ServerCommand::Create("Guilda".into()));
+            let CoreEvent::Server(ServerNotice::Created { id, .. }) =
+                alice.wait("servidor criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))).await
+            else {
+                unreachable!()
+            };
+            bob.server(ServerCommand::Join(id.clone()));
+            bob.wait("Bob receber a chave", |e| matches!(e, CoreEvent::Server(ServerNotice::KeyReceived { .. }))).await;
+
+            bob.send(CoreCommand::Server(ServerCommand::Switch("lobby".into())));
+            let mut alone = false;
+            for _ in 0..30 {
+                alice.seen.clear();
+                alice.server(ServerCommand::Info);
+                let CoreEvent::Server(ServerNotice::Info(info)) =
+                    alice.wait("info", |e| matches!(e, CoreEvent::Server(ServerNotice::Info(_)))).await
+                else {
+                    unreachable!()
+                };
+                if info.mls_leader.as_deref() == Some("Alice") {
+                    alone = true;
+                    break;
+                }
+                alice.drain(Duration::from_millis(500)).await;
+            }
+            assert!(alone, "com Bob no Lobby, Alice lidera o grupo do servidor");
+        })
+        .await;
+}
+
+/// O grupo cifrado é por sala: trocar de canal dentro do servidor sai do grupo da sala anterior
+/// (Alice passa a liderar #geral) e forma o grupo da nova sala
+#[tokio::test]
+async fn test_changing_channel_leaves_room_group() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut alice, alice_task) = start("Alice", None);
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+            let (mut bob, bob_task) = start("Bob", Some(alice_port));
+            tokio::task::spawn_local(bob_task.run());
+            alice.wait("Alice identificar Bob", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Bob")).await;
+            alice.server(ServerCommand::Create("Guilda".into()));
+            let CoreEvent::Server(ServerNotice::Created { id, .. }) =
+                alice.wait("servidor criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))).await
+            else {
+                unreachable!()
+            };
+            alice.server(ServerCommand::AddChannel { name: "jogos".into(), voice: false });
+            alice.wait("canal criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::ChannelAdded { .. }, .. }))).await;
+            bob.server(ServerCommand::Join(id.clone()));
+            bob.wait("Bob receber a chave de #geral", |e| matches!(e, CoreEvent::Server(ServerNotice::KeyReceived { .. }))).await;
+            assert!(exchange(&mut alice, &mut bob, "oi no geral").await);
+
+            bob.send(CoreCommand::JoinChannel("jogos".into()));
+            bob.wait("Bob entrar em #jogos", |e| matches!(e, CoreEvent::ChannelEntered { channel, .. } if channel == "jogos")).await;
+            let mut alice_alone = false;
+            for _ in 0..30 {
+                alice.seen.clear();
+                alice.server(ServerCommand::Info);
+                let CoreEvent::Server(ServerNotice::Info(info)) =
+                    alice.wait("info", |e| matches!(e, CoreEvent::Server(ServerNotice::Info(_)))).await
+                else {
+                    unreachable!()
+                };
+                if info.mls_leader.as_deref() == Some("Alice") {
+                    alice_alone = true;
+                    break;
+                }
+                alice.drain(Duration::from_millis(500)).await;
+            }
+            assert!(alice_alone, "com Bob em #jogos, Alice lidera o grupo de #geral");
+
+            // Alice vai para #jogos também: entra no grupo dessa sala e os dois voltam a conversar
+            alice.send(CoreCommand::JoinChannel("jogos".into()));
+            assert!(exchange(&mut bob, &mut alice, "oi nos jogos").await, "grupo de #jogos formado com os dois");
         })
         .await;
 }

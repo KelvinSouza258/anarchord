@@ -135,7 +135,7 @@ impl Runtime {
     pub(super) fn share_file(&mut self, path: PathBuf) {
         // Em servidor, os pedaços vão cifrados com uma chave que só viaja na oferta (MLS)
         let key = match self.active.server_id() {
-            Some(id) if !self.mls.has_group(id) => return self.error(CoreError::NoGroupKey),
+            Some(_) if !self.active_room().is_some_and(|(_, _, room)| self.mls.has_group(&room)) => return self.error(CoreError::NoGroupKey),
             Some(_) => Some(FileKey::generate()),
             None => None,
         };

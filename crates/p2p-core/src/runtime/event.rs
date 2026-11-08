@@ -273,6 +273,8 @@ pub enum ServerNotice {
     KeyReceived { server: String },
     /// Passaporte do servidor recebido, renovado ou achatado com sucesso
     PassportUpdated { server: String },
+    /// O líder do grupo cifrado do servidor mudou (`None` = sem grupo/sem líder no momento)
+    LeaderChanged { server: String, leader: Option<String>, you: bool },
     /// Chave do grupo MLS rotacionada para uma nova época
     KeyRotated { server: String, epoch: u64 },
     RemovedFromGroup { server: String },

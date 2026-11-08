@@ -113,8 +113,8 @@ pub struct ServerGroups {
 }
 
 /// Janela em que pedidos de entrada repetidos de quem acabou de ser admitido são ignorados
-/// (o Welcome pode ainda estar a caminho)
-const READMIT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+/// (o Welcome pode ainda estar a caminho). Curta: quem sai e volta logo depois precisa ser readmitido.
+const READMIT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Intervalo padrão de rotação periódica da chave MLS pelo líder (5 minutos em produção)
 pub const DEFAULT_KEY_ROTATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -168,6 +168,22 @@ impl ServerGroups {
     /// Retorna `true` se este nó é o líder determinístico atual do grupo (`min(pubkey)`).
     pub fn is_leader(&self, server_id: &str) -> bool {
         self.leader(server_id).as_deref() == Some(self.me.as_str())
+    }
+
+    /// Somos o líder se `absent` não contar: `absent` está no grupo, mas perdeu o estado MLS (saiu e
+    /// voltou sem ninguém perceber). Se ele era o líder, ninguém mais seria, e ele ficaria de fora.
+    pub fn is_leader_without(&self, server_id: &str, absent: &str) -> bool {
+        self.members(server_id).into_iter().filter(|pk| pk != absent).min().as_deref() == Some(self.me.as_str())
+    }
+
+    /// `pubkey` avisou que saiu: se somos o menor dos demais, tiramos a folha dele (chave nova).
+    /// Devolve o Commit a publicar.
+    pub fn member_left(&mut self, server_id: &str, pubkey: &str) -> Result<Option<Vec<u8>>, E2eeError> {
+        self.recently_added.remove(&(server_id.to_string(), pubkey.to_string()));
+        if pubkey == self.me || !self.members(server_id).contains(pubkey) || !self.is_leader_without(server_id, pubkey) {
+            return Ok(None);
+        }
+        self.remove_members_unchecked(server_id, &[pubkey.to_string()])
     }
 
     /// Cria um grupo efêmero em memória para o servidor (quando somos o primeiro membro presente)
@@ -540,16 +556,22 @@ pub fn admit_from_key_package(
     groups: &mut ServerGroups,
     registry: &super::ServerRegistry,
     server_id: &str,
+    room: &str,
     from_pubkey: &str,
     key_package: &[u8],
     passport: Option<&super::ServerPassport>,
     now: u64,
 ) -> Result<Vec<super::ServerMessage>, E2eeError> {
     let server = registry.get(server_id).filter(|s| s.has_chain()).ok_or(E2eeError::NotOwner)?;
-    if !groups.has_group(server_id) {
+    let group = super::room_id(server_id, room);
+    if !groups.has_group(&group) {
         return Err(E2eeError::NotInGroup);
     }
-    if !groups.is_leader(server_id) {
+    // Quem ainda consta no grupo e manda pacote de chave novo perdeu o estado (saiu sem o aviso
+    // chegar, ex.: Ctrl+C). Vale como "saiu e entrou": primeiro a remoção normal, conduzida por quem
+    // seria o líder sem ele; depois a entrada normal pelo líder.
+    let stale = groups.members(&group).contains(from_pubkey);
+    if !groups.is_leader(&group) && !(stale && groups.is_leader_without(&group, from_pubkey)) {
         return Err(E2eeError::NotOwner);
     }
     let me = groups.me().to_string();
@@ -559,25 +581,33 @@ pub fn admit_from_key_package(
     if server.is_banned(from_pubkey, now) || !server.is_allowed_with_passport(from_pubkey, passport, now) {
         return Err(E2eeError::NotAllowed);
     }
-    let key = (server_id.to_string(), from_pubkey.to_string());
-    if groups.members(server_id).contains(from_pubkey)
+    let key = (group.clone(), from_pubkey.to_string());
+    if groups.members(&group).contains(from_pubkey)
         && groups.recently_added.get(&key).is_some_and(|t| t.elapsed() < READMIT_GRACE)
     {
         return Ok(Vec::new());
     }
-    let (commits, welcome) = groups.add_member(server_id, key_package, from_pubkey)?;
+    groups.validate_key_package(key_package, from_pubkey)?;
+    let mut commits = Vec::new();
+    if stale {
+        // Saída: igual a receber o aviso de saída dele
+        commits.extend(groups.member_left(&group, from_pubkey)?);
+    }
+    // Entrada: pelo líder, que depois da saída somos nós
+    let (added, welcome) = groups.add_member(&group, key_package, from_pubkey)?;
+    commits.extend(added);
     groups.recently_added.insert(key, std::time::Instant::now());
     // Quem entra recebe os passaportes dos membros, para validar o grupo e os Commits do líder
     let member_passports = groups
-        .members(server_id)
+        .members(&group)
         .iter()
         .filter_map(|pk| if *pk == me { server.my_passport() } else { server.passport_of(pk) })
         .cloned()
         .collect();
 
     let mut out: Vec<super::ServerMessage> =
-        commits.into_iter().map(|commit| super::ServerMessage::Commit { server_id: server_id.to_string(), commit }).collect();
-    out.push(super::ServerMessage::Welcome { server_id: server_id.to_string(), target: from_pubkey.to_string(), welcome, member_passports });
+        commits.into_iter().map(|commit| super::ServerMessage::Commit { server_id: server_id.to_string(), room: room.to_string(), commit }).collect();
+    out.push(super::ServerMessage::Welcome { server_id: server_id.to_string(), room: room.to_string(), target: from_pubkey.to_string(), welcome, member_passports });
     Ok(out)
 }
 
@@ -588,10 +618,12 @@ pub fn enforce_membership(
     groups: &mut ServerGroups,
     registry: &super::ServerRegistry,
     server_id: &str,
+    room: &str,
     now: u64,
 ) -> Result<Option<super::ServerMessage>, E2eeError> {
     let Some(server) = registry.get(server_id).filter(|s| s.has_chain()) else { return Ok(None) };
-    if !groups.has_group(server_id) {
+    let group = super::room_id(server_id, room);
+    if !groups.has_group(&group) {
         return Ok(None);
     }
     let me = groups.me().to_string();
@@ -603,7 +635,7 @@ pub fn enforce_membership(
     }
     // Quem deve executar a manutenção? O menor membro NÃO-banido e permitido que está no grupo!
     let effective_leader = groups
-        .members(server_id)
+        .members(&group)
         .into_iter()
         .filter(|pk| !server.is_excluded(pk, now))
         .min();
@@ -611,14 +643,14 @@ pub fn enforce_membership(
         return Ok(None);
     }
     let out: Vec<String> = groups
-        .members(server_id)
+        .members(&group)
         .into_iter()
         .filter(|pk| *pk != me && server.is_excluded(pk, now))
         .collect();
     if out.is_empty() {
         return Ok(None);
     }
-    Ok(groups.remove_members_unchecked(server_id, &out)?.map(|commit| super::ServerMessage::Commit { server_id: server_id.to_string(), commit }))
+    Ok(groups.remove_members_unchecked(&group, &out)?.map(|commit| super::ServerMessage::Commit { server_id: server_id.to_string(), room: room.to_string(), commit }))
 }
 
 #[cfg(test)]
@@ -809,6 +841,64 @@ mod tests {
         assert!(alice.decrypt(SERVER, &secret).is_err());
     }
 
+    /// O líder sai e volta sem ninguém perceber (perdeu o estado MLS): o menor dos demais troca a
+    /// folha velha dele por uma nova, e todos voltam a ler as mensagens uns dos outros
+    #[test]
+    fn test_leader_that_lost_state_is_readmitted_by_next_smallest() {
+        let mut nodes = sorted_nodes(3);
+        let (_, mut carol) = nodes.pop().unwrap();
+        let (_, mut bob) = nodes.pop().unwrap();
+        let (alice_id, mut alice) = nodes.pop().unwrap();
+        alice.create_group(SERVER).unwrap();
+        admit(&mut alice, &mut bob, &mut []);
+        admit(&mut alice, &mut carol, &mut [&mut bob]);
+        assert!(alice.is_leader(SERVER));
+
+        // Alice volta sem estado; os outros ainda a têm como líder no grupo
+        let mut alice = ServerGroups::new(&alice_id, None);
+        let alice_pk = alice.me().to_string();
+        assert!(bob.members(SERVER).contains(&alice_pk) && bob.leader(SERVER).as_deref() == Some(alice_pk.as_str()));
+        assert!(!carol.is_leader_without(SERVER, &alice_pk), "só o menor dos demais conduz");
+        let kp = alice.key_package().unwrap();
+        // "Saiu e entrou": remoção normal da líder (Bob seria o líder sem ela) e depois a entrada
+        assert!(matches!(bob.add_member(SERVER, &kp, &alice_pk), Err(E2eeError::NotOwner)), "na visão do grupo, Alice ainda lidera");
+        let mut commits = vec![bob.member_left(SERVER, &alice_pk).unwrap().expect("saída da líder")];
+        assert!(bob.is_leader(SERVER), "depois da saída, Bob lidera");
+        let (added, welcome) = bob.add_member(SERVER, &kp, &alice_pk).expect("entrada pelo novo líder");
+        commits.extend(added);
+        assert_eq!(commits.len(), 2, "um Commit de saída e um de entrada");
+        for c in &commits {
+            assert!(matches!(carol.process_commit(SERVER, c, "").unwrap(), CommitOutcome::Applied { .. }));
+        }
+        alice.join(SERVER, &welcome, "").unwrap();
+        assert_eq!(alice.members(SERVER).len(), 3);
+
+        let msg = carol.encrypt(SERVER, b"de volta").unwrap();
+        assert_eq!(alice.decrypt(SERVER, &msg).unwrap().plaintext, b"de volta");
+        let msg = alice.encrypt(SERVER, b"oi").unwrap();
+        assert_eq!(bob.decrypt(SERVER, &msg).unwrap().plaintext, b"oi");
+    }
+
+    /// Aviso de saída: o menor dos demais tira a folha de quem saiu (mesmo que fosse o líder)
+    #[test]
+    fn test_member_left_is_removed_by_next_smallest() {
+        let mut nodes = sorted_nodes(3);
+        let (_, mut carol) = nodes.pop().unwrap();
+        let (_, mut bob) = nodes.pop().unwrap();
+        let (_, mut alice) = nodes.pop().unwrap();
+        alice.create_group(SERVER).unwrap();
+        admit(&mut alice, &mut bob, &mut []);
+        admit(&mut alice, &mut carol, &mut [&mut bob]);
+        let alice_pk = alice.me().to_string();
+
+        assert_eq!(carol.member_left(SERVER, &alice_pk).unwrap(), None, "Carol não é a próxima líder");
+        let commit = bob.member_left(SERVER, &alice_pk).unwrap().expect("Bob remove a líder que saiu");
+        assert!(matches!(carol.process_commit(SERVER, &commit, "").unwrap(), CommitOutcome::Applied { .. }));
+        assert!(!carol.members(SERVER).contains(&alice_pk) && bob.is_leader(SERVER));
+        let msg = carol.encrypt(SERVER, b"sem a alice").unwrap();
+        assert_eq!(bob.decrypt(SERVER, &msg).unwrap().plaintext, b"sem a alice");
+    }
+
     /// Convergência determinística de grupos (`maior grupo vence`, desempate `menor pubkey`):
     /// Se dois subgrupos se formarem ao mesmo tempo, o menor adota o Welcome do maior.
     #[test]
@@ -940,6 +1030,7 @@ mod tests {
         let owner_id = UserIdentity::generate_with_nick("Owner");
         let mut owner_registry = ServerRegistry::in_memory();
         let server = owner_registry.create("Guild", &owner_id.public_key_hex(), T0).unwrap();
+        let room = crate::community::room_id(&server, "geral");
 
         // Bob e Carol são membros comuns (o dono NÃO está no grupo MLS!)
         let mut nodes = sorted_nodes(2);
@@ -963,33 +1054,33 @@ mod tests {
         assert!(bob_registry.accept_my_passport(&server, &bob_id.public_key_hex(), &bob_p, T0));
 
         // Bob cria o grupo efêmero da sala (sem o dono estar online!) e admite Carol
-        bob.create_group(&server).unwrap();
+        bob.create_group(&room).unwrap();
         let carol_pk = carol_id.public_key_hex();
         let kp = carol.key_package().unwrap();
         assert!(
-            matches!(admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp, None, T0), Err(E2eeError::NotAllowed)),
+            matches!(admit_from_key_package(&mut bob, &bob_registry, &server, "geral", &carol_pk, &kp, None, T0), Err(E2eeError::NotAllowed)),
             "sem passaporte não entra"
         );
         let kp = carol.key_package().unwrap();
-        let msgs = admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp, Some(&carol_p), T0).unwrap();
+        let msgs = admit_from_key_package(&mut bob, &bob_registry, &server, "geral", &carol_pk, &kp, Some(&carol_p), T0).unwrap();
         assert!(matches!(msgs.last(), Some(ServerMessage::Welcome { target, .. }) if *target == carol_pk));
-        assert!(bob.members(&server).contains(&carol_pk));
+        assert!(bob.members(&room).contains(&carol_pk));
         bob_registry.get_mut(&server).unwrap().learn_passport(&carol_p, T0);
 
         // Pedido repetido logo depois de admitida: ignorado (sem nova troca de chave)
         let kp_again = carol.key_package().unwrap();
-        assert!(admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp_again, Some(&carol_p), T0).unwrap().is_empty());
+        assert!(admit_from_key_package(&mut bob, &bob_registry, &server, "geral", &carol_pk, &kp_again, Some(&carol_p), T0).unwrap().is_empty());
 
         // Dono bane Carol na cadeia e o bloco chega para Bob -> Bob (líder MLS) remove Carol do grupo!
         let ban_block = owner_registry.moderate(&server, &owner_id, ModKind::Ban { until: None }, &carol_pk, "", T0 + 1).unwrap();
         bob_registry.handle_message(ban_block, None, T0 + 1);
-        assert!(enforce_membership(&mut bob, &bob_registry, &server, T0 + 2).unwrap().is_some());
-        assert!(!bob.members(&server).contains(&carol_pk));
-        assert!(enforce_membership(&mut bob, &bob_registry, &server, T0 + 3).unwrap().is_none(), "nada mais a fazer");
+        assert!(enforce_membership(&mut bob, &bob_registry, &server, "geral", T0 + 2).unwrap().is_some());
+        assert!(!bob.members(&room).contains(&carol_pk));
+        assert!(enforce_membership(&mut bob, &bob_registry, &server, "geral", T0 + 3).unwrap().is_none(), "nada mais a fazer");
 
         // Banida não é readmitida pelo líder Bob
         let kp = carol.key_package().unwrap();
-        assert!(matches!(admit_from_key_package(&mut bob, &bob_registry, &server, &carol_pk, &kp, Some(&carol_p), T0 + 4), Err(E2eeError::NotAllowed)));
+        assert!(matches!(admit_from_key_package(&mut bob, &bob_registry, &server, "geral", &carol_pk, &kp, Some(&carol_p), T0 + 4), Err(E2eeError::NotAllowed)));
     }
 
     /// Garante que o grupo MLS é 100% efêmero em memória: nenhum arquivo `mls-state.json` é criado

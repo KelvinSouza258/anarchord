@@ -123,12 +123,22 @@ impl Runtime {
         if self.active.space != space && self.voice.topic.is_some() {
             self.leave_voice();
         }
+        // Cada sala (canal de servidor) tem o próprio grupo cifrado: trocar de sala, mesmo dentro do
+        // servidor, é sair do grupo dela (com aviso) e entrar no da nova. A cadeia do servidor
+        // continua sendo acompanhada.
+        let changing_room = self.active.space != space || self.active.channel != channel;
+        if changing_room {
+            self.leave_room_group();
+        }
         self.dm.active_dm_peer = None;
         if let Err(e) = self.active.switch(&mut self.node.swarm.behaviour_mut().gossipsub, space, channel) {
             return self.error(CoreError::Network(format!("{:?}", e)));
         }
         self.refresh_space();
         self.emit(CoreEvent::ChannelEntered { space: self.space_info(&self.active.space), channel: self.active.channel.clone() });
+        if changing_room {
+            self.enter_room_group();
+        }
     }
 
     pub(super) fn space_info(&self, space: &Space) -> SpaceInfo {
@@ -203,10 +213,7 @@ impl Runtime {
         } else {
             if let Some((invite, maybe_passport)) = super::parse_invite_details(&message.text) {
                 if let Some(passport) = maybe_passport {
-                    let my_pk = self.my_pubkey();
-                    let _ = self.servers.join(&invite);
-                    self.servers.accept_my_passport(&invite, &my_pk, &passport, now);
-                    let _ = self.servers.persist(&invite);
+                    self.accept_invite_passport(&invite, &passport);
                 }
                 let known = self.servers.get(&invite).is_some();
                 self.emit(CoreEvent::InviteReceived { from: message.author_name.clone(), server_id: invite.clone(), known });

@@ -601,11 +601,7 @@ impl Runtime {
                             DmFirewallVerdict::Allowed => {
                                 if let Some((invite, maybe_passport)) = super::parse_invite_details(&payload.text) {
                                     if let Some(passport) = maybe_passport {
-                                        let my_pk = self.my_pubkey();
-                                        let now = super::now_secs();
-                                        let _ = self.servers.join(&invite);
-                                        self.servers.accept_my_passport(&invite, &my_pk, &passport, now);
-                                        let _ = self.servers.persist(&invite);
+                                        self.accept_invite_passport(&invite, &passport);
                                     }
                                     let known = self.servers.get(&invite).is_some();
                                     self.emit(CoreEvent::InviteReceived {
@@ -885,11 +881,7 @@ impl Runtime {
                     DmFirewallVerdict::Allowed => {
                         if let Some((invite, maybe_passport)) = super::parse_invite_details(&payload.text) {
                             if let Some(passport) = maybe_passport {
-                                let my_pk = self.my_pubkey();
-                                let now = super::now_secs();
-                                let _ = self.servers.join(&invite);
-                                self.servers.accept_my_passport(&invite, &my_pk, &passport, now);
-                                let _ = self.servers.persist(&invite);
+                                self.accept_invite_passport(&invite, &passport);
                             }
                             let known = self.servers.get(&invite).is_some();
                             self.emit(CoreEvent::InviteReceived {

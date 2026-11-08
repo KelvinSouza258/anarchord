@@ -413,6 +413,11 @@ fn server(notice: &ServerNotice) -> Vec<String> {
         ServerNotice::KeyReceived { server } => {
             one(format!("🔐 Chave do grupo de '{}' recebida: chat, voz e tela cifrados de ponta a ponta.", server))
         }
+        ServerNotice::LeaderChanged { server, leader, you } => one(match (leader, you) {
+            (_, true) => format!("👑 [{}] Você é o novo líder do grupo cifrado (admite quem entra e troca a chave).", server),
+            (Some(leader), false) => format!("👑 [{}] Novo líder do grupo cifrado: {}.", server, leader),
+            (None, _) => format!("👑 [{}] Grupo cifrado sem líder no momento (aguardando membros).", server),
+        }),
         ServerNotice::KeyRotated { server, epoch } => {
             one(format!("🔄 Chave do grupo MLS de '{}' rotacionada (época {}).", server, epoch))
         }

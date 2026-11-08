@@ -254,6 +254,8 @@ pub(crate) struct Runtime {
     stamp_rx: Option<UnboundedReceiver<servers::StampResult>>,
     /// Último pedido de acesso de quem ainda não tem passaporte, por servidor
     last_access_request: HashMap<String, std::time::Instant>,
+    /// Último líder do grupo cifrado avisado à interface, por servidor
+    last_leader: HashMap<String, Option<String>>,
 
     voice: voice::VoiceState,
     screen: screen::ScreenState,
@@ -327,6 +329,7 @@ impl Runtime {
             stamp_tx,
             stamp_rx: Some(stamp_rx),
             last_access_request: HashMap::new(),
+            last_leader: HashMap::new(),
             voice: voice::VoiceState::default(),
             screen,
             files,
@@ -406,6 +409,16 @@ impl Runtime {
             }
         }
 
+        // Avisa o grupo cifrado da sala que saímos e dá um instante para a rede enviar (Ctrl+C não
+        // passa por aqui; nesse caso a readmissão acontece pelo KeyPackage quando voltarmos)
+        self.leave_room_group();
+        let _ = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                let event = self.node.swarm.next_event().await;
+                self.handle_swarm_event(event);
+            }
+        })
+        .await;
         self.stop_discovery();
         self.emit(CoreEvent::Stopped);
     }
@@ -565,8 +578,10 @@ impl Runtime {
         let bytes = self.adapt_envelope_version(topic, bytes);
         let topic_name = topic.hash().into_string();
         match community::parse_server_content_topic(&topic_name) {
-            Some(server_id) => {
-                let encrypted = self.mls.encrypt(server_id, &bytes).map_err(|_| PublishError::NoGroupKey)?;
+            Some(_) => {
+                // Cifra com o grupo da sala (cada canal tem o próprio grupo e chave)
+                let room = self.room_for_topic(&topic_name).ok_or(PublishError::NoGroupKey)?;
+                let encrypted = self.mls.encrypt(&room, &bytes).map_err(|_| PublishError::NoGroupKey)?;
                 self.sniff_packet("TX", &topic_name, None, &encrypted, Some(&bytes));
                 self.node
                     .swarm

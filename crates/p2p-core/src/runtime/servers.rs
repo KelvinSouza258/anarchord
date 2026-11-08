@@ -78,40 +78,81 @@ impl Runtime {
         self.servers.get(server_id).is_some_and(|s| s.has_chain() && s.is_allowed(&me, now))
     }
 
+    /// Sala atual: (servidor, canal, id do grupo cifrado). Cada sala tem o próprio grupo, líder e
+    /// chave, e só participamos do grupo da sala em que estamos.
+    pub(super) fn active_room(&self) -> Option<(String, String, String)> {
+        let server = self.active.server_id()?.to_string();
+        let channel = self.active.channel.clone();
+        let room = community::room_id(&server, &channel);
+        Some((server, channel, room))
+    }
+
+    /// Grupo cifrado que protege um tópico de conteúdo de servidor: o da sala do canal (texto ou voz),
+    /// ou, para telas (tópico do servidor inteiro), o da nossa sala nesse servidor
+    pub(super) fn room_for_topic(&self, topic: &str) -> Option<String> {
+        if let Some((server_id, channel)) = community::parse_room_topic(topic) {
+            return Some(community::room_id(server_id, channel));
+        }
+        let server_id = community::parse_server_content_topic(topic)?;
+        let (active_server, _, room) = self.active_room()?;
+        (active_server == server_id).then_some(room)
+    }
+
+    /// Id do grupo da sala, se ela for a atual (mensagens de grupo de outras salas são ignoradas)
+    fn room_if_active(&self, server_id: &str, channel: &str) -> Option<String> {
+        let (server, current, room) = self.active_room()?;
+        (server == server_id && current == channel).then_some(room)
+    }
+
     fn enter_server(&mut self, server_id: String) {
         let now = super::now_secs();
-        if self.participating(&server_id, now) && !self.mls.has_group(&server_id) {
-            // Se já há outros membros online no tópico de controle do servidor, pedimos KeyPackage
-            // para entrar no grupo deles; se não houver resposta até o próximo tick (ou estivermos sozinhos),
-            // assumimos a liderança inicial criando o grupo.
-            let ctrl_topic = IdentTopic::new(server_control_topic(&server_id));
-            let has_peers_in_ctrl = !super::chat::channel_members_with_topics(
-                &self.node.swarm.behaviour().gossipsub,
-                &self.peer_metadata,
-                &self.peer_topics,
-                &ctrl_topic,
-            )
-            .is_empty();
-            if has_peers_in_ctrl {
-                self.request_group_key(&server_id);
-            } else {
-                let _ = self.mls.create_group(&server_id);
-                self.announce_mls_group(&server_id);
-            }
-        } else if self.servers.get(&server_id).is_some_and(|s| s.has_chain()) && !self.participating(&server_id, now) {
+        if self.servers.get(&server_id).is_some_and(|s| s.has_chain()) && !self.participating(&server_id, now) {
             self.request_access(&server_id);
         }
         let channel = self.default_channel(&server_id);
         self.enter_channel(Space::Server(server_id), channel);
     }
 
-    /// Publica o pacote de chave MLS com o nosso passaporte
-    fn request_group_key(&mut self, server_id: &str) {
-        if let Ok(key_package) = self.mls.key_package() {
-            let passport = self.servers.get(server_id).and_then(|s| s.my_passport().cloned());
-            if self.publish_server_message(server_id, &ServerMessage::KeyPackage { server_id: server_id.to_string(), key_package, passport }) {
-                self.last_key_package.insert(server_id.to_string(), Instant::now());
-            }
+    /// Entra no grupo cifrado da sala atual. Entrar é anunciado sempre com o KeyPackage: se ainda
+    /// constamos no grupo (saímos sem o aviso chegar, ex.: Ctrl+C), vale como "saiu e entrou". Sem
+    /// resposta até o próximo tick, assumimos a liderança criando o grupo; sem ninguém no tópico, já.
+    pub(super) fn enter_room_group(&mut self) {
+        let now = super::now_secs();
+        let Some((server_id, channel, room)) = self.active_room() else { return };
+        if !self.participating(&server_id, now) || self.mls.has_group(&room) {
+            return;
+        }
+        if !self.request_group_key(&server_id, &channel) {
+            let _ = self.mls.create_group(&room);
+            self.announce_mls_group();
+        }
+    }
+
+    /// Sai do grupo cifrado da sala atual (troca de sala, saída do servidor ou encerramento)
+    pub(super) fn leave_room_group(&mut self) {
+        let Some((server_id, channel, room)) = self.active_room() else { return };
+        self.announce_group_leave(&server_id, &channel);
+        self.mls.drop_group(&room);
+        self.last_key_package.remove(&room);
+    }
+
+    /// Publica o pacote de chave MLS da sala com o nosso passaporte. `false` = ninguém no tópico.
+    fn request_group_key(&mut self, server_id: &str, channel: &str) -> bool {
+        let Ok(key_package) = self.mls.key_package() else { return false };
+        let passport = self.servers.get(server_id).and_then(|s| s.my_passport().cloned());
+        let message = ServerMessage::KeyPackage { server_id: server_id.to_string(), room: channel.to_string(), key_package, passport };
+        let sent = self.publish_server_message(server_id, &message);
+        if sent {
+            self.last_key_package.insert(community::room_id(server_id, channel), Instant::now());
+        }
+        sent
+    }
+
+    /// Avisa que saímos do grupo cifrado da sala (atalho para o líder trocar a chave já; não é garantido)
+    fn announce_group_leave(&mut self, server_id: &str, channel: &str) {
+        let room = community::room_id(server_id, channel);
+        if self.mls.has_group(&room) && self.mls.members(&room).len() > 1 {
+            self.publish_server_message(server_id, &ServerMessage::GroupLeave { server_id: server_id.to_string(), room: channel.to_string() });
         }
     }
 
@@ -125,16 +166,45 @@ impl Runtime {
         }
     }
 
-    /// Se somos o líder efetivo do grupo cifrado, remove agora quem está banido ou sem passaporte
-    /// válido. Os membros validam esse Commit como qualquer outro.
-    fn enforce_now(&mut self, server_id: &str) {
-        let now = super::now_secs();
-        if !self.mls.has_group(server_id) {
+    /// Avisa a interface quando o líder do grupo cifrado da sala atual muda
+    pub(super) fn check_leader_changes(&mut self) {
+        let me = self.my_pubkey();
+        let active = self.active_room();
+        self.last_leader.retain(|id, _| active.as_ref().is_some_and(|(_, _, room)| room == id));
+        let Some((server_id, channel, room)) = active else { return };
+        let leader = self.mls.leader(&room);
+        if self.last_leader.get(&room) == Some(&leader) {
             return;
         }
-        if let Ok(Some(commit)) = e2ee::enforce_membership(&mut self.mls, &self.servers, server_id, now) {
+        let known_before = self.last_leader.insert(room, leader.clone()).is_some();
+        if leader.is_none() && !known_before {
+            return;
+        }
+        self.notice(ServerNotice::LeaderChanged {
+            server: format!("{} #{}", self.server_name(&server_id), channel),
+            you: leader.as_deref() == Some(me.as_str()),
+            leader: leader.map(|pk| self.nick_for(&pk)),
+        });
+    }
+
+    /// Se somos o líder efetivo do grupo da sala atual (neste servidor), remove agora quem está
+    /// banido ou sem passaporte válido. Os membros validam esse Commit como qualquer outro.
+    fn enforce_now(&mut self, server_id: &str) {
+        let now = super::now_secs();
+        let Some((active_server, channel, room)) = self.active_room() else { return };
+        if active_server != server_id || !self.mls.has_group(&room) {
+            return;
+        }
+        // Fomos banidos ou perdemos o passaporte: saímos sozinhos do grupo da sala, sem depender do
+        // líder (podemos nem estar no mesmo grupo que ele)
+        if self.servers.get(server_id).is_some_and(|s| s.is_excluded(&self.my_pubkey(), now)) {
+            self.leave_room_group();
+            self.notice(ServerNotice::RemovedFromGroup { server: self.server_name(server_id) });
+            return;
+        }
+        if let Ok(Some(commit)) = e2ee::enforce_membership(&mut self.mls, &self.servers, server_id, &channel, now) {
             self.publish_server_message(server_id, &commit);
-            self.announce_mls_group(server_id);
+            self.announce_mls_group();
         }
     }
 
@@ -170,44 +240,28 @@ impl Runtime {
         }
     }
 
-    /// Anuncia o grupo MLS atual (se formos o líder determinístico) para convergência
-    pub(super) fn announce_mls_group(&mut self, server_id: &str) {
-        if !self.mls.is_leader(server_id) {
+    /// Anuncia o grupo MLS da sala atual (se formos o líder determinístico) para convergência
+    pub(super) fn announce_mls_group(&mut self) {
+        let Some((server_id, channel, room)) = self.active_room() else { return };
+        if !self.mls.is_leader(&room) {
             return;
         }
-        let Some(epoch) = self.mls.epoch(server_id) else { return };
-        let Some(leader) = self.mls.leader(server_id) else { return };
-        let members: Vec<String> = self.mls.members(server_id).into_iter().collect();
-        self.publish_server_message(
-            server_id,
-            &ServerMessage::GroupAnnounce {
-                server_id: server_id.to_string(),
-                epoch,
-                leader,
-                members,
-            },
-        );
+        let Some(epoch) = self.mls.epoch(&room) else { return };
+        let Some(leader) = self.mls.leader(&room) else { return };
+        let members: Vec<String> = self.mls.members(&room).into_iter().collect();
+        self.publish_server_message(&server_id, &ServerMessage::GroupAnnounce { server_id: server_id.clone(), room: channel, epoch, leader, members });
     }
 
-    /// Remove um par que desconectou do Swarm de todos os grupos MLS em que somos o líder atual
+    /// Par desconectou do Swarm: se ele estava no grupo da nossa sala e somos o menor dos demais,
+    /// tiramos a folha dele (chave nova)
     pub(super) fn on_peer_disconnected_mls(&mut self, disconnected_pubkey: &str) {
-        let ids: Vec<String> = self.servers.list().map(|s| s.server_id.clone()).collect();
-        for id in ids {
-            if self.mls.has_group(&id) && self.mls.members(&id).contains(disconnected_pubkey) {
-                // Se quem saiu era o líder antigo e agora nós somos o menor restante,
-                // ou se já éramos o líder: verificamos quem seria o líder sem o desconectado.
-                let mut remaining = self.mls.members(&id);
-                remaining.remove(disconnected_pubkey);
-                if remaining.iter().min().map(String::as_str) == Some(self.my_pubkey().as_str()) {
-                    // Força a remoção: se o desconectado tinha pubkey menor que a nossa,
-                    // removemos diretamente a folha dele para assumir a liderança na nova época!
-                    if let Ok(Some(commit)) = self.mls.remove_members_unchecked(&id, &[disconnected_pubkey.to_string()]) {
-                        self.publish_server_message(&id, &ServerMessage::Commit { server_id: id.clone(), commit });
-                        self.announce_mls_group(&id);
-                    }
-                }
+        if let Some((server_id, channel, room)) = self.active_room() {
+            if let Ok(Some(commit)) = self.mls.member_left(&room, disconnected_pubkey) {
+                self.publish_server_message(&server_id, &ServerMessage::Commit { server_id: server_id.clone(), room: channel, commit });
+                self.announce_mls_group();
             }
         }
+        self.check_leader_changes();
     }
 
     /// Pubkey de um par por nick, prefixo da pubkey (6+ caracteres) ou a pubkey completa
@@ -237,42 +291,38 @@ impl Runtime {
                 self.request_access(id);
             }
         }
-        // Grupo cifrado efêmero com líder determinístico (menor pubkey):
-        // O dono NÃO precisa estar online. Qualquer membro autorizado participa/lidera.
-        let ids: Vec<String> = synced.into_iter().filter(|id| self.participating(id, now)).collect();
-        for id in ids {
-            if self.mls.has_group(&id) {
-                if let Ok(Some(commit)) = e2ee::enforce_membership(&mut self.mls, &self.servers, &id, now) {
+        // Grupo cifrado efêmero com líder determinístico (menor pubkey), só da sala em que o usuário
+        // está: estar online (ou no mesmo servidor) não basta para participar ou liderar. O dono não
+        // precisa estar online.
+        if let Some((id, channel, room)) = self.active_room().filter(|(id, _, _)| self.participating(id, now)) {
+            if self.mls.has_group(&room) {
+                if let Ok(Some(commit)) = e2ee::enforce_membership(&mut self.mls, &self.servers, &id, &channel, now) {
                     self.publish_server_message(&id, &commit);
                 }
-                if self.mls.is_leader(&id) {
-                    if self.mls.needs_periodic_rotation(&id, e2ee::DEFAULT_KEY_ROTATION_INTERVAL) {
-                        if let Ok(commit) = self.mls.rotate_key(&id) {
-                            self.publish_server_message(&id, &ServerMessage::Commit { server_id: id.clone(), commit });
+                if self.mls.is_leader(&room) {
+                    if self.mls.needs_periodic_rotation(&room, e2ee::DEFAULT_KEY_ROTATION_INTERVAL) {
+                        if let Ok(commit) = self.mls.rotate_key(&room) {
+                            self.publish_server_message(&id, &ServerMessage::Commit { server_id: id.clone(), room: channel.clone(), commit });
                         }
                     }
-                    self.announce_mls_group(&id);
+                    self.announce_mls_group();
                 }
             } else {
-                // Ainda sem grupo MLS: se já pedimos KeyPackage há >= 5s e ninguém respondeu com Welcome,
-                // criamos o grupo local (somos o primeiro membro online) e anunciamos.
-                let waited_enough = self.last_key_package.get(&id).is_some_and(|t| t.elapsed() >= Duration::from_secs(5));
+                // Ainda sem grupo: se já pedimos entrada há >= 5s e ninguém respondeu com Welcome,
+                // criamos o grupo da sala (somos os primeiros nela) e anunciamos.
+                let waited_enough = self.last_key_package.get(&room).is_some_and(|t| t.elapsed() >= Duration::from_secs(5));
                 if waited_enough {
-                    let _ = self.mls.create_group(&id);
-                    self.announce_mls_group(&id);
-                } else if self.last_key_package.get(&id).is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
-                    if let Ok(key_package) = self.mls.key_package() {
-                        let passport = self.servers.get(&id).and_then(|s| s.my_passport().cloned());
-                        if self.publish_server_message(&id, &ServerMessage::KeyPackage { server_id: id.clone(), key_package, passport }) {
-                            self.last_key_package.insert(id, Instant::now());
-                        } else {
-                            // Ninguém inscrito no tópico de controle: cria o grupo imediatamente!
-                            let _ = self.mls.create_group(&id);
-                        }
-                    }
+                    let _ = self.mls.create_group(&room);
+                    self.announce_mls_group();
+                } else if self.last_key_package.get(&room).is_none_or(|t| t.elapsed() >= Duration::from_secs(10))
+                    && !self.request_group_key(&id, &channel)
+                {
+                    // Ninguém inscrito no tópico de controle: cria o grupo imediatamente
+                    let _ = self.mls.create_group(&room);
                 }
             }
         }
+        self.check_leader_changes();
         // Dono online: consolida ações de moderadores
         for id in self.servers.list().filter(|s| s.is_owner()).map(|s| s.server_id.clone()).collect::<Vec<_>>() {
             if let Some(block) = self.servers.owner_maintenance(&id, now) {
@@ -314,6 +364,19 @@ impl Runtime {
         }
     }
 
+    /// Convite com passaporte embutido: só vale se o passaporte for deste nó (em mensagem pública,
+    /// o token de outra pessoa não pode nos fazer passar a acompanhar um servidor)
+    pub(super) fn accept_invite_passport(&mut self, server_id: &str, passport: &crate::community::ServerPassport) -> bool {
+        let me = self.my_pubkey();
+        if passport.body.holder != me || passport.body.server_id != server_id {
+            return false;
+        }
+        if self.servers.join(server_id).is_err() {
+            return false;
+        }
+        self.servers.accept_my_passport(server_id, &me, passport, super::now_secs())
+    }
+
     /// Publica uma alteração bem-sucedida e atualiza o espaço
     fn publish_change(&mut self, id: &str, result: Result<ServerMessage, CommunityError>, change: ServerChange) {
         match result {
@@ -336,7 +399,7 @@ impl Runtime {
         let now = super::now_secs();
         let passport = self.servers.issue_passport(id, &self.identity, target_pk, permissions, duration, now)?;
         if let Some(server) = self.servers.get_mut(id) {
-            server.learn_passport(&passport, now);
+            server.remember_issued(&passport, now);
         }
         let _ = self.servers.persist(id);
         self.publish_server_message(id, &ServerMessage::PassportOffer { server_id: id.to_string(), target: target_pk.to_string(), passport: passport.clone() });
@@ -370,10 +433,8 @@ impl Runtime {
             ServerCommand::Create(name) => match self.servers.create(&name, &self.my_pubkey(), now) {
                 Ok(id) => {
                     self.follow_server(&id);
-                    if let Err(e) = self.mls.create_group(&id) {
-                        tracing::warn!("Grupo cifrado não criado: {}", e);
-                    }
                     self.notice(ServerNotice::Created { id: id.clone(), name });
+                    // Ao entrar no canal padrão, o grupo cifrado da sala é criado (somos os primeiros)
                     self.enter_server(id);
                 }
                 Err(e) => self.error(CoreError::Server(e.to_string())),
@@ -387,8 +448,10 @@ impl Runtime {
                 let id = need_server!();
                 let name = self.server_name(&id);
                 let was_owner = self.servers.get(&id).is_some_and(|s| s.is_owner());
+                if self.active.server_id() == Some(id.as_str()) {
+                    self.leave_room_group();
+                }
                 self.servers.leave(&id);
-                self.mls.drop_group(&id);
                 let gossipsub = &mut self.node.swarm.behaviour_mut().gossipsub;
                 let _ = gossipsub.unsubscribe(&IdentTopic::new(server_control_topic(&id)));
                 let _ = gossipsub.unsubscribe(&IdentTopic::new(community::screen_topic(&Space::Server(id.clone()))));
@@ -430,8 +493,8 @@ impl Runtime {
                     id: id.clone(),
                     name: server.name(),
                     safety_number: crate::identity::safety_number(&id),
-                    mls_leader: self.mls.leader(&id).map(|pk| self.nick_for(&pk)),
-                    mls_epoch: self.mls.epoch(&id),
+                    mls_leader: self.active_room().and_then(|(_, _, room)| self.mls.leader(&room)).map(|pk| self.nick_for(&pk)),
+                    mls_epoch: self.active_room().and_then(|(_, _, room)| self.mls.epoch(&room)),
                     height: head.map_or(0, |b| b.body.height),
                     updated_at: head.map(|b| b.body.timestamp),
                     channels: server.channels().into_iter().map(|c| ChannelInfo { voice: c.channel_type == ChannelType::Voice, name: c.name }).collect(),
@@ -509,10 +572,11 @@ impl Runtime {
                             s.is_owner() || s.my_passport().is_some_and(|p| p.allows(PassportPermission::IssueMember))
                         });
                         let passport_token = if is_closed && can_issue {
-                            match self.servers.issue_passport(&id, &self.identity, &target_pk, PassportPermission::member(), None, now) {
+                            let validity = self.servers.get(&id).map_or(0, |s| s.chain().state().passport_validity_secs).max(3600);
+                            match self.servers.issue_passport(&id, &self.identity, &target_pk, PassportPermission::member(), Some(validity), now) {
                                 Ok(passport) => {
                                     if let Some(s) = self.servers.get_mut(&id) {
-                                        s.learn_passport(&passport, now);
+                                        s.remember_issued(&passport, now);
                                     }
                                     let _ = self.servers.persist(&id);
                                     self.publish_server_message(&id, &ServerMessage::PassportOffer {
@@ -618,11 +682,12 @@ impl Runtime {
             }
             ServerCommand::RotateKey => {
                 let id = need_server!();
-                match self.mls.rotate_key(&id) {
+                let Some((_, channel, room)) = self.active_room() else { return };
+                match self.mls.rotate_key(&room) {
                     Ok(commit) => {
-                        self.publish_server_message(&id, &ServerMessage::Commit { server_id: id.clone(), commit });
-                        self.announce_mls_group(&id);
-                        let epoch = self.mls.epoch(&id).unwrap_or(0);
+                        self.publish_server_message(&id, &ServerMessage::Commit { server_id: id.clone(), room: channel, commit });
+                        self.announce_mls_group();
+                        let epoch = self.mls.epoch(&room).unwrap_or(0);
                         self.notice(ServerNotice::KeyRotated { server: self.server_name(&id), epoch });
                     }
                     Err(e) => self.error(CoreError::Server(e.to_string())),
@@ -703,20 +768,23 @@ impl Runtime {
 
         // Grupo cifrado (MLS), passaportes e carimbos
         match &message {
-            ServerMessage::KeyPackage { server_id, key_package, passport } => {
+            ServerMessage::KeyPackage { server_id, room, key_package, passport } => {
                 let Some(from) = from_pubkey else { return };
+                // O passaporte serve para o servidor todo, mesmo que o pedido seja de outra sala
                 if let (Some(p), Some(server)) = (passport, self.servers.get_mut(server_id)) {
                     if p.body.holder == from && server.learn_passport(p, now) {
                         let _ = self.servers.persist(server_id);
                     }
                 }
-
-                match e2ee::admit_from_key_package(&mut self.mls, &self.servers, server_id, from, key_package, passport.as_ref(), now) {
+                if self.room_if_active(server_id, room).is_none() {
+                    return;
+                }
+                match e2ee::admit_from_key_package(&mut self.mls, &self.servers, server_id, room, from, key_package, passport.as_ref(), now) {
                     Ok(messages) => {
                         for m in &messages {
                             self.publish_server_message(server_id, m);
                         }
-                        self.announce_mls_group(server_id);
+                        self.announce_mls_group();
                         self.notice(ServerNotice::KeyGranted { to: self.nick_for(from) });
                     }
                     Err(E2eeError::NotOwner | E2eeError::NotInGroup) => {}
@@ -732,15 +800,24 @@ impl Runtime {
                 let closed = self.servers.get(server_id).is_some_and(|s| s.has_chain() && s.chain().state().closed);
                 if let Some(offer) = self.servers.answer_access_request(server_id, &self.identity, from, now) {
                     if let ServerMessage::PassportOffer { passport, .. } = &offer {
+                        // Só pede carimbo para passaporte recém-emitido (reenvio já tem os seus)
+                        let fresh = self.servers.get_mut(server_id).is_some_and(|s| s.passport_of(&passport.body.holder) != Some(passport) && s.remember_issued(passport, now));
                         let imprint = passport.imprint();
-                        if let Some(server) = self.servers.get_mut(server_id) {
-                            server.learn_passport(passport, now);
-                        }
                         self.publish_server_message(server_id, &offer);
-                        self.request_stamps(server_id, imprint);
+                        if fresh {
+                            self.request_stamps(server_id, imprint);
+                        }
                     }
                 } else if closed && self.servers.get(server_id).is_some_and(|s| s.is_moderator(&me, now)) {
                     self.notice(ServerNotice::AccessRequested { server: self.server_name(server_id), who: self.nick_for(from) });
+                }
+                return;
+            }
+            ServerMessage::GroupLeave { server_id, room } => {
+                let (Some(from), Some(group)) = (from_pubkey, self.room_if_active(server_id, room)) else { return };
+                if let Ok(Some(commit)) = self.mls.member_left(&group, from) {
+                    self.publish_server_message(server_id, &ServerMessage::Commit { server_id: server_id.clone(), room: room.clone(), commit });
+                    self.announce_mls_group();
                 }
                 return;
             }
@@ -753,11 +830,12 @@ impl Runtime {
                 }
                 return;
             }
-            ServerMessage::Commit { server_id, commit } => {
+            ServerMessage::Commit { server_id, room, commit } => {
+                let Some(group) = self.room_if_active(server_id, room) else { return };
                 let Some(server) = self.servers.get(server_id).filter(|s| s.has_chain()) else { return };
                 let owner = server.chain().state().owner.clone();
-                let current_leader = self.mls.leader(server_id);
-                let outcome = self.mls.process_commit_with_validator(server_id, commit, &owner, |pk| !server.is_excluded(pk, now), |pk| server.is_allowed(pk, now));
+                let current_leader = self.mls.leader(&group);
+                let outcome = self.mls.process_commit_with_validator(&group, commit, &owner, |pk| !server.is_excluded(pk, now), |pk| server.is_allowed(pk, now));
                 match outcome {
                     Ok(CommitOutcome::Applied { epoch }) => {
                         if let Some(from) = from_pubkey {
@@ -772,8 +850,8 @@ impl Runtime {
                     Ok(CommitOutcome::OutOfSync)
                         if from_pubkey.is_some_and(|pk| !server.is_excluded(pk, now) && (current_leader.as_deref() == Some(pk) || pk == owner)) =>
                     {
-                        self.mls.drop_group(server_id);
-                        self.request_group_key(server_id);
+                        self.mls.drop_group(&group);
+                        let _ = self.request_group_key(server_id, room);
                     }
                     Ok(CommitOutcome::OutOfSync) => tracing::debug!("Commit fora de sincronia de não-líder ignorado"),
                     Ok(_) => {}
@@ -781,8 +859,8 @@ impl Runtime {
                 }
                 return;
             }
-            ServerMessage::Welcome { server_id, target, welcome, member_passports } => {
-                if *target == me {
+            ServerMessage::Welcome { server_id, room, target, welcome, member_passports } => {
+                if let (true, Some(group)) = (*target == me, self.room_if_active(server_id, room)) {
                     // Passaportes dos membros: com eles validamos o grupo e os Commits seguintes do líder
                     if let Some(server) = self.servers.get_mut(server_id) {
                         for p in member_passports {
@@ -791,8 +869,8 @@ impl Runtime {
                     }
                     let _ = self.servers.persist(server_id);
                     let Some(server) = self.servers.get(server_id).filter(|s| s.has_chain()) else { return };
-                    let had_group = self.mls.has_group(server_id);
-                    let res = self.mls.join_with_validator(server_id, welcome, |sender_pk, members| {
+                    let had_group = self.mls.has_group(&group);
+                    let res = self.mls.join_with_validator(&group, welcome, |sender_pk, members| {
                         server.is_allowed(sender_pk, now) && members.iter().all(|pk| server.is_allowed(pk, now))
                     });
                     match res {
@@ -856,8 +934,8 @@ impl Runtime {
                 }
                 return;
             }
-            ServerMessage::GroupAnnounce { server_id, leader, members, .. } => {
-                let Some(from) = from_pubkey else { return };
+            ServerMessage::GroupAnnounce { server_id, room, epoch, leader, members } => {
+                let (Some(from), Some(group)) = (from_pubkey, self.room_if_active(server_id, room)) else { return };
                 let Some(server) = self.servers.get(server_id).filter(|s| s.has_chain()) else { return };
                 if from != leader || !server.is_allowed(&me, now) || server.is_excluded(from, now) {
                     return;
@@ -867,14 +945,38 @@ impl Runtime {
                 if candidate_set.iter().min().map(String::as_str) != Some(leader.as_str()) {
                     return;
                 }
-                let current_set = self.mls.members(server_id);
+                let current_set = self.mls.members(&group);
+                // Membro do nosso grupo anunciando um grupo sem nós e de época anterior à nossa (recém-criado):
+                // perdeu o estado, saiu e voltou sem ninguém perceber (ex.: Ctrl+C). Uma remoção legítima
+                // chega com época maior. O menor dos demais tira a folha velha e anuncia o grupo, e quem
+                // voltou converge para ele (grupo maior vence).
+                let stale_epoch = self.mls.epoch(&group).is_some_and(|ours| *epoch < ours);
+                if current_set.contains(from)
+                    && !candidate_set.contains(&me)
+                    && stale_epoch
+                    && !server.is_excluded(&me, now)
+                    && self.mls.is_leader_without(&group, from)
+                {
+                    if let Ok(Some(commit)) = self.mls.remove_members_unchecked(&group, &[from.to_string()]) {
+                        self.publish_server_message(server_id, &ServerMessage::Commit { server_id: server_id.clone(), room: room.clone(), commit });
+                    }
+                    self.announce_mls_group();
+                    return;
+                }
                 // Se não estamos no grupo anunciado (ou se nosso grupo local perder na convergência),
                 // enviamos KeyPackage para convergir para o grupo vencedor!
+                // Pedimos entrada há pouco e ainda não temos grupo: o Welcome está a caminho (o anúncio pode
+                // chegar antes dele, ou ser anterior à nossa admissão). Pedir de novo faria o líder readmitir à toa.
+                let welcome_on_the_way = !self.mls.has_group(&group)
+                    && self.last_key_package.get(&group).is_some_and(|t| t.elapsed() < Duration::from_secs(5));
+                if welcome_on_the_way {
+                    return;
+                }
                 if !current_set.contains(&me) || (!candidate_set.contains(&me) && e2ee::should_adopt_group(&current_set, &candidate_set)) {
                     // O OpenMLS não aceita o Welcome com outro grupo de mesmo id guardado: o grupo
                     // local (que perdeu a convergência) sai antes de pedirmos a entrada no vencedor
-                    self.mls.drop_group(server_id);
-                    self.request_group_key(server_id);
+                    self.mls.drop_group(&group);
+                    let _ = self.request_group_key(server_id, room);
                 }
                 return;
             }

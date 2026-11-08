@@ -395,10 +395,8 @@ impl Runtime {
             .get_friends()
             .iter()
             .any(|f| f.public_key.eq_ignore_ascii_case(&clean_pk))
-            || self.servers.list().any(|srv| {
-                srv.chain().state().owner.eq_ignore_ascii_case(&clean_pk)
-                    || self.mls.members(&srv.server_id).contains(&clean_pk)
-            });
+            || self.servers.list().any(|srv| srv.chain().state().owner.eq_ignore_ascii_case(&clean_pk))
+            || self.active_room().is_some_and(|(_, _, room)| self.mls.members(&room).contains(&clean_pk));
         let verdict = self.dm.firewall.check_packet(
             &clean_pk,
             is_friend,
@@ -478,7 +476,9 @@ impl Runtime {
                     }
                     self.last_snapshot_reply.insert(server_id.clone(), std::time::Instant::now());
                 }
-                self.announce_mls_group(&server_id);
+                if self.active.server_id() == Some(server_id.as_str()) {
+                    self.announce_mls_group();
+                }
             }
         }
     }
@@ -539,6 +539,7 @@ impl Runtime {
                     {
                         self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Accept);
                         self.handle_server_network_message(&server_id, server_message, from.as_deref());
+                        self.check_leader_changes();
                     } else {
                         self.report_gossip_validation(&message_id, &propagation_source, gossipsub::MessageAcceptance::Ignore);
                     }
@@ -578,8 +579,12 @@ impl Runtime {
         let raw_data = message.data.clone();
         let mut data = message.data;
         let mut mls_sender: Option<String> = None;
-        if let Some(server_id) = community::parse_server_content_topic(&topic) {
-            match self.mls.decrypt(server_id, &data) {
+        if community::parse_server_content_topic(&topic).is_some() {
+            let decrypted = match self.room_for_topic(&topic) {
+                Some(room) => self.mls.decrypt(&room, &data),
+                None => Err(community::e2ee::E2eeError::NotInGroup),
+            };
+            match decrypted {
                 Ok(decrypted) => {
                     self.sniff_packet("RX", &topic, src_str, &raw_data, Some(&decrypted.plaintext));
                     data = decrypted.plaintext;
