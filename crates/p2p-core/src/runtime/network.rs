@@ -16,7 +16,7 @@ use libp2p::{gossipsub, Multiaddr, PeerId};
 use std::collections::HashMap;
 
 /// Intervalo mínimo entre mensagens de erro de hole punching repetidas para o mesmo par (Issue #40)
-const DCUTR_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+const DCUTR_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Runtime {
     /// Trackers em uso: os informados e, com `public_defaults`, os públicos embutidos
@@ -213,8 +213,6 @@ impl Runtime {
                     self.identified.remove(&peer_id);
                     self.peer_topics.remove(&peer_id);
                     self.relay_manager.remove_peer(&peer_id);
-                    self.dcutr_punched.remove(&peer_id);
-                    self.dcutr_last_failure.remove(&peer_id);
                     let has_peers = self.anarchord_peers().next().is_some();
                     self.has_anarchord_connected.store(has_peers, std::sync::atomic::Ordering::Relaxed);
                     if let Some((nick, pubkey)) = self.peer_metadata.get(&peer_id).cloned() {
@@ -790,6 +788,11 @@ impl Runtime {
     }
 
     fn on_dcutr_success(&mut self, remote_peer_id: PeerId) {
+        if !self.peer_metadata.contains_key(&remote_peer_id) {
+            return;
+        }
+        // Quando o hole punching tem sucesso, limpa qualquer falha antiga registrada para este par
+        self.dcutr_last_failure.remove(&remote_peer_id);
         if self.dcutr_punched.insert(remote_peer_id) {
             let peer_label = self.peer_display_name(&remote_peer_id);
             self.emit(CoreEvent::Network(NetworkEvent::HolePunched(peer_label)));
@@ -797,11 +800,14 @@ impl Runtime {
     }
 
     fn on_dcutr_failure(&mut self, remote_peer_id: PeerId, error: &str) {
+        // Ignora nós da DHT do IPFS que não são pares Anarchord identificados
+        // e também ignora falhas se já temos um hole punch bem-sucedido para este par.
+        if !self.peer_metadata.contains_key(&remote_peer_id) || self.dcutr_punched.contains(&remote_peer_id) {
+            return;
+        }
         let now = std::time::Instant::now();
         let should_emit = match self.dcutr_last_failure.get(&remote_peer_id) {
-            Some((last_time, last_err)) => {
-                now.duration_since(*last_time) >= DCUTR_FAILURE_COOLDOWN || last_err != error
-            }
+            Some((last_time, _)) => now.duration_since(*last_time) >= DCUTR_FAILURE_COOLDOWN,
             None => true,
         };
         if should_emit {
@@ -889,21 +895,26 @@ mod tests {
         })));
         assert!(rx.try_recv().is_err(), "sucesso repetido não deve emitir evento");
 
-        // 3) Falha de hole punching: emite HolePunchFailed
-        runtime.on_dcutr_failure(peer1, "dial timeout");
+        // 3) Falha de hole punching para um segundo par Anarchord (Carol): emite HolePunchFailed
+        let peer2 = PeerId::random();
+        runtime.peer_metadata.insert(peer2, ("Carol".to_string(), "pubkey456".to_string()));
+        runtime.on_dcutr_failure(peer2, "dial timeout");
         let ev = rx.try_recv().expect("falha deve emitir evento");
-        assert!(matches!(ev, CoreEvent::Network(NetworkEvent::HolePunchFailed { peer_id, error }) if peer_id.contains("Bob") && error == "dial timeout"));
+        assert!(matches!(ev, CoreEvent::Network(NetworkEvent::HolePunchFailed { peer_id, error }) if peer_id.contains("Carol") && error == "dial timeout"));
 
-        // 4) Falha consecutiva idêntica logo em seguida: SUPRIMIDA por cooldown
-        runtime.on_dcutr_failure(peer1, "dial timeout");
+        // 4) Falha consecutiva para o mesmo par (mesmo com texto de porta/endereço diferente!): SUPRIMIDA por cooldown
+        runtime.on_dcutr_failure(peer2, "dial timeout");
         assert!(rx.try_recv().is_err(), "falha consecutiva idêntica em cooldown deve ser suprimida");
+        runtime.on_dcutr_failure(peer2, "connection refused on ephemeral port 54321");
+        assert!(rx.try_recv().is_err(), "falha com string de porta efêmera diferente no mesmo par também deve respeitar o cooldown");
 
-        // 5) Falha com erro diferente: emite imediatamente mesmo em cooldown
-        runtime.on_dcutr_failure(peer1, "connection refused");
-        let ev = rx.try_recv().expect("erro diferente deve emitir evento");
-        assert!(matches!(ev, CoreEvent::Network(NetworkEvent::HolePunchFailed { error, .. }) if error == "connection refused"));
+        // 5) Nós desconhecidos da DHT do IPFS (sem peer_metadata) NUNCA geram eventos de HolePunched / HolePunchFailed
+        let ipfs_node = PeerId::random();
+        runtime.on_dcutr_failure(ipfs_node, "dial timeout");
+        runtime.on_dcutr_success(ipfs_node);
+        assert!(rx.try_recv().is_err(), "nós não-Anarchord da DHT não devem poluir a TUI com DCUtR");
 
-        // 6) Ao desconectar totalmente (num_established == 0), o estado é limpo
+        // 6) Mesmo que uma conexão feche temporariamente (idle timeout), reconectar ao mesmo par não repete o spam
         runtime.handle_swarm_event(SwarmEvent::ConnectionClosed {
             peer_id: peer1,
             connection_id: libp2p::swarm::ConnectionId::new_unchecked(1),
@@ -914,8 +925,6 @@ mod tests {
             num_established: 0,
             cause: None,
         });
-
-        // 7) Nova conexão subsequente pode emitir HolePunched novamente
         runtime.handle_swarm_event(SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(libp2p::dcutr::Event {
             remote_peer_id: peer1,
             result: Ok(libp2p::swarm::ConnectionId::new_unchecked(3)),
@@ -926,6 +935,6 @@ mod tests {
                 new_events.push(ev);
             }
         }
-        assert_eq!(new_events.len(), 1, "após reconexão, novo hole punch deve ser emitido");
+        assert_eq!(new_events.len(), 0, "reconexão por idle timeout ao mesmo par não deve repetir HolePunched");
     }
 }
