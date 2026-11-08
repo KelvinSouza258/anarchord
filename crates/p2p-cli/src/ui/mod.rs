@@ -866,16 +866,22 @@ impl TerminalUi {
             self.render_messages(f, main_chunks[0]);
         }
 
-        // Painel Lateral de Membros e Status de Voz
+        // Painel Lateral: Canais (topo) e Membros unificados (texto + voz)
         let side_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(30), Constraint::Percentage(40), Constraint::Percentage(30)])
+            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
             .split(main_chunks[1]);
 
         // 0. Canais do espaço atual (Lobby ou servidor)
         let mut channel_items: Vec<ListItem> = Vec::new();
         if self.space_channels.is_empty() {
-            let chan_prefix = if self.current_channel.starts_with('@') { "💬" } else { "#" };
+            let chan_prefix = if self.current_channel.starts_with('@') {
+                "💬"
+            } else if self.current_voice_channel.as_deref() == Some(self.current_channel.as_str()) {
+                "🔊"
+            } else {
+                "#"
+            };
             channel_items.push(ListItem::new(Line::from(Span::styled(
                 format!("▶ {} {}", chan_prefix, self.current_channel),
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -901,53 +907,87 @@ impl TerminalUi {
         f.render_widget(channels_list, side_chunks[0]);
         self.channels_area = side_chunks[0];
 
-        // 1. Membros da Sala de Texto Atual (#canal)
+        // 1. Membros da Sala Atual (unificado: texto e voz)
         self.peers_area = side_chunks[1];
-        let current_members = self.channel_members.get(&self.current_channel);
-        
+        let in_voice_here = self.current_voice_channel.as_deref() == Some(self.current_channel.as_str());
+        let mut combined_members: Vec<String> = self
+            .channel_members
+            .get(&self.current_channel)
+            .map(|s| {
+                let mut v: Vec<String> = s.iter().cloned().collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default();
+        if in_voice_here {
+            for vm in &self.voice_members {
+                if !combined_members.contains(vm) {
+                    combined_members.push(vm.clone());
+                }
+            }
+        }
+
         let mut room_members_items: Vec<ListItem> = Vec::new();
         let mut seen_keys = HashSet::new();
 
         // Usuário atual na sala
-        room_members_items.push(ListItem::new(Line::from(vec![
-            Span::styled("👤 ", Style::default().fg(Color::Yellow)),
+        let me_speaking = in_voice_here && self.speakers.contains(&self.my_nick);
+        let mut my_spans = vec![
+            Span::styled(
+                if me_speaking { "🔊 " } else { "👤 " },
+                Style::default().fg(if me_speaking { Color::Green } else { Color::Yellow }),
+            ),
             Span::styled(format!("{} (Você)", self.my_nick), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ])));
+        ];
+        if me_speaking {
+            my_spans.push(Span::styled(" [Falando...]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        }
+        room_members_items.push(ListItem::new(Line::from(my_spans)));
         seen_keys.insert((self.my_nick.clone(), self.my_pubkey.clone()));
         self.member_rows = vec![self.my_nick.clone()];
 
         // Pares ativos na sala atual
-        if let Some(members) = current_members {
-            for nick in members {
-                let peer_pk = self.peers.iter()
-                    .find(|(_, n, _)| n == nick)
-                    .map(|(_, _, pk)| pk.clone())
-                    .unwrap_or_default();
-                let is_self = nick == &self.my_nick && (peer_pk.is_empty() || peer_pk == self.my_pubkey);
-                if !is_self && seen_keys.insert((nick.clone(), peer_pk.clone())) {
-                    self.member_rows.push(nick.clone());
-                    let short_pk = if peer_pk.len() >= 6 {
-                        format!(" ({})", &peer_pk[..6])
-                    } else if !peer_pk.is_empty() {
-                        format!(" ({})", peer_pk)
-                    } else {
-                        String::new()
-                    };
-                    let friend_info = self.friends.iter().find(|f| f.display_name.eq_ignore_ascii_case(nick));
-                    let friend_badge = match friend_info.map(|f| f.state) {
-                        Some(p2p_core::identity::FriendState::Confirmed) => " 💚",
-                        Some(p2p_core::identity::FriendState::PendingOutgoing) => " ⏳",
-                        Some(p2p_core::identity::FriendState::PendingIncoming) => " 📩",
-                        Some(p2p_core::identity::FriendState::Rejected) => " 🚫",
-                        None => "",
-                    };
-
-                    room_members_items.push(ListItem::new(Line::from(vec![
-                        Span::styled("🟢 ", Style::default().fg(Color::Green)),
-                        Span::styled(format!("{}{}", nick, friend_badge), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                        Span::styled(short_pk, Style::default().fg(Color::DarkGray)),
-                    ])));
+        for nick in &combined_members {
+            let peer_pk = self.peers.iter()
+                .find(|(_, n, _)| n == nick)
+                .map(|(_, _, pk)| pk.clone())
+                .unwrap_or_default();
+            let is_self = nick == &self.my_nick && (peer_pk.is_empty() || peer_pk == self.my_pubkey);
+            if !is_self && seen_keys.insert((nick.clone(), peer_pk.clone())) {
+                self.member_rows.push(nick.clone());
+                let short_pk = if peer_pk.len() >= 6 {
+                    format!(" ({})", &peer_pk[..6])
+                } else if !peer_pk.is_empty() {
+                    format!(" ({})", peer_pk)
+                } else {
+                    String::new()
+                };
+                let friend_info = self.friends.iter().find(|f| f.display_name.eq_ignore_ascii_case(nick));
+                let friend_badge = match friend_info.map(|f| f.state) {
+                    Some(p2p_core::identity::FriendState::Confirmed) => " 💚",
+                    Some(p2p_core::identity::FriendState::PendingOutgoing) => " ⏳",
+                    Some(p2p_core::identity::FriendState::PendingIncoming) => " 📩",
+                    Some(p2p_core::identity::FriendState::Rejected) => " 🚫",
+                    None => "",
+                };
+                let is_speaking = in_voice_here && self.speakers.contains(nick);
+                let mut spans = vec![
+                    Span::styled(
+                        if is_speaking { "🔊 " } else { "🟢 " },
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(
+                        format!("{}{}", nick, friend_badge),
+                        Style::default()
+                            .fg(if is_speaking { Color::Green } else { Color::White })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(short_pk, Style::default().fg(Color::DarkGray)),
+                ];
+                if is_speaking {
+                    spans.push(Span::styled(" [Falando...]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
                 }
+                room_members_items.push(ListItem::new(Line::from(spans)));
             }
         }
 
@@ -991,7 +1031,13 @@ impl TerminalUi {
         }
 
         // Título com membros da sala e total no Swarm P2P
-        let room_prefix = if self.current_channel.starts_with('@') { "" } else { "#" };
+        let room_prefix = if self.current_channel.starts_with('@') {
+            ""
+        } else if in_voice_here {
+            "🔊 "
+        } else {
+            "#"
+        };
         let room_members_title = format!(" Membros {}{} [Swarm: {}] ", room_prefix, self.current_channel, self.peers.len());
         let peers_list = List::new(room_members_items).block(
             Block::default()
@@ -999,45 +1045,6 @@ impl TerminalUi {
                 .title(room_members_title),
         );
         f.render_widget(peers_list, side_chunks[1]);
-
-        // 2. Painel da Sala de Voz Atual
-        let voice_title = match &self.current_voice_channel {
-            Some(vchan) => format!(" Sala de Voz [🔊 {}] ({}) ", vchan, self.voice_members.len()),
-            None => " Sala de Voz [Desconectada] ".to_string(),
-        };
-
-        let voice_items: Vec<ListItem> = if self.current_voice_channel.is_none() {
-            vec![ListItem::new(Span::styled("  Use /voice join <sala> para entrar", Style::default().fg(Color::DarkGray)))]
-        } else if self.voice_members.is_empty() {
-            vec![ListItem::new(Span::styled("  (Nenhum participante conectado)", Style::default().fg(Color::DarkGray)))]
-        } else {
-            self.voice_members
-                .iter()
-                .map(|name| {
-                    let is_speaking = self.speakers.contains(name);
-                    if is_speaking {
-                        ListItem::new(Line::from(vec![
-                            Span::styled("🔊 ", Style::default().fg(Color::Green)),
-                            Span::styled(name.clone(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                            Span::styled(" [Falando...]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                        ]))
-                    } else {
-                        ListItem::new(Line::from(vec![
-                            Span::styled("🔈 ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(name.clone(), Style::default().fg(Color::White)),
-                            Span::styled(" [Ouvindo]", Style::default().fg(Color::DarkGray)),
-                        ]))
-                    }
-                })
-                .collect()
-        };
-
-        let voice_list = List::new(voice_items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(voice_title),
-        );
-        f.render_widget(voice_list, side_chunks[2]);
 
         // 3. Barra de Entrada
         let prefix = "❯ ";
@@ -1389,12 +1396,16 @@ mod tests {
     #[test]
     fn test_voice_room_members_rendered() {
         let mut ui = ui_for("Alice");
+        ui.handle_event(UiEvent::ChannelChanged("sala1".to_string()));
         ui.handle_event(UiEvent::VoiceChannelChanged(Some("sala1".to_string())));
         ui.handle_event(UiEvent::VoiceRoomMembers(vec!["Alice".to_string(), "Bob".to_string()]));
+        ui.handle_event(UiEvent::VoiceActivity { nick: "Bob".to_string(), speaking: true });
 
         let screen = render(&mut ui);
-        assert!(screen.contains("sala1"), "{}", screen);
+        assert!(screen.contains("Membros 🔊 sala1"), "{}", screen);
         assert!(screen.contains("Bob"), "{}", screen);
+        assert!(screen.contains("[Falando...]"), "{}", screen);
+        assert!(!screen.contains("Sala de Voz ["), "painel separado de voz foi removido:\n{}", screen);
     }
 
     // ---------- Interação: teclado, mouse, menus e diálogos ----------
