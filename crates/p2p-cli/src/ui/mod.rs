@@ -112,6 +112,18 @@ pub enum UiEvent {
     ScreenShareActive(bool),
 }
 
+/// Área de transferência do sistema operacional (Windows, macOS, Linux X11/Wayland). A instância
+/// fica viva até o programa terminar: no Linux o conteúdo copiado pertence ao processo e some
+/// quando ela é descartada (a menos que haja um gerenciador de área de transferência).
+fn system_clipboard(text: &str) -> Result<(), String> {
+    static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
+    let mut guard = CLIPBOARD.lock().map_err(|e| e.to_string())?;
+    if guard.is_none() {
+        *guard = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+    }
+    guard.as_mut().expect("criada acima").set_text(text.to_string()).map_err(|e| e.to_string())
+}
+
 /// Ações disparadas pela UI para o backend P2P
 #[derive(Debug, Clone)]
 pub enum UiAction {
@@ -156,6 +168,10 @@ pub struct TerminalUi {
     header_row: u16,
     header_space_cols: (u16, u16),
     header_mic_cols: (u16, u16),
+    /// Colunas da chave pública no cabeçalho (clique copia a chave completa)
+    header_key_cols: (u16, u16),
+    /// Escreve na área de transferência do sistema (substituível nos testes)
+    clipboard: fn(&str) -> Result<(), String>,
     channels_area: Rect,
     popup_area: Rect,
     peers: Vec<(String, String, String)>, // (PeerId, Nick, PubKey) - Todo o Swarm
@@ -211,6 +227,8 @@ impl TerminalUi {
             header_row: u16::MAX,
             header_space_cols: (0, 0),
             header_mic_cols: (0, 0),
+            header_key_cols: (0, 0),
+            clipboard: system_clipboard,
             channels_area: Rect::default(),
             popup_area: Rect::default(),
             peers: Vec::new(),
@@ -603,6 +621,11 @@ impl TerminalUi {
                     if inside(self.header_mic_cols) {
                         return vec![UiAction::ToggleMute];
                     }
+                    if inside(self.header_key_cols) {
+                        let key = self.my_pubkey.clone();
+                        self.copy_to_clipboard(&key, "Sua chave pública");
+                        return Vec::new();
+                    }
                     if inside(self.header_space_cols) {
                         self.overlay = Some(Overlay::Menu(vec![spaces_menu(&self.servers)]));
                     }
@@ -627,6 +650,7 @@ impl TerminalUi {
                         let inviteable_servers: Vec<ServerEntry> = self.servers.iter().filter(|s| s.owner || s.moderator).cloned().collect();
                         self.overlay = Some(Overlay::Menu(vec![member_menu(
                             &nick,
+                            target_pk,
                             is_friend,
                             self.in_server,
                             can_moderate,
@@ -727,7 +751,22 @@ impl TerminalUi {
                 self.overlay = Some(Overlay::Help);
                 Vec::new()
             }
+            MenuAction::Copy { text, what } => {
+                self.copy_to_clipboard(&text, &what);
+                Vec::new()
+            }
         }
+    }
+
+    /// Copia para a área de transferência e confirma na barra de status
+    fn copy_to_clipboard(&mut self, text: &str, what: &str) {
+        self.last_status_bar = match (self.clipboard)(text) {
+            Ok(()) => format!("📋 {} copiada para a área de transferência!", what),
+            Err(e) => {
+                self.push_system(format!("⚠️ Não foi possível copiar para a área de transferência: {}", e));
+                format!("⚠️ Falha ao copiar: {}", e)
+            }
+        };
     }
 
     /// Linha confirmada (digitada ou vinda de um menu). Só texto comum aparece no chat como
@@ -927,6 +966,7 @@ impl TerminalUi {
         self.header_row = chunks[0].y + 1;
         self.header_space_cols = ranges[3];
         self.header_mic_cols = ranges[4];
+        self.header_key_cols = ranges[2];
         let header = Paragraph::new(Line::from(spans))
         .block(Block::default().borders(Borders::ALL).title(" Anarchord Core v0.1.0 "));
         f.render_widget(header, chunks[0]);
@@ -1662,7 +1702,7 @@ mod tests {
     #[test]
     fn test_optional_ban_reason_can_be_empty() {
         let mut ui = ui_for("Alice");
-        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false, true, true, false, &[])]));
+        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", None, false, true, true, false, &[])]));
         select(&mut ui, "Banir");
         select(&mut ui, "Permanente");
         assert_eq!(sent(&ui.handle_key(key(KeyCode::Enter))), vec!["/server ban Bob perm"]);
@@ -1671,14 +1711,14 @@ mod tests {
     #[test]
     fn test_add_friend_from_member_menu() {
         let mut ui = ui_for("Alice");
-        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false, false, false, false, &[])]));
+        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", None, false, false, false, false, &[])]));
         assert_eq!(sent(&select(&mut ui, "Adicionar aos amigos")), vec!["/friend add Bob"]);
     }
 
     #[test]
     fn test_permissions_menu_checkbox_toggle_and_apply() {
         let mut ui = ui_for("Alice");
-        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false, true, true, false, &[])]));
+        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", None, false, true, true, false, &[])]));
         select(&mut ui, "Permissões e Moderação");
         assert!(render(&mut ui).contains("Acessar Servidor"));
 
@@ -1742,7 +1782,7 @@ mod tests {
     #[test]
     fn test_send_file_from_member_menu_quotes_path() {
         let mut ui = ui_for("Alice");
-        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", false, false, false, false, &[])]));
+        ui.overlay = Some(Overlay::Menu(vec![member_menu("Bob", None, false, false, false, false, &[])]));
         select(&mut ui, "Enviar arquivo");
         type_text(&mut ui, "C:\\fotos\\férias 2026.png");
         assert_eq!(sent(&ui.handle_key(key(KeyCode::Enter))), vec!["/send Bob \"C:\\fotos\\férias 2026.png\""]);
@@ -1861,6 +1901,83 @@ mod tests {
 
         ui.handle_event(UiEvent::SystemLog("outro evento".into()));
         assert!(!render(&mut ui).contains("Sistema (1)"), "com a aba aberta, não conta como não lida");
+    }
+
+    thread_local! {
+        static COPIED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Área de transferência falsa: guarda o que foi copiado
+    fn fake_clipboard(text: &str) -> Result<(), String> {
+        COPIED.with(|c| c.borrow_mut().push(text.to_string()));
+        Ok(())
+    }
+
+    fn last_copied() -> Option<String> {
+        COPIED.with(|c| c.borrow().last().cloned())
+    }
+
+    /// #92: copiar a própria chave (clique no cabeçalho), a de um membro, a de um amigo e o id do servidor
+    #[test]
+    fn test_copy_public_keys_and_server_id_to_clipboard() {
+        let mut ui = ui_for("Alice");
+        ui.clipboard = fake_clipboard;
+        render(&mut ui);
+
+        // Clique na chave do cabeçalho copia a chave completa
+        let (col, row) = (ui.header_key_cols.0 + 3, ui.header_row);
+        assert!(ui.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: col, row, modifiers: KeyModifiers::NONE }).is_empty());
+        assert_eq!(last_copied().as_deref(), Some("abcdef0123"));
+        assert!(ui.overlay.is_none());
+        let status_line = render(&mut ui).lines().last().unwrap_or_default().to_string();
+        assert!(status_line.contains("Sua chave pública copiada"), "{}", status_line);
+
+        // Membro da sala: chave completa dele
+        ui.handle_event(bob_connected());
+        ui.handle_event(members("geral", &["Bob"]));
+        render(&mut ui);
+        click(&mut ui, |ui| ui.peers_area, 1, false);
+        assert!(select(&mut ui, "📋 Copiar chave pública").is_empty());
+        assert_eq!(last_copied().as_deref(), Some("224d733c71f8"));
+        assert!(render(&mut ui).lines().last().unwrap_or_default().contains("Chave pública de Bob copiada"));
+
+        // Amigo
+        let friend = FriendUiEntry {
+            public_key: "cd".repeat(32),
+            display_name: "Carol".into(),
+            online: true,
+            state: p2p_core::identity::FriendState::Confirmed,
+        };
+        ui.overlay = Some(Overlay::Menu(vec![super::menu::friends_menu(&[friend])]));
+        select(&mut ui, "🟢 Carol");
+        select(&mut ui, "📋 Copiar chave pública");
+        assert_eq!(last_copied(), Some("cd".repeat(32)));
+
+        // Servidor atual
+        ui.handle_event(UiEvent::SpaceChanged { space_name: "🏰 Rust Guild".into(), channels: vec![("geral".into(), false)], is_server: true });
+        ui.handle_event(UiEvent::ServersChanged(vec![ServerEntry {
+            name: "Rust Guild".into(),
+            id: "ab".repeat(32),
+            current: true,
+            owner: false,
+            moderator: false,
+            pending: false,
+            closed: false,
+        }]));
+        ui.handle_key(key(KeyCode::F(1)));
+        select(&mut ui, "Espaços e Servidores");
+        select(&mut ui, "📋 Copiar ID do servidor");
+        assert_eq!(last_copied(), Some("ab".repeat(32)));
+    }
+
+    /// Falha da área de transferência (ex.: Linux sem X11) vira aviso, sem derrubar a interface
+    #[test]
+    fn test_clipboard_failure_is_reported() {
+        let mut ui = ui_for("Alice");
+        ui.clipboard = |_| Err("sem servidor gráfico".into());
+        ui.copy_to_clipboard("x", "Sua chave pública");
+        assert!(ui.last_status_bar.contains("Falha ao copiar"));
+        assert!(ui.system_messages.iter().any(|m| m.contains("sem servidor gráfico")));
     }
 
     #[test]

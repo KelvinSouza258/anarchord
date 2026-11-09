@@ -67,6 +67,8 @@ pub enum MenuAction {
     ApplyPermissions { nick: String },
     /// Abre a tela de ajuda
     Help,
+    /// Copia `text` para a área de transferência; `what` descreve o que foi copiado
+    Copy { text: String, what: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +86,10 @@ pub struct Menu {
 
 fn run(label: impl Into<String>, command: impl Into<String>) -> MenuItem {
     MenuItem { label: label.into(), action: MenuAction::Run(command.into()) }
+}
+
+fn copy(label: &str, text: &str, what: &str) -> MenuItem {
+    MenuItem { label: label.to_string(), action: MenuAction::Copy { text: text.to_string(), what: what.to_string() } }
 }
 
 fn ask(label: &str, prompt: impl Into<String>, template: impl Into<String>) -> MenuItem {
@@ -170,6 +176,9 @@ pub fn spaces_category_menu(ctx: &MenuContext) -> Menu {
         items.push(run("📨 Convidar para este servidor", "/server invite"));
         items.push(ask("➕ Criar canal de texto…", "Nome do canal", "/server channel add {}"));
         items.push(ask("➕ Criar sala de voz…", "Nome da sala de voz", "/server channel add {} voz"));
+        if let Some(current) = ctx.servers.iter().find(|s| s.current) {
+            items.push(copy("📋 Copiar ID do servidor", &current.id, "ID do servidor"));
+        }
         items.push(run("ℹ️ Informações do servidor", "/server info"));
         items.push(run("🔨 Membros banidos (/server bans)", "/server bans"));
         // Toggle inteligente de privacidade do servidor
@@ -313,6 +322,8 @@ pub fn friends_menu(friends: &[FriendUiEntry]) -> Menu {
                 (icon, items)
             }
         };
+        let mut sub_items = sub_items;
+        sub_items.push(copy("📋 Copiar chave pública", &f.public_key, &format!("Chave pública de {}", f.display_name)));
         let short_pk = if f.public_key.len() >= 8 { &f.public_key[..8] } else { &f.public_key };
         let label = format!("{} {} ({}) ▸", icon, f.display_name, short_pk);
         let sub = Menu::new(format!(" {} ", f.display_name), sub_items);
@@ -324,6 +335,7 @@ pub fn friends_menu(friends: &[FriendUiEntry]) -> Menu {
 /// Menu de contexto de um membro da sala, com toggles inteligentes e convites ubíquos
 pub fn member_menu(
     nick: &str,
+    pubkey: Option<&str>,
     is_friend: bool,
     in_server: bool,
     can_moderate: bool,
@@ -336,6 +348,9 @@ pub fn member_menu(
         ask("📁 Enviar arquivo…", format!("Caminho do arquivo para {}", nick), format!("/send {} \"{{}}\"", nick)),
         run("📺 Assistir tela", format!("/screen watch {}", nick)),
     ];
+    if let Some(pubkey) = pubkey {
+        items.push(copy("📋 Copiar chave pública", pubkey, &format!("Chave pública de {}", nick)));
+    }
 
     // Toggle de Amizade (nunca exibe os dois simultaneamente)
     if is_friend {
@@ -673,19 +688,19 @@ mod tests {
         let servers = vec![entry("Minha Guild", false)];
 
         // No Lobby e sem amizade
-        let lobby_non_friend = member_menu("Bob", false, false, false, false, &servers);
+        let lobby_non_friend = member_menu("Bob", None, false, false, false, false, &servers);
         assert!(lobby_non_friend.find("Banir").is_none());
         assert!(lobby_non_friend.find("Adicionar aos amigos").is_some());
         assert!(lobby_non_friend.find("Remover dos amigos").is_none());
         assert!(lobby_non_friend.find("Convidar para Servidor").is_some(), "convite ubíquo presente");
 
         // Já amigo (toggle)
-        let friend_menu = member_menu("Bob", true, false, false, false, &servers);
+        let friend_menu = member_menu("Bob", None, true, false, false, false, &servers);
         assert!(friend_menu.find("Adicionar aos amigos").is_none());
         assert!(friend_menu.find("Remover dos amigos").is_some());
 
         // Em servidor com autoridade de moderação
-        let menu = member_menu("Bob", false, true, true, false, &servers);
+        let menu = member_menu("Bob", None, false, true, true, false, &servers);
         let ban = &menu.items[menu.find("Banir").unwrap()];
         let MenuAction::Submenu(durations) = &ban.action else { panic!("Banir abre as durações") };
         let day = &durations.items[durations.find("1 dia").unwrap()];
@@ -697,7 +712,7 @@ mod tests {
         assert!(matches!(&file.action, MenuAction::Ask { template, .. } if template == "/send Bob \"{}\""));
 
         // Se o alvo já for moderador
-        let mod_target_menu = member_menu("Bob", false, true, true, true, &servers);
+        let mod_target_menu = member_menu("Bob", None, false, true, true, true, &servers);
         assert!(mod_target_menu.find("Remover moderador").is_some());
         assert!(mod_target_menu.find("Tornar moderador").is_none());
     }
