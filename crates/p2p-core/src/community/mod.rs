@@ -567,7 +567,7 @@ pub struct HistoryEntry {
 pub struct ServerRegistry {
     dir: Option<PathBuf>,
     servers: BTreeMap<String, KnownServer>,
-    /// Renúncias de quem saiu, republicadas até o passaporte expirar (ninguém pode ter visto a saída)
+    /// Renúncias de quem saiu, reenviadas algumas vezes na primeira hora (ninguém pode ter visto a saída)
     renounces: Vec<PendingRenounce>,
 }
 
@@ -576,9 +576,16 @@ pub struct ServerRegistry {
 struct PendingRenounce {
     server_id: String,
     action: ModAction,
-    /// Depois disso o passaporte já expirou e a renúncia não importa mais
-    until: UtcSecs,
+    /// Quando a renúncia foi feita (saída)
+    left_at: UtcSecs,
+    /// Tentativas de reenvio já feitas
+    #[serde(default)]
+    retries: u32,
 }
+
+/// Reenvios da renúncia, em segundos depois da saída. É só um esforço: sair é voluntário, e quem
+/// precisa garantir a revogação é o servidor. Depois do último, a pendência é apagada.
+const RENOUNCE_RETRY_AFTER: [UtcSecs; 4] = [60, 5 * 60, 15 * 60, 30 * 60];
 
 impl ServerRegistry {
     /// Registro sem persistência (testes)
@@ -727,10 +734,9 @@ impl ServerRegistry {
             .flatten()
             .filter(|p| p.body.holder == personal.public_key_hex())
             .map(|passport| {
-                let until = passport.effective_expires_at().unwrap_or(now + 30 * 86_400);
                 let kind = ModKind::Renounce { serial: passport.body.serial.clone() };
                 let action = ModAction::create(personal, &passport, kind, &passport.body.holder, "saiu do servidor", now);
-                PendingRenounce { server_id: server_id.to_string(), action, until }
+                PendingRenounce { server_id: server_id.to_string(), action, left_at: now, retries: 0 }
             });
         self.leave(server_id);
         let renounce = renounce?;
@@ -740,14 +746,22 @@ impl ServerRegistry {
         Some(message)
     }
 
-    /// Renúncias ainda relevantes, para republicar (descarta as de passaportes já expirados)
+    /// Renúncias com reenvio vencido (até 4, na primeira hora depois da saída)
     pub fn pending_renounces(&mut self, now: UtcSecs) -> Vec<(String, ServerMessage)> {
-        let before = self.renounces.len();
-        self.renounces.retain(|r| now < r.until);
-        if self.renounces.len() != before {
+        let mut due = Vec::new();
+        for renounce in &mut self.renounces {
+            let Some(after) = RENOUNCE_RETRY_AFTER.get(renounce.retries as usize) else { continue };
+            if now >= renounce.left_at + after {
+                renounce.retries += 1;
+                due.push((renounce.server_id.clone(), ServerMessage::Action(renounce.action.clone())));
+            }
+        }
+        // Depois do último reenvio, desiste
+        self.renounces.retain(|r| (r.retries as usize) < RENOUNCE_RETRY_AFTER.len());
+        if !due.is_empty() {
             self.persist_renounces();
         }
-        self.renounces.iter().map(|r| (r.server_id.clone(), ServerMessage::Action(r.action.clone()))).collect()
+        due
     }
 
     fn persist_renounces(&self) {
@@ -1605,8 +1619,13 @@ mod tests {
 
         let renounce = carol_reg.leave_renouncing(&id, &carol, T0 + 10).expect("membro renuncia ao sair");
         assert!(carol_reg.get(&id).is_none(), "deixou de acompanhar");
-        assert_eq!(carol_reg.pending_renounces(T0 + 20).len(), 1, "guardada para republicar");
-        assert!(carol_reg.pending_renounces(T0 + 8 * 86_400).is_empty(), "passaporte expirado: a renúncia não importa mais");
+        // Esforço só: reenvia 1, 5, 15 e 30 minutos depois da saída e desiste
+        assert!(carol_reg.pending_renounces(T0 + 20).is_empty(), "primeiro reenvio só depois de 1 minuto");
+        assert_eq!(carol_reg.pending_renounces(T0 + 10 + 60).len(), 1);
+        assert!(carol_reg.pending_renounces(T0 + 10 + 61).is_empty(), "sem reenvio fora do horário");
+        let late: usize = [5 * 60, 15 * 60, 30 * 60].iter().map(|after| carol_reg.pending_renounces(T0 + 10 + after).len()).sum();
+        assert_eq!(late, 3);
+        assert!(carol_reg.pending_renounces(T0 + 10 + 86_400).is_empty(), "depois da primeira hora, desistiu");
 
         deliver(&mut owner, vec![renounce], Some(&pk(&carol)), T0 + 11);
         assert!(!owner.get(&id).unwrap().is_allowed(&pk(&carol), T0 + 12), "passaporte renunciado não vale");

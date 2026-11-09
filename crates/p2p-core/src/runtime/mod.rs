@@ -260,8 +260,6 @@ pub(crate) struct Runtime {
     access: access::AccessState,
     /// Último líder do grupo cifrado avisado à interface, por servidor
     last_leader: HashMap<String, Option<String>>,
-    /// Última republicação das renúncias de servidores dos quais saímos
-    last_renounce_publish: Option<std::time::Instant>,
 
     voice: voice::VoiceState,
     screen: screen::ScreenState,
@@ -339,7 +337,6 @@ impl Runtime {
             pow_rx: Some(pow_rx),
             access: access::AccessState::default(),
             last_leader: HashMap::new(),
-            last_renounce_publish: None,
             voice: voice::VoiceState::default(),
             screen,
             files,
