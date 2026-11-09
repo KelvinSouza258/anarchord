@@ -547,6 +547,17 @@ pub struct HistoryEntry {
 pub struct ServerRegistry {
     dir: Option<PathBuf>,
     servers: BTreeMap<String, KnownServer>,
+    /// Renúncias de quem saiu, republicadas até o passaporte expirar (ninguém pode ter visto a saída)
+    renounces: Vec<PendingRenounce>,
+}
+
+/// Renúncia ao passaporte de um servidor do qual este nó saiu
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PendingRenounce {
+    server_id: String,
+    action: ModAction,
+    /// Depois disso o passaporte já expirou e a renúncia não importa mais
+    until: UtcSecs,
 }
 
 impl ServerRegistry {
@@ -560,7 +571,8 @@ impl ServerRegistry {
     pub fn load(dir: impl AsRef<Path>, now: UtcSecs) -> Result<Self, CommunityError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        let mut registry = Self { dir: Some(dir.clone()), servers: BTreeMap::new() };
+        let renounces = std::fs::read(dir.join("renounces.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mut registry = Self { dir: Some(dir.clone()), servers: BTreeMap::new(), renounces };
 
         for entry in std::fs::read_dir(&dir)? {
             let path = entry?.path();
@@ -682,6 +694,48 @@ impl ServerRegistry {
         self.servers.insert(server_id.to_string(), server);
         self.persist(server_id)?;
         Ok(true)
+    }
+
+    /// Sair do servidor por vontade própria: renuncia ao passaporte (vira uma revogação na cadeia,
+    /// e quem saiu só volta com passaporte novo) e deixa de acompanhar o servidor. O dono não
+    /// renuncia: o passaporte dele vem da Chave do Servidor, que fica no disco.
+    /// Devolve a ação a publicar; ela também fica guardada para ser republicada depois.
+    pub fn leave_renouncing(&mut self, server_id: &str, personal: &UserIdentity, now: UtcSecs) -> Option<ServerMessage> {
+        let server = self.servers.get(server_id)?;
+        let renounce = (!server.is_owner())
+            .then(|| server.my_passport().cloned())
+            .flatten()
+            .filter(|p| p.body.holder == personal.public_key_hex())
+            .map(|passport| {
+                let until = passport.effective_expires_at().unwrap_or(now + 30 * 86_400);
+                let kind = ModKind::Renounce { serial: passport.body.serial.clone() };
+                let action = ModAction::create(personal, &passport, kind, &passport.body.holder, "saiu do servidor", now);
+                PendingRenounce { server_id: server_id.to_string(), action, until }
+            });
+        self.leave(server_id);
+        let renounce = renounce?;
+        let message = ServerMessage::Action(renounce.action.clone());
+        self.renounces.push(renounce);
+        self.persist_renounces();
+        Some(message)
+    }
+
+    /// Renúncias ainda relevantes, para republicar (descarta as de passaportes já expirados)
+    pub fn pending_renounces(&mut self, now: UtcSecs) -> Vec<(String, ServerMessage)> {
+        let before = self.renounces.len();
+        self.renounces.retain(|r| now < r.until);
+        if self.renounces.len() != before {
+            self.persist_renounces();
+        }
+        self.renounces.iter().map(|r| (r.server_id.clone(), ServerMessage::Action(r.action.clone()))).collect()
+    }
+
+    fn persist_renounces(&self) {
+        if let Some(dir) = &self.dir {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&self.renounces) {
+                let _ = std::fs::write(dir.join("renounces.json"), bytes);
+            }
+        }
     }
 
     /// Deixa de acompanhar o servidor. A chave de dono, se existir, é mantida em disco.
@@ -1045,7 +1099,7 @@ impl ServerRegistry {
             let entry = match kind {
                 ModKind::Ban { until } => Entry::Ban { target: target.to_string(), until, reason: reason.to_string() },
                 ModKind::Unban => Entry::Unban { target: target.to_string() },
-                ModKind::Revoke { serial } => Entry::RevokePassport { serial },
+                ModKind::Revoke { serial } | ModKind::Renounce { serial } => Entry::RevokePassport { serial },
             };
             return self.owner_append(server_id, now, vec![entry]);
         }
@@ -1126,11 +1180,15 @@ fn describe_entry(entry: &Entry) -> String {
             until.map_or("permanente".to_string(), |u| format!("até {}", u))
         ),
         Entry::Unban { target } => format!("dono desbaniu {}", short_id(target)),
+        Entry::IncludeModAction(action) if matches!(action.body.kind, ModKind::Renounce { .. }) => {
+            format!("{} saiu do servidor (renunciou ao passaporte)", short_id(action.actor()))
+        }
         Entry::IncludeModAction(action) => {
             let verb = match &action.body.kind {
                 ModKind::Ban { .. } => "baniu".to_string(),
                 ModKind::Unban => "desfez o ban de".to_string(),
                 ModKind::Revoke { serial } => format!("revogou o passaporte {} de", serial),
+                ModKind::Renounce { .. } => unreachable!("tratado acima"),
             };
             format!("moderador {} {} {}", short_id(action.actor()), verb, short_id(&action.body.target))
         }
@@ -1465,6 +1523,46 @@ mod tests {
         assert!(reg.leave(&id));
         assert!(dir.join(format!("{}.owner-key.json", id)).exists(), "sair nunca apaga a chave");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sair renuncia ao passaporte: ele não é reenviado na volta. Servidor público emite outro;
+    /// privado não. A renúncia fica guardada para republicar até o passaporte expirar.
+    #[test]
+    fn test_leaving_renounces_passport() {
+        let (mut owner, _member, id) = owner_and_member();
+        let carol = UserIdentity::generate();
+        let mut carol_reg = ServerRegistry::in_memory();
+        carol_reg.join(&id).unwrap();
+        deliver(&mut carol_reg, owner.snapshot(&id), None, T0);
+        let issuer = UserIdentity::generate();
+        let Some(ServerMessage::PassportOffer { passport, .. }) = owner.answer_access_request(&id, &issuer, &pk(&carol), T0) else { panic!() };
+        owner.get_mut(&id).unwrap().remember_issued(&passport, T0);
+        assert!(carol_reg.accept_my_passport(&id, &pk(&carol), &passport, T0));
+
+        let renounce = carol_reg.leave_renouncing(&id, &carol, T0 + 10).expect("membro renuncia ao sair");
+        assert!(carol_reg.get(&id).is_none(), "deixou de acompanhar");
+        assert_eq!(carol_reg.pending_renounces(T0 + 20).len(), 1, "guardada para republicar");
+        assert!(carol_reg.pending_renounces(T0 + 8 * 86_400).is_empty(), "passaporte expirado: a renúncia não importa mais");
+
+        deliver(&mut owner, vec![renounce], Some(&pk(&carol)), T0 + 11);
+        assert!(!owner.get(&id).unwrap().is_allowed(&pk(&carol), T0 + 12), "passaporte renunciado não vale");
+        let Some(ServerMessage::PassportOffer { passport: fresh, .. }) = owner.answer_access_request(&id, &issuer, &pk(&carol), T0 + 13) else { panic!() };
+        assert_ne!(fresh.body.serial, passport.body.serial, "público: emite outro, não reenvia o renunciado");
+
+        owner.set_closed(&id, true, T0 + 14).unwrap();
+        let dave = UserIdentity::generate();
+        let dave_p = owner.issue_passport(&id, &issuer, &pk(&dave), PassportPermission::member(), None, T0 + 15).unwrap();
+        owner.get_mut(&id).unwrap().remember_issued(&dave_p, T0 + 15);
+        let mut dave_reg = ServerRegistry::in_memory();
+        dave_reg.join(&id).unwrap();
+        deliver(&mut dave_reg, owner.snapshot(&id), None, T0 + 15);
+        dave_reg.accept_my_passport(&id, &pk(&dave), &dave_p, T0 + 15);
+        let renounce = dave_reg.leave_renouncing(&id, &dave, T0 + 16).unwrap();
+        deliver(&mut owner, vec![renounce], Some(&pk(&dave)), T0 + 17);
+        assert!(owner.answer_access_request(&id, &issuer, &pk(&dave), T0 + 18).is_none(), "privado: quem saiu só volta com passaporte manual");
+
+        // O dono não renuncia (o passaporte dele vem da Chave do Servidor)
+        assert!(owner.leave_renouncing(&id, &issuer, T0 + 19).is_none());
     }
 
     /// Sair e voltar ao próprio servidor: a chave de dono ficou no disco e a posse volta

@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 
 /// Intervalo entre pedidos de acesso de quem ainda não tem passaporte
 const ACCESS_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
+/// Intervalo entre republicações da renúncia ao passaporte de quem saiu de um servidor
+const RENOUNCE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Resultado de um pedido de carimbo a uma TSA, feito fora do loop de eventos
 pub(super) struct StampResult {
@@ -323,6 +325,14 @@ impl Runtime {
             }
         }
         self.check_leader_changes();
+        // Renúncias de servidores dos quais saímos: republicadas a cada minuto até o passaporte
+        // expirar, porque podia não haver ninguém online para ver a saída
+        if self.last_renounce_publish.is_none_or(|t| t.elapsed() >= RENOUNCE_REPUBLISH_INTERVAL) {
+            self.last_renounce_publish = Some(Instant::now());
+            for (server_id, message) in self.servers.pending_renounces(now) {
+                self.publish_server_message(&server_id, &message);
+            }
+        }
         // Dono online: consolida ações de moderadores
         for id in self.servers.list().filter(|s| s.is_owner()).map(|s| s.server_id.clone()).collect::<Vec<_>>() {
             if let Some(block) = self.servers.owner_maintenance(&id, now) {
@@ -451,7 +461,10 @@ impl Runtime {
                 if self.active.server_id() == Some(id.as_str()) {
                     self.leave_room_group();
                 }
-                self.servers.leave(&id);
+                // Sair renuncia ao passaporte (exceto o dono); publicado antes de deixar o tópico
+                if let Some(renounce) = self.servers.leave_renouncing(&id, &self.identity, now) {
+                    self.publish_server_message(&id, &renounce);
+                }
                 let gossipsub = &mut self.node.swarm.behaviour_mut().gossipsub;
                 let _ = gossipsub.unsubscribe(&IdentTopic::new(server_control_topic(&id)));
                 let _ = gossipsub.unsubscribe(&IdentTopic::new(community::screen_topic(&Space::Server(id.clone()))));

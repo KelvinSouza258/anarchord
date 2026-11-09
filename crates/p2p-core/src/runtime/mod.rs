@@ -256,6 +256,8 @@ pub(crate) struct Runtime {
     last_access_request: HashMap<String, std::time::Instant>,
     /// Último líder do grupo cifrado avisado à interface, por servidor
     last_leader: HashMap<String, Option<String>>,
+    /// Última republicação das renúncias de servidores dos quais saímos
+    last_renounce_publish: Option<std::time::Instant>,
 
     voice: voice::VoiceState,
     screen: screen::ScreenState,
@@ -330,6 +332,7 @@ impl Runtime {
             stamp_rx: Some(stamp_rx),
             last_access_request: HashMap::new(),
             last_leader: HashMap::new(),
+            last_renounce_publish: None,
             voice: voice::VoiceState::default(),
             screen,
             files,

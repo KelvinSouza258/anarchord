@@ -821,3 +821,48 @@ async fn test_changing_channel_leaves_room_group() {
         })
         .await;
 }
+
+/// Quem sai do servidor renuncia ao passaporte: com o servidor já privado, voltar com
+/// `/server join` não devolve o passaporte antigo (#89)
+#[tokio::test]
+async fn test_leaving_private_server_needs_new_passport_to_return() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut alice, alice_task) = start("Alice", None);
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+            let (mut carol, carol_task) = start("Carol", Some(alice_port));
+            tokio::task::spawn_local(carol_task.run());
+            alice.wait("Alice identificar Carol", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Carol")).await;
+            alice.server(ServerCommand::Create("Clube".into()));
+            let CoreEvent::Server(ServerNotice::Created { id, .. }) =
+                alice.wait("servidor criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))).await
+            else {
+                unreachable!()
+            };
+            carol.server(ServerCommand::Join(id.clone()));
+            carol.wait("Carol receber passaporte", |e| matches!(e, CoreEvent::Server(ServerNotice::PassportUpdated { .. }))).await;
+            carol.wait("Carol receber a chave", |e| matches!(e, CoreEvent::Server(ServerNotice::KeyReceived { .. }))).await;
+
+            alice.server(ServerCommand::Close);
+            alice.wait("servidor privado", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::Closed, .. }))).await;
+            carol.drain(Duration::from_millis(500)).await;
+            carol.server(ServerCommand::Leave);
+            carol.wait("Carol sair", |e| matches!(e, CoreEvent::Server(ServerNotice::Left { .. }))).await;
+            alice
+                .wait("Alice ver a renúncia", |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::ModerationReceived { kind: p2p_core::community::ModKind::Renounce { .. }, .. }))
+                })
+                .await;
+
+            carol.seen.clear();
+            carol.server(ServerCommand::Join(id.clone()));
+            carol.drain(Duration::from_secs(8)).await;
+            assert!(
+                !carol.seen.iter().any(|e| matches!(e, CoreEvent::Server(ServerNotice::PassportUpdated { .. }))),
+                "servidor privado: quem saiu não recebe o passaporte antigo de volta"
+            );
+        })
+        .await;
+}

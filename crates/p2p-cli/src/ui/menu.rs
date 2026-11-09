@@ -171,7 +171,7 @@ pub fn spaces_category_menu(ctx: &MenuContext) -> Menu {
         }
         items.push(run("📜 Histórico de alterações", "/server history"));
         items.push(ask("⏳ Política de passaportes…", "Validade e janela de renovação (ex.: 7d 2d)", "/server policy {}"));
-        items.push(run("🚪 Sair deste servidor", "/server leave"));
+        items.push(MenuItem { label: "🚪 Sair deste servidor ▸".into(), action: MenuAction::Submenu(leave_menu()) });
     } else {
         items.push(ask("# Entrar em canal do Lobby…", "Nome do canal", "/join {}"));
     }
@@ -450,6 +450,14 @@ pub fn bans_menu(server_name: &str, bans: &[BanUiEntry]) -> Menu {
 }
 
 /// Duração do ban; cada opção pergunta o motivo (opcional)
+/// Confirmação de saída: sair renuncia ao passaporte (Esc cancela)
+pub fn leave_menu() -> Menu {
+    Menu::new(
+        " Sair do servidor? ",
+        vec![run("✅ Sair e renunciar ao passaporte (em servidor privado, só volta com um novo)", "/server leave")],
+    )
+}
+
 pub fn ban_menu(nick: &str) -> Menu {
     let option = |label: &str, duration: &str| {
         ask(label, format!("Motivo do ban de {} (opcional)", nick), format!("/server ban {} {} {{}}", nick, duration))

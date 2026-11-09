@@ -155,6 +155,7 @@ pub enum Rejection {
     SelfTarget,
     ActorBanned,
     NotBanAuthor,
+    NotOwnPassport,
     AlreadyApplied,
 }
 
@@ -170,6 +171,7 @@ impl std::fmt::Display for Rejection {
             Rejection::SelfTarget => f.write_str("não é possível agir sobre si mesmo"),
             Rejection::ActorBanned => f.write_str("o autor já estava banido quando agiu"),
             Rejection::NotBanAuthor => f.write_str("só quem aplicou o ban (ou o dono) pode desfazê-lo antes do prazo"),
+            Rejection::NotOwnPassport => f.write_str("só o titular renuncia, e só ao passaporte que apresenta"),
             Rejection::AlreadyApplied => f.write_str("ação já aplicada"),
         }
     }
@@ -367,7 +369,7 @@ impl ServerState {
                     }
                 }
             }
-            ModKind::Revoke { serial } => {
+            ModKind::Revoke { serial } | ModKind::Renounce { serial } => {
                 self.revoked.insert(serial.clone());
             }
         }
@@ -437,6 +439,13 @@ impl ServerState {
             return Err(Rejection::MissingPermission);
         }
         let target = &action.body.target;
+        // Renúncia: o titular abre mão do próprio passaporte (o anexado à ação)
+        if let ModKind::Renounce { serial } = &action.body.kind {
+            if target != actor || serial != &passport.body.serial {
+                return Err(Rejection::NotOwnPassport);
+            }
+            return Ok(());
+        }
         if target == actor {
             return Err(Rejection::SelfTarget);
         }
@@ -983,6 +992,26 @@ pub(crate) mod tests {
         assert!(s.state().verify_passport(&p1, T0 + 5).is_err());
         assert!(s.state().verify_passport(&p2, T0 + 5).is_err());
         assert!(!s.state().is_allowed_with_passport(&pk(&member), Some(&p2), T0 + 5));
+    }
+
+    /// Sair do servidor: o próprio titular renuncia ao passaporte, sem precisar de poder de moderação
+    #[test]
+    fn test_holder_renounces_own_passport_only() {
+        let mut s = Setup::new();
+        let (member, other) = (UserIdentity::generate(), UserIdentity::generate());
+        let mine = ServerPassport::issue_root(&s.key, &pk(&member), P::member(), T0, Some(T0 + 86_400));
+        let theirs = ServerPassport::issue_root(&s.key, &pk(&other), P::member(), T0, Some(T0 + 86_400));
+
+        let wrong_serial = ModAction::create(&member, &mine, ModKind::Renounce { serial: theirs.body.serial.clone() }, &pk(&member), "", T0 + 1);
+        assert_eq!(s.state().check_mod_action(&wrong_serial, T0 + 1), Err(Rejection::NotOwnPassport));
+        let for_other = ModAction::create(&member, &mine, ModKind::Renounce { serial: mine.body.serial.clone() }, &pk(&other), "", T0 + 1);
+        assert_eq!(s.state().check_mod_action(&for_other, T0 + 1), Err(Rejection::NotOwnPassport));
+
+        let renounce = ModAction::create(&member, &mine, ModKind::Renounce { serial: mine.body.serial.clone() }, &pk(&member), "saiu", T0 + 2);
+        assert_eq!(s.state().check_mod_action(&renounce, T0 + 2), Ok(()), "membro comum renuncia sem permissão de moderação");
+        s.append(T0 + 3, vec![Entry::IncludeModAction(renounce)]);
+        assert!(s.state().verify_passport(&mine, T0 + 4).is_err(), "passaporte renunciado não vale mais");
+        assert!(s.state().verify_passport(&theirs, T0 + 4).is_ok());
     }
 
     #[test]

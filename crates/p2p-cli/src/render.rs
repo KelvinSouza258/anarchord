@@ -309,6 +309,7 @@ fn moderation_text(target: &str, kind: &ModKind, at: u64) -> String {
     match kind {
         ModKind::Ban { until } => format!("baniu {} ({})", target, format_duration(until.map(|u| u.saturating_sub(at)))),
         ModKind::Unban => format!("desfez o próprio ban de {}", target),
+        ModKind::Renounce { .. } => "saiu do servidor (renunciou ao passaporte)".to_string(),
         ModKind::Revoke { serial } => format!("revogou o passaporte {} de {}", serial, target),
     }
 }
@@ -367,6 +368,7 @@ fn server(notice: &ServerNotice) -> Vec<String> {
             let what = match kind {
                 ModKind::Ban { until } => format!("🔨 {} foi banido ({}).", target, format_duration(until.map(|u| u.saturating_sub(*at)))),
                 ModKind::Unban => format!("🕊️ {} foi desbanido.", target),
+                ModKind::Renounce { .. } => format!("🚪 {} renunciou ao passaporte.", target),
                 ModKind::Revoke { .. } => format!("🎫 Passaporte de {} revogado.", target),
             };
             let note = if *recorded_by_owner { " Gravado na cadeia." } else { " Vale agora; fica definitivo quando o dono consolidar." };

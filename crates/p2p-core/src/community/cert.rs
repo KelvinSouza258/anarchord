@@ -22,11 +22,17 @@ pub enum ModKind {
     Unban,
     /// Revoga um passaporte específico do alvo
     Revoke { serial: String },
+    /// O próprio titular abre mão do passaporte (saiu do servidor). Alvo = o autor.
+    Renounce { serial: String },
 }
 
 impl ModKind {
+    /// Permissão exigida do autor. Renunciar ao próprio passaporte não exige poder de moderação.
     pub fn permission(&self) -> PassportPermission {
-        PassportPermission::Ban
+        match self {
+            ModKind::Renounce { .. } => PassportPermission::EnterServer,
+            _ => PassportPermission::Ban,
+        }
     }
 }
 
