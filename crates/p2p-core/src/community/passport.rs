@@ -45,6 +45,12 @@ pub enum PassportPermission {
     ManageChannels,
     /// Alterar nome e configurações estruturais do servidor
     ManageConfig,
+    /// Alterar a política de tempo (autoridades aceitas): quem a tem pode decidir quais carimbos valem
+    ManageTimestampPolicy,
+    /// Alterar a lista de protegidos (quem não pode ser banido nem revogado por moderador)
+    ManageProtected,
+    /// Consolidar o registro do servidor numa nova Genesis
+    Consolidate,
 }
 
 impl PassportPermission {
@@ -57,6 +63,9 @@ impl PassportPermission {
             PassportPermission::Ban,
             PassportPermission::ManageChannels,
             PassportPermission::ManageConfig,
+            PassportPermission::ManageTimestampPolicy,
+            PassportPermission::ManageProtected,
+            PassportPermission::Consolidate,
         ]
     }
 
@@ -86,6 +95,9 @@ impl PassportPermission {
             "manageconfig" | "config" | "configuracao" | "configuracoes" | "configurações" => {
                 Some(PassportPermission::ManageConfig)
             }
+            "managetimestamppolicy" | "time" | "tempo" | "tsa" => Some(PassportPermission::ManageTimestampPolicy),
+            "manageprotected" | "protected" | "protegidos" => Some(PassportPermission::ManageProtected),
+            "consolidate" | "consolidar" => Some(PassportPermission::Consolidate),
             _ => None,
         }
     }
@@ -99,6 +111,9 @@ impl PassportPermission {
             PassportPermission::Ban => "ban",
             PassportPermission::ManageChannels => "channels",
             PassportPermission::ManageConfig => "config",
+            PassportPermission::ManageTimestampPolicy => "time",
+            PassportPermission::ManageProtected => "protected",
+            PassportPermission::Consolidate => "consolidate",
         }
     }
 
@@ -111,6 +126,9 @@ impl PassportPermission {
             PassportPermission::Ban => "🔨 Banir Membros (Ban)",
             PassportPermission::ManageChannels => "💬 Gerenciar Canais (ManageChannels)",
             PassportPermission::ManageConfig => "⚙️ Gerenciar Configurações (ManageConfig)",
+            PassportPermission::ManageTimestampPolicy => "🕒 Gerenciar Autoridades de Tempo (ManageTimestampPolicy)",
+            PassportPermission::ManageProtected => "🛡️ Gerenciar Protegidos (ManageProtected)",
+            PassportPermission::Consolidate => "📦 Consolidar o Servidor (Consolidate)",
         }
     }
 }
@@ -186,17 +204,29 @@ impl ServerPassport {
         issued_at: UtcSecs,
         expires_at: Option<UtcSecs>,
     ) -> Self {
-        let server_id = server_key.public_key_hex();
+        Self::issue_root_for(&server_key.public_key_hex(), server_key, holder_pubkey, permissions, issued_at, expires_at)
+    }
+
+    /// Emite um passaporte raiz do servidor `server_id` assinado pela chave raiz atual (`root_key`).
+    /// Depois de uma transferência, a raiz deixa de ser a chave que deu o id ao servidor.
+    pub fn issue_root_for(
+        server_id: &str,
+        root_key: &UserIdentity,
+        holder_pubkey: &str,
+        permissions: Vec<PassportPermission>,
+        issued_at: UtcSecs,
+        expires_at: Option<UtcSecs>,
+    ) -> Self {
         let body = PassportBody {
             serial: random_serial(),
-            server_id: server_id.clone(),
+            server_id: server_id.to_string(),
             holder: holder_pubkey.to_string(),
-            issuer: server_id,
+            issuer: root_key.public_key_hex(),
             permissions,
             issued_at,
             expires_at,
         };
-        let signature = server_key.sign(&crate::wire::signing_bytes("passport", &body));
+        let signature = root_key.sign(&crate::wire::signing_bytes("passport", &body));
         Self { body, issuer_passport: None, signature, stamps: Vec::new() }
     }
 
@@ -254,6 +284,12 @@ impl ServerPassport {
     /// Valida toda a cadeia criptográfica até a Raiz do Servidor: assinaturas, escopo de
     /// permissões e prazos em `at`. Bans e revogações são conferidos pela `ServerChain`.
     pub fn verify_at(&self, expected_server_id: &str, at: UtcSecs) -> Result<(), PassportError> {
+        self.verify_with_roots(expected_server_id, &[expected_server_id.to_string()], at)
+    }
+
+    /// Como [`verify_at`](Self::verify_at), aceitando como raiz qualquer uma das `roots` (a chave do
+    /// servidor e as que a receberam por transferência). Se as raízes ainda valem é a cadeia que diz.
+    pub fn verify_with_roots(&self, expected_server_id: &str, roots: &[String], at: UtcSecs) -> Result<(), PassportError> {
         if self.body.server_id != expected_server_id {
             return Err(PassportError::ServerMismatch { expected: expected_server_id.to_string(), found: self.body.server_id.clone() });
         }
@@ -271,7 +307,7 @@ impl ServerPassport {
         }
         match &self.issuer_passport {
             None => {
-                if self.body.issuer != expected_server_id {
+                if !roots.iter().any(|root| root == &self.body.issuer) {
                     return Err(PassportError::RootNotServerKey { server_id: expected_server_id.to_string() });
                 }
             }
@@ -288,7 +324,7 @@ impl ServerPassport {
                     return Err(PassportError::IssuerMismatch { parent_holder: parent.body.holder.clone(), issuer: self.body.issuer.clone() });
                 }
                 check_delegation(&parent.body.permissions, &self.body.permissions)?;
-                parent.verify_at(expected_server_id, at)?;
+                parent.verify_with_roots(expected_server_id, roots, at)?;
             }
         }
         Ok(())
@@ -369,18 +405,14 @@ impl ServerPassport {
     /// **Achatamento pela Chave do Servidor**: reemite como elo único, com as mesmas permissões e validade.
     pub fn flatten_with_server_key(&self, server_key: &UserIdentity, at: UtcSecs) -> Result<Self, PassportError> {
         let server_id = server_key.public_key_hex();
-        self.verify_at(&server_id, at)?;
-        let body = PassportBody {
-            serial: random_serial(),
-            server_id: server_id.clone(),
-            holder: self.body.holder.clone(),
-            issuer: server_id,
-            permissions: self.body.permissions.clone(),
-            issued_at: at,
-            expires_at: self.effective_expires_at(),
-        };
-        let signature = server_key.sign(&crate::wire::signing_bytes("passport", &body));
-        Ok(Self { body, issuer_passport: None, signature, stamps: Vec::new() })
+        self.flatten_with_root(&server_id, server_key, &[server_id.clone()], at)
+    }
+
+    /// Achatamento pela chave raiz atual (`root_key`) de `server_id`, aceitando na cadeia de origem
+    /// qualquer uma das `roots` (inclusive a raiz anterior a uma transferência)
+    pub fn flatten_with_root(&self, server_id: &str, root_key: &UserIdentity, roots: &[String], at: UtcSecs) -> Result<Self, PassportError> {
+        self.verify_with_roots(server_id, roots, at)?;
+        Ok(Self::issue_root_for(server_id, root_key, &self.body.holder, self.body.permissions.clone(), at, self.effective_expires_at()))
     }
 
     /// **Achatamento por ancestral**: quem está na cadeia acima do titular reemite o passaporte

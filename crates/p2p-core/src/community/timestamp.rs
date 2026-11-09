@@ -246,6 +246,26 @@ pub fn verify_rfc3161(token_der: &[u8], message_imprint: &[u8; 32], tsas: &[Trus
     Err(TimestampError::BadSignature)
 }
 
+/// Horário declarado (`genTime`) de um token RFC 3161, sem verificar assinatura. Serve só para
+/// ordenar; quem decide se o carimbo vale é [`verify_rfc3161`].
+pub fn rfc3161_declared_time(token_der: &[u8]) -> Option<UtcSecs> {
+    let content_info = cms::content_info::ContentInfo::from_der(token_der).ok()?;
+    let signed: cms::signed_data::SignedData = content_info.content.decode_as().ok()?;
+    let econtent = signed.encap_content_info.econtent?;
+    let tst = x509_tsp::TstInfo::from_der(econtent.decode_as::<OctetString>().ok()?.as_bytes()).ok()?;
+    Some(tst.gen_time.to_unix_duration().as_secs())
+}
+
+impl TimestampAttestation {
+    /// Horário que o carimbo declara (sem verificar). Para ordenar antes de validar.
+    pub fn declared_time(&self) -> Option<UtcSecs> {
+        match self {
+            TimestampAttestation::Rfc3161 { token_der, .. } => rfc3161_declared_time(token_der),
+            TimestampAttestation::Peer(token) => Some(token.body.gen_time),
+        }
+    }
+}
+
 fn digest(oid: &ObjectIdentifier, data: &[u8]) -> Result<Vec<u8>, TimestampError> {
     Ok(match *oid {
         OID_SHA256 => Sha256::digest(data).to_vec(),

@@ -398,7 +398,7 @@ impl Runtime {
             .get_friends()
             .iter()
             .any(|f| f.public_key.eq_ignore_ascii_case(&clean_pk))
-            || self.servers.list().any(|srv| srv.chain().state().owner.eq_ignore_ascii_case(&clean_pk))
+            || self.servers.list().any(|srv| srv.chain().state().protected.contains(&clean_pk))
             || self.active_room().is_some_and(|(_, _, room)| self.mls.members(&room).contains(&clean_pk));
         let verdict = self.dm.firewall.check_packet(
             &clean_pk,

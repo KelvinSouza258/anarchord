@@ -402,9 +402,8 @@ fn dissect_incoming(incoming: Incoming) -> (String, SniffedCrypto) {
         ),
         Incoming::Server(srv) => {
             let sub = match srv {
-                crate::community::ServerMessage::Blocks { .. } => "Server.Blocks",
-                crate::community::ServerMessage::ChainRequest { .. } => "Server.ChainRequest",
-                crate::community::ServerMessage::Action(_) => "Server.Action",
+                crate::community::ServerMessage::Events { .. } => "Server.Events",
+                crate::community::ServerMessage::Inventory { .. } => "Server.Inventory",
                 crate::community::ServerMessage::KeyPackage { .. } => "Server.KeyPackage",
                 crate::community::ServerMessage::Commit { .. } => "Server.Commit",
                 crate::community::ServerMessage::Welcome { .. } => "Server.Welcome",

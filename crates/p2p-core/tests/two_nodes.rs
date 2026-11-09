@@ -287,9 +287,9 @@ async fn send_server_messages(
     events
 }
 
-/// Protocolo de servidor pela rede, com a cadeia de configuração:
-/// Bob entra e sincroniza; Alice (dona) certifica Bob como moderador; Bob bane alguém
-/// (ação provisória); a manutenção da Alice consolida a ação num bloco que volta ao Bob.
+/// Protocolo de servidor pela rede, com o registro de governança:
+/// Bob entra e sincroniza pelo inventário; Alice (dona) certifica Bob como moderador; Bob bane
+/// alguém; Alice testemunha o evento (carimbo) e o ban publicado vale para ela.
 #[tokio::test]
 async fn test_server_chain_sync_and_moderation_over_network() {
     const T0: u64 = 1_800_000_000;
@@ -311,7 +311,7 @@ async fn test_server_chain_sync_and_moderation_over_network() {
     let events = send_server_messages(&mut alice, &mut bob, Side::Bob, &control, vec![request], &mut alice_servers, T0).await;
     let Some(ServerEvent::Reply { messages, .. }) = events.into_iter().next() else { panic!("Alice deveria responder") };
     let events = send_server_messages(&mut alice, &mut bob, Side::Alice, &control, messages, &mut bob_servers, T0).await;
-    assert!(events.iter().any(|e| matches!(e, ServerEvent::ChainUpdated { height: 0, .. })), "{:?}", events);
+    assert!(events.iter().any(|e| matches!(e, ServerEvent::ChainUpdated { events: 0, .. })), "{:?}", events);
     assert_eq!(bob_servers.get(&server_id).unwrap().name(), "Rust Guild");
 
     // 2. Alice emite passaporte de moderador para Bob
@@ -322,20 +322,30 @@ async fn test_server_chain_sync_and_moderation_over_network() {
     assert!(bob_servers.accept_my_passport(&server_id, &bob_pk, &passport, T0 + 10));
     assert!(bob_servers.get(&server_id).unwrap().is_moderator(&bob_pk, T0 + 10));
 
-    // 3. Bob (moderador) bane um spammer: ação provisória que chega à Alice
+    // 3. Bob (moderador) bane um spammer: o evento fica na fila até ter carimbo
     let spammer = UserIdentity::generate().public_key_hex();
     let bob_identity = bob.identity.clone();
-    let action = bob_servers.moderate(&server_id, &bob_identity, ModKind::Ban { until: None }, &spammer, "spam", T0 + 20).unwrap();
-    let events = send_server_messages(&mut alice, &mut bob, Side::Bob, &control, vec![action], &mut alice_servers, T0 + 21).await;
-    assert!(matches!(events.as_slice(), [ServerEvent::ActionAccepted { .. }]), "{:?}", events);
-    assert!(alice_servers.get(&server_id).unwrap().is_banned(&spammer, T0 + 21));
+    let submitted = bob_servers.moderate(&server_id, &bob_identity, ModKind::Ban { until: None }, &spammer, "spam", T0 + 20).unwrap();
+    assert!(!bob_servers.get(&server_id).unwrap().is_banned(&spammer, T0 + 20), "sem carimbo ainda não vale");
 
-    // 4. Manutenção da dona consolida; o bloco volta ao Bob e a ação sai da fila provisória
-    let block = alice_servers.owner_maintenance(&server_id, T0 + 30).expect("consolidação");
-    send_server_messages(&mut alice, &mut bob, Side::Alice, &control, vec![block], &mut bob_servers, T0 + 30).await;
-    let bob_view = bob_servers.get(&server_id).unwrap();
-    assert!(bob_view.chain().state().is_banned(&spammer, T0 + 30), "ban definitivo na cadeia");
-    assert_eq!(bob_view.pending_actions().count(), 0);
+    // 4. Alice testemunha (carimbo pela rede); o evento entra no registro do Bob e é publicado
+    let imprint: String = submitted.imprint.iter().map(|b| format!("{:02x}", b)).collect();
+    let alice_identity = alice.identity.clone();
+    let stamp = alice_servers.witness_stamp(&server_id, &alice_identity, &imprint, "n", T0 + 21).expect("Alice testemunha");
+    let events = send_server_messages(&mut alice, &mut bob, Side::Alice, &control, vec![stamp], &mut bob_servers, T0 + 21).await;
+    assert!(bob_servers.get(&server_id).unwrap().is_banned(&spammer, T0 + 21));
+    let publish: Vec<ServerMessage> = events
+        .into_iter()
+        .filter_map(|e| match e {
+            ServerEvent::Reply { messages, .. } => Some(messages),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let events = send_server_messages(&mut alice, &mut bob, Side::Bob, &control, publish, &mut alice_servers, T0 + 22).await;
+    assert!(events.iter().any(|e| matches!(e, ServerEvent::EventApplied { .. })), "{:?}", events);
+    assert!(alice_servers.get(&server_id).unwrap().is_banned(&spammer, T0 + 22));
+    assert_eq!(bob_servers.get(&server_id).unwrap().outbox().count(), 0);
 }
 
 /// Executa as ações do motor do enxame num nó de verdade

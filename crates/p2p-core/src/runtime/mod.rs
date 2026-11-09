@@ -246,6 +246,10 @@ pub(crate) struct Runtime {
     servers: ServerRegistry,
     mls: ServerGroups,
     last_key_package: HashMap<String, std::time::Instant>,
+    /// Último pedido de carimbo de cada evento da fila (para pedir de novo se nada chegar)
+    outbox_retry: HashMap<String, std::time::Instant>,
+    /// Alterações deste nó aguardando carimbo: o aviso sai quando forem aplicadas
+    pending_changes: HashMap<String, ServerChange>,
     /// Servidor em que entra assim que a configuração chegar
     pending_switch: Option<String>,
     last_invite: Option<String>,
@@ -328,6 +332,8 @@ impl Runtime {
             servers,
             mls,
             last_key_package: HashMap::new(),
+            outbox_retry: HashMap::new(),
+            pending_changes: HashMap::new(),
             pending_switch: None,
             last_invite: None,
             last_snapshot_reply: HashMap::new(),

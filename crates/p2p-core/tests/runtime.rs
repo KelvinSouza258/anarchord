@@ -212,12 +212,12 @@ async fn test_two_cores_server_lifecycle() {
 
             // Moderador não age sobre a dona
             bob.server(ServerCommand::Ban { target: "Alice".into(), duration: None, reason: String::new() });
-            bob.wait("ban recusado: dono protegido", |e| matches!(e, CoreEvent::Error(CoreError::Server(m)) if m.contains("não podem ser alvo"))).await;
+            bob.wait("ban recusado: dono protegido", |e| matches!(e, CoreEvent::Error(CoreError::Server(m)) if m.contains("protegido"))).await;
 
             // Alice revoga o passaporte de moderador e bane Bob por 1 hora
             alice.server(ServerCommand::RemoveModerator("Bob".into()));
             alice.server(ServerCommand::Ban { target: "Bob".into(), duration: Some(3600), reason: "spam".into() });
-            alice.wait("ban gravado", |e| matches!(e, CoreEvent::Server(ServerNotice::Moderated { recorded_by_owner: true, .. }))).await;
+            alice.wait("ban gravado", |e| matches!(e, CoreEvent::Server(ServerNotice::Moderated { .. }))).await;
             bob.wait("Bob ser avisado do ban", |e| matches!(e, CoreEvent::Server(ServerNotice::BanStatus { banned: true, .. }))).await;
             alice.drain(Duration::from_millis(300)).await;
             let last_members = alice.seen.iter().rev().find_map(|e| match e {
@@ -249,8 +249,8 @@ async fn test_two_cores_server_lifecycle() {
             let joined = text.join("\n");
             assert!(joined.contains("criado 'Rust Guild'"), "{}", joined);
             let alice_errors: Vec<&CoreEvent> = alice.seen.iter().filter(|e| matches!(e, CoreEvent::Error(_))).collect();
-            assert!(joined.contains("revogado"), "{}\nerros de Alice: {:?}", joined, alice_errors);
-            assert!(joined.contains("dono baniu"), "{}", joined);
+            assert!(joined.contains("revogou o passaporte"), "{}\nerros de Alice: {:?}", joined, alice_errors);
+            assert!(joined.contains(" baniu "), "{}", joined);
 
             alice.send(CoreCommand::Shutdown);
             alice.wait("Alice encerrar", |e| matches!(e, CoreEvent::Stopped)).await;
@@ -980,8 +980,8 @@ async fn test_moderator_online_later_sees_pending_request() {
         .await;
 }
 
-/// Pedido de acesso com prova de trabalho (#91), sem internet: o servidor exige prova e não tem
-/// TSA na política, então a semente é carimbada por uma testemunha da rede
+/// Pedido de acesso com prova de trabalho (#91): o servidor exige prova e não tem TSA na política,
+/// então a semente é carimbada por uma testemunha da rede (a configuração usa a FreeTSA)
 #[tokio::test]
 async fn test_access_request_with_proof_of_work_via_witness() {
     let local = tokio::task::LocalSet::new();
@@ -999,10 +999,12 @@ async fn test_access_request_with_proof_of_work_via_witness() {
             else {
                 unreachable!()
             };
-            alice.server(ServerCommand::RemoveTsa("FreeTSA".into()));
-            alice.wait("sem TSA", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::TsaRemoved(_), .. }))).await;
+            // Toda alteração precisa de carimbo: com Alice sozinha, só a TSA carimba. A política de
+            // prova vem antes, e a remoção da TSA (carimbada por ela mesma) por último.
             alice.server(ServerCommand::AccessPow(8));
             alice.wait("prova exigida", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::AccessPow(8), .. }))).await;
+            alice.server(ServerCommand::RemoveTsa("FreeTSA".into()));
+            alice.wait("sem TSA", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::TsaRemoved(_), .. }))).await;
 
             carol.server(ServerCommand::Join(id.clone()));
             carol.wait("Carol calcular a prova", |e| matches!(e, CoreEvent::Server(ServerNotice::AccessProofComputing { .. }))).await;

@@ -10,7 +10,7 @@ use crate::community::{
     e2ee::{self, CommitOutcome, E2eeError},
     server_control_topic, server_dht_key,
     timestamp::{self, TimestampAttestation},
-    ChannelType, CommunityError, ModKind, PassportPermission, ServerEvent, ServerMessage, Space, TrustedTsa,
+    ChannelType, CommunityError, ModKind, PassportPermission, ServerEvent, ServerMessage, Space, Submitted, TrustedTsa,
 };
 use base64::Engine as _;
 use libp2p::gossipsub::IdentTopic;
@@ -197,12 +197,17 @@ impl Runtime {
     /// Pede carimbos de tempo para `imprint`: às TSAs da política (em threads, via HTTP) e às
     /// testemunhas da rede (pelo tópico de controle)
     pub(super) fn request_stamps(&mut self, server_id: &str, imprint: [u8; 32]) {
+        let tsas = self.servers.get(server_id).map(|s| s.chain().state().timestamp_policy.tsas.clone()).unwrap_or_default();
+        self.request_stamps_with(server_id, imprint, tsas);
+    }
+
+    /// Como [`Self::request_stamps`], com as autoridades informadas (ex.: servidor do qual acabamos de sair)
+    pub(super) fn request_stamps_with(&mut self, server_id: &str, imprint: [u8; 32], tsas: Vec<TrustedTsa>) {
         let nonce = timestamp::hex(&rand::random::<[u8; 8]>());
         self.publish_server_message(
             server_id,
             &ServerMessage::StampRequest { server_id: server_id.to_string(), imprint: timestamp::hex(&imprint), nonce },
         );
-        let tsas = self.servers.get(server_id).map(|s| s.chain().state().timestamp_policy.tsas.clone()).unwrap_or_default();
         for tsa in tsas {
             let tx = self.stamp_tx.clone();
             let server_id = server_id.to_string();
@@ -218,9 +223,12 @@ impl Runtime {
         let StampResult { server_id, imprint, tsa, result } = result;
         match result {
             Ok(stamp) => {
-                self.servers.attach_stamp(&server_id, &imprint, &stamp);
+                let now = super::now_secs();
+                let before = self.my_status(&server_id, now);
+                let events = self.servers.attach_stamp(&server_id, &imprint, &stamp, now);
                 self.publish_server_message(&server_id, &ServerMessage::Stamp { server_id: server_id.clone(), imprint: timestamp::hex(&imprint), stamp });
                 self.notice(ServerNotice::StampObtained { server: self.server_name(&server_id), source: tsa });
+                self.process_server_events(&server_id, events, before, now);
             }
             Err(reason) => self.notice(ServerNotice::StampFailed { server: self.server_name(&server_id), tsa, reason }),
         }
@@ -312,12 +320,18 @@ impl Runtime {
         for (server_id, message) in self.servers.pending_renounces(now) {
             self.publish_server_message(&server_id, &message);
         }
-        // Dono online: consolida ações de moderadores
-        for id in self.servers.list().filter(|s| s.is_owner()).map(|s| s.server_id.clone()).collect::<Vec<_>>() {
-            if let Some(block) = self.servers.owner_maintenance(&id, now) {
-                self.publish_server_message(&id, &block);
-                if self.active.server_id() == Some(id.as_str()) {
-                    self.refresh_space();
+        // Consolidação periódica (quem tem a permissão) e eventos da fila ainda sem carimbo: pede de novo
+        for id in self.servers.list().map(|s| s.server_id.clone()).collect::<Vec<_>>() {
+            if let Some(submitted) = self.servers.maintenance(&id, &self.identity, now) {
+                self.request_stamps(&id, submitted.imprint);
+            }
+            let waiting: Vec<(String, [u8; 32])> =
+                self.servers.get(&id).map(|s| s.outbox().map(|e| (e.id(), e.imprint())).collect()).unwrap_or_default();
+            for (event_id, imprint) in waiting {
+                let due = self.outbox_retry.get(&event_id).is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
+                if due {
+                    self.outbox_retry.insert(event_id, std::time::Instant::now());
+                    self.request_stamps(&id, imprint);
                 }
             }
         }
@@ -372,12 +386,13 @@ impl Runtime {
     }
 
     /// Publica uma alteração bem-sucedida e atualiza o espaço
-    fn publish_change(&mut self, id: &str, result: Result<ServerMessage, CommunityError>, change: ServerChange) {
+    /// Evento de governança criado: pede o carimbo (entra no registro e é publicado quando chegar)
+    fn publish_change(&mut self, id: &str, result: Result<Submitted, CommunityError>, change: ServerChange) {
         match result {
-            Ok(message) => {
-                self.publish_server_message(id, &message);
-                self.refresh_space();
-                self.notice(ServerNotice::Changed { server: self.server_name(id), change });
+            Ok(submitted) => {
+                // O aviso sai quando o evento for aplicado (com o carimbo)
+                self.pending_changes.insert(submitted.event_id.clone(), change);
+                self.request_stamps(id, submitted.imprint);
             }
             Err(e) => self.error(CoreError::Server(e.to_string())),
         }
@@ -445,9 +460,9 @@ impl Runtime {
                 if self.active.server_id() == Some(id.as_str()) {
                     self.leave_room_group();
                 }
-                // Sair renuncia ao passaporte (exceto o dono); publicado antes de deixar o tópico
-                if let Some(renounce) = self.servers.leave_renouncing(&id, &self.identity, now) {
-                    self.publish_server_message(&id, &renounce);
+                // Sair renuncia ao passaporte (exceto o dono); publicado quando o carimbo chegar
+                if let Some((imprint, tsas)) = self.servers.leave_renouncing(&id, &self.identity, now) {
+                    self.request_stamps_with(&id, imprint, tsas);
                 }
                 let gossipsub = &mut self.node.swarm.behaviour_mut().gossipsub;
                 let _ = gossipsub.unsubscribe(&IdentTopic::new(server_control_topic(&id)));
@@ -477,7 +492,6 @@ impl Runtime {
                 let id = need_server!();
                 let Some(server) = self.servers.get(&id) else { return };
                 let state = server.effective_state(now);
-                let head = server.chain().head();
                 let me = self.my_pubkey();
                 let role = if server.is_owner() || state.is_owner_key(&me) {
                     Role::Owner
@@ -492,8 +506,8 @@ impl Runtime {
                     safety_number: crate::identity::safety_number(&id),
                     mls_leader: self.active_room().and_then(|(_, _, room)| self.mls.leader(&room)).map(|pk| self.nick_for(&pk)),
                     mls_epoch: self.active_room().and_then(|(_, _, room)| self.mls.epoch(&room)),
-                    height: head.map_or(0, |b| b.body.height),
-                    updated_at: head.map(|b| b.body.timestamp),
+                    height: server.chain().events().count() as u64,
+                    updated_at: state.last_event.as_ref().map(|(_, at)| *at),
                     channels: server.channels().into_iter().map(|c| ChannelInfo { voice: c.channel_type == ChannelType::Voice, name: c.name }).collect(),
                     role,
                     closed: state.closed,
@@ -507,7 +521,7 @@ impl Runtime {
                     tsas: state.timestamp_policy.tsas.iter().map(|t| (t.name.clone(), t.url.clone())).collect(),
                     passport_validity_secs: state.passport_validity_secs,
                     renewal_window_secs: state.renewal_window_secs,
-                    pending_actions: server.pending_actions().count(),
+                    pending_actions: server.outbox().count(),
                 };
                 self.notice(ServerNotice::Info(info));
             }
@@ -614,12 +628,12 @@ impl Runtime {
             ServerCommand::AddChannel { name, voice } => {
                 let id = need_server!();
                 let kind = if voice { ChannelType::Voice } else { ChannelType::Text };
-                let result = self.servers.add_channel(&id, &name, kind, now);
+                let result = self.servers.add_channel(&id, &self.identity, &name, kind, now);
                 self.publish_change(&id, result, ServerChange::ChannelAdded { name, voice });
             }
             ServerCommand::RemoveChannel(name) => {
                 let id = need_server!();
-                let result = self.servers.remove_channel(&id, &name, now);
+                let result = self.servers.remove_channel(&id, &self.identity, &name, now);
                 self.publish_change(&id, result, ServerChange::ChannelRemoved(name));
             }
             ServerCommand::AddModerator { target, permissions } => {
@@ -639,19 +653,19 @@ impl Runtime {
             ServerCommand::RemoveModerator(target) => {
                 let id = need_server!();
                 let pubkey = need_peer!(target);
-                let result = self.servers.remove_moderator(&id, &pubkey, now);
+                let result = self.servers.remove_moderator(&id, &self.identity, &pubkey, now);
                 let who = self.nick_for(&pubkey);
                 self.publish_change(&id, result, ServerChange::ModeratorRemoved { who });
             }
             ServerCommand::Close | ServerCommand::Open => {
                 let id = need_server!();
                 let closing = matches!(command, ServerCommand::Close);
-                let result = self.servers.set_closed(&id, closing, now);
+                let result = self.servers.set_closed(&id, &self.identity, closing, now);
                 self.publish_change(&id, result, if closing { ServerChange::Closed } else { ServerChange::Opened });
             }
             ServerCommand::Policy { validity, renewal_window } => {
                 let id = need_server!();
-                let result = self.servers.set_passport_policy(&id, validity, renewal_window, now);
+                let result = self.servers.set_passport_policy(&id, &self.identity, validity, renewal_window, now);
                 self.publish_change(&id, result, ServerChange::Policy { validity_secs: validity, renewal_window_secs: renewal_window });
             }
             ServerCommand::AddTsa { name, url, public_key_b64 } => {
@@ -659,19 +673,19 @@ impl Runtime {
                 let Ok(spki_der) = base64::engine::general_purpose::STANDARD.decode(public_key_b64.trim()) else {
                     return self.error(CoreError::Server("Chave pública da TSA deve estar em base64 (SubjectPublicKeyInfo DER)".into()));
                 };
-                let result = self.servers.add_tsa(&id, TrustedTsa { name: name.clone(), url, spki_der }, now);
+                let result = self.servers.add_tsa(&id, &self.identity, TrustedTsa { name: name.clone(), url, spki_der }, now);
                 self.publish_change(&id, result, ServerChange::TsaAdded(name));
             }
             ServerCommand::RemoveTsa(name) => {
                 let id = need_server!();
-                let result = self.servers.remove_tsa(&id, &name, now);
+                let result = self.servers.remove_tsa(&id, &self.identity, &name, now);
                 self.publish_change(&id, result, ServerChange::TsaRemoved(name));
             }
             ServerCommand::Ban { target, duration, reason } => self.moderate(ModKind::Ban { until: duration.map(|d| now + d) }, &target, &reason),
             ServerCommand::Unban(target) => self.moderate(ModKind::Unban, &target, ""),
             ServerCommand::AccessPow(bits) => {
                 let id = need_server!();
-                let result = self.servers.set_access_pow(&id, bits, now);
+                let result = self.servers.set_access_pow(&id, &self.identity, bits, now);
                 self.publish_change(&id, result, ServerChange::AccessPow(bits));
             }
             ServerCommand::Requests => {
@@ -746,9 +760,8 @@ impl Runtime {
         }
     }
 
-    /// Ban, desban e revogação. O dono grava direto na cadeia; um moderador publica uma ação
-    /// assinada com o próprio passaporte, que vale na hora, recebe carimbos de tempo e é
-    /// consolidada pelo dono depois.
+    /// Ban, desban e revogação: evento assinado com o nosso passaporte, publicado quando chegar o
+    /// carimbo de tempo
     fn moderate(&mut self, kind: ModKind, target: &str, reason: &str) {
         let Some(id) = self.active.server_id().map(str::to_string) else { return self.error(CoreError::InLobby) };
         let Some(pubkey) = self.resolve_pubkey(target) else { return self.error(CoreError::PeerNotFound(target.to_string())) };
@@ -756,17 +769,11 @@ impl Runtime {
             return self.error(CoreError::SelfModeration);
         }
         let now = super::now_secs();
-        let owner = self.servers.get(&id).is_some_and(|s| s.is_owner());
         let who = self.nick_for(&pubkey);
         match self.servers.moderate(&id, &self.identity, kind.clone(), &pubkey, reason, now) {
-            Ok(message) => {
-                self.publish_server_message(&id, &message);
-                if let ServerMessage::Action(action) = &message {
-                    self.request_stamps(&id, action.imprint());
-                }
-                self.enforce_now(&id);
-                self.publish_channel_members();
-                self.notice(ServerNotice::Moderated { server: self.server_name(&id), target: who, kind, at: now, recorded_by_owner: owner });
+            Ok(submitted) => {
+                self.request_stamps(&id, submitted.imprint);
+                self.notice(ServerNotice::Moderated { server: self.server_name(&id), target: who, kind, at: now });
             }
             Err(e) => self.error(CoreError::Server(e.to_string())),
         }
@@ -847,9 +854,8 @@ impl Runtime {
             ServerMessage::Commit { server_id, room, commit } => {
                 let Some(group) = self.room_if_active(server_id, room) else { return };
                 let Some(server) = self.servers.get(server_id).filter(|s| s.has_chain()) else { return };
-                let owner = server.chain().state().owner.clone();
                 let current_leader = self.mls.leader(&group);
-                let outcome = self.mls.process_commit_with_validator(&group, commit, &owner, |pk| !server.is_excluded(pk, now), |pk| server.is_allowed(pk, now));
+                let outcome = self.mls.process_commit_with_validator(&group, commit, "", |pk| !server.is_excluded(pk, now), |pk| server.is_allowed(pk, now));
                 match outcome {
                     Ok(CommitOutcome::Applied { epoch }) => {
                         if let Some(from) = from_pubkey {
@@ -862,7 +868,7 @@ impl Runtime {
                     Ok(CommitOutcome::Removed) => self.notice(ServerNotice::RemovedFromGroup { server: self.server_name(server_id) }),
                     // Perdemos algum Commit: descarta e pede entrada de novo se veio de um membro válido
                     Ok(CommitOutcome::OutOfSync)
-                        if from_pubkey.is_some_and(|pk| !server.is_excluded(pk, now) && (current_leader.as_deref() == Some(pk) || pk == owner)) =>
+                        if from_pubkey.is_some_and(|pk| !server.is_excluded(pk, now) && current_leader.as_deref() == Some(pk)) =>
                     {
                         self.mls.drop_group(&group);
                         let _ = self.request_group_key(server_id, room);
@@ -998,17 +1004,29 @@ impl Runtime {
             }
             _ => {}
         }
-        let before = self.servers.get(topic_server_id).map(|s| (s.has_chain() && s.is_banned(&me, now), s.has_chain() && s.is_moderator(&me, now)));
+        let before = self.my_status(topic_server_id, now);
+        let events = self.servers.handle_message(message, from_pubkey, now);
+        self.process_server_events(topic_server_id, events, before, now);
+    }
 
+    /// (banido, moderador) deste usuário no servidor, para avisar quando mudar
+    fn my_status(&self, server_id: &str, now: u64) -> Option<(bool, bool)> {
+        let me = self.my_pubkey();
+        self.servers.get(server_id).map(|s| (s.has_chain() && s.is_banned(&me, now), s.has_chain() && s.is_moderator(&me, now)))
+    }
+
+    /// Reage ao que o registro de governança devolveu (sincronização, eventos aplicados, respostas)
+    pub(super) fn process_server_events(&mut self, topic_server_id: &str, events: Vec<ServerEvent>, before: Option<(bool, bool)>, now: u64) {
+        let me = self.my_pubkey();
         let mut governance_changed = false;
-        for event in self.servers.handle_message(message, from_pubkey, now) {
+        for event in events {
             governance_changed |= matches!(
                 event,
-                ServerEvent::ChainUpdated { .. } | ServerEvent::ActionAccepted { .. } | ServerEvent::ActionsUndone { .. } | ServerEvent::StampAttached { .. }
+                ServerEvent::ChainUpdated { .. } | ServerEvent::EventApplied { .. } | ServerEvent::StampAttached { .. }
             );
             match event {
-                ServerEvent::ChainUpdated { server_id, name, height } => {
-                    self.notice(ServerNotice::Synced { id: server_id.clone(), name, height });
+                ServerEvent::ChainUpdated { server_id, name, events } => {
+                    self.notice(ServerNotice::Synced { id: server_id.clone(), name, height: events as u64 });
                     if self.pending_switch.as_deref() == Some(server_id.as_str()) {
                         self.pending_switch = None;
                         self.enter_server(server_id);
@@ -1016,22 +1034,31 @@ impl Runtime {
                         self.refresh_space();
                     }
                 }
-                ServerEvent::Fork { server_id, height, replaced } => self.notice(ServerNotice::Fork { id: server_id, height, replaced }),
-                ServerEvent::NeedBlocks { server_id, from_height } => {
-                    let passport = self.servers.get(&server_id).and_then(|s| s.my_passport().cloned());
-                    self.publish_server_message(&server_id, &ServerMessage::ChainRequest { server_id: server_id.clone(), from_height, passport });
+                ServerEvent::EventApplied { server_id, event, at } => {
+                    if let Some(change) = self.pending_changes.remove(&event.id()) {
+                        self.refresh_space();
+                        self.notice(ServerNotice::Changed { server: self.server_name(&server_id), change });
+                    }
+                    if let Some((target, kind)) = ModKind::from_entry(&event.body.entry, event.author()) {
+                        let reason = match &event.body.entry {
+                            community::Entry::Ban { reason, .. } => reason.clone(),
+                            _ => String::new(),
+                        };
+                        self.notice(ServerNotice::ModerationReceived {
+                            server: self.server_name(&server_id),
+                            by: self.nick_for(event.author()),
+                            target: self.nick_for(&target),
+                            kind,
+                            at,
+                            reason,
+                        });
+                    }
                 }
-                ServerEvent::ActionAccepted { server_id, action } => self.notice(ServerNotice::ModerationReceived {
+                ServerEvent::EventRejected { server_id, entry, reason } => self.notice(ServerNotice::EventRejected {
                     server: self.server_name(&server_id),
-                    by: self.nick_for(action.actor()),
-                    target: self.nick_for(&action.body.target),
-                    kind: action.body.kind.clone(),
-                    at: now,
-                    reason: action.body.reason.clone(),
+                    description: community::describe_entry(&entry),
+                    reason: reason.to_string(),
                 }),
-                ServerEvent::ActionsUndone { server_id, count } => {
-                    self.notice(ServerNotice::ActionsUndone { server: self.server_name(&server_id), count })
-                }
                 ServerEvent::Reply { server_id, messages } => {
                     for m in &messages {
                         self.publish_server_message(&server_id, m);

@@ -1028,8 +1028,10 @@ mod tests {
         use crate::community::{ModKind, ServerEvent, ServerMessage, ServerRegistry};
         const T0: u64 = 1_800_000_000;
         let owner_id = UserIdentity::generate_with_nick("Owner");
+        let tsa = crate::community::timestamp::test_tsa::LocalTsa::new();
+        let policy = crate::community::TimestampPolicy { tsas: vec![tsa.trusted("local")], max_delay_secs: 600 };
         let mut owner_registry = ServerRegistry::in_memory();
-        let server = owner_registry.create("Guild", &owner_id.public_key_hex(), T0).unwrap();
+        let server = owner_registry.create_with_policy("Guild", &owner_id.public_key_hex(), policy, T0).unwrap();
         let room = crate::community::room_id(&server, "geral");
 
         // Bob e Carol são membros comuns (o dono NÃO está no grupo MLS!)
@@ -1071,9 +1073,15 @@ mod tests {
         let kp_again = carol.key_package().unwrap();
         assert!(admit_from_key_package(&mut bob, &bob_registry, &server, "geral", &carol_pk, &kp_again, Some(&carol_p), T0).unwrap().is_empty());
 
-        // Dono bane Carol na cadeia e o bloco chega para Bob -> Bob (líder MLS) remove Carol do grupo!
-        let ban_block = owner_registry.moderate(&server, &owner_id, ModKind::Ban { until: None }, &carol_pk, "", T0 + 1).unwrap();
-        bob_registry.handle_message(ban_block, None, T0 + 1);
+        // Dono bane Carol, o evento carimbado chega para Bob -> Bob (líder MLS) remove Carol do grupo!
+        let ban = owner_registry.moderate(&server, &owner_id, ModKind::Ban { until: None }, &carol_pk, "", T0 + 1).unwrap();
+        for event in owner_registry.attach_stamp(&server, &ban.imprint, &tsa.stamp(&ban.imprint, T0 + 1), T0 + 1) {
+            if let ServerEvent::Reply { messages, .. } = event {
+                for m in messages {
+                    bob_registry.handle_message(m, None, T0 + 1);
+                }
+            }
+        }
         assert!(enforce_membership(&mut bob, &bob_registry, &server, "geral", T0 + 2).unwrap().is_some());
         assert!(!bob.members(&room).contains(&carol_pk));
         assert!(enforce_membership(&mut bob, &bob_registry, &server, "geral", T0 + 3).unwrap().is_none(), "nada mais a fazer");

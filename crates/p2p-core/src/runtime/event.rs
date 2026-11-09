@@ -250,14 +250,14 @@ pub enum ServerNotice {
     WaitingConfig { id: String },
     Left { name: String, was_owner: bool },
     Synced { id: String, name: String, height: u64 },
-    Fork { id: String, height: u64, replaced: bool },
-    /// Alteração feita por este nó e já publicada
+    /// Alteração feita por este nó, já carimbada e aplicada
     Changed { server: String, change: ServerChange },
     /// Ação de moderação feita por este nó
-    Moderated { server: String, target: String, kind: ModKind, at: UtcSecs, recorded_by_owner: bool },
+    Moderated { server: String, target: String, kind: ModKind, at: UtcSecs },
     /// Ação de moderação de outro moderador
     ModerationReceived { server: String, by: String, target: String, kind: ModKind, at: UtcSecs, reason: String },
-    ActionsUndone { server: String, count: usize },
+    /// Evento deste nó recusado pelas regras do servidor ao ser carimbado
+    EventRejected { server: String, description: String, reason: String },
     /// Ban deste usuário começou ou acabou
     BanStatus { server: String, banned: bool },
     /// Este usuário passou a ser (ou deixou de ser) moderador

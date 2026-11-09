@@ -334,13 +334,7 @@ fn server(notice: &ServerNotice) -> Vec<String> {
             name,
             if *was_owner { " A chave de dono continua salva em disco." } else { "" }
         )),
-        ServerNotice::Synced { name, height, .. } => one(format!("📜 '{}' sincronizado (bloco {}).", name, height)),
-        ServerNotice::Fork { id, height, replaced } => one(format!(
-            "⚠️ Fork na cadeia de {} no bloco {} (a chave do dono foi usada em dois lugares?): {}.",
-            short_id(id),
-            height,
-            if *replaced { "adotado o ramo vencedor" } else { "mantido o ramo atual" }
-        )),
+        ServerNotice::Synced { name, height, .. } => one(format!("📜 '{}' sincronizado ({} eventos).", name, height)),
         ServerNotice::Changed { change, .. } => one(match change {
             ServerChange::ChannelAdded { name, voice } => format!("✅ Canal {}{} criado.", if *voice { "🔊 " } else { "#" }, name),
             ServerChange::ChannelRemoved(name) => format!("🗑️ Canal {} removido.", name),
@@ -350,7 +344,7 @@ fn server(notice: &ServerNotice) -> Vec<String> {
                 format_duration(Some(*validity_secs))
             ),
             ServerChange::ModeratorRemoved { who } => {
-                format!("🛡️ Passaporte de moderador de {} revogado. Ações posteriores dele serão desfeitas.", who)
+                format!("🛡️ Passaporte de moderador de {} revogado. Ações posteriores dele não valem.", who)
             }
             ServerChange::Closed => {
                 "🔒 Servidor privado: só entra quem recebe passaporte de um moderador (/server passport issue <par>).".to_string()
@@ -366,24 +360,22 @@ fn server(notice: &ServerNotice) -> Vec<String> {
             ServerChange::AccessPow(0) => "⛏️ Pedidos de acesso sem prova de trabalho.".to_string(),
             ServerChange::AccessPow(bits) => format!("⛏️ Pedidos de acesso exigem prova de trabalho ({} bits).", bits),
         }),
-        ServerNotice::Moderated { target, kind, at, recorded_by_owner, .. } => {
+        ServerNotice::Moderated { target, kind, at, .. } => {
             let what = match kind {
                 ModKind::Ban { until } => format!("🔨 {} foi banido ({}).", target, format_duration(until.map(|u| u.saturating_sub(*at)))),
                 ModKind::Unban => format!("🕊️ {} foi desbanido.", target),
                 ModKind::Renounce { .. } => format!("🚪 {} renunciou ao passaporte.", target),
                 ModKind::Revoke { .. } => format!("🎫 Passaporte de {} revogado.", target),
             };
-            let note = if *recorded_by_owner { " Gravado na cadeia." } else { " Vale agora; fica definitivo quando o dono consolidar." };
-            one(format!("{}{}", what, note))
+            one(format!("{} Vale quando o carimbo de tempo chegar.", what))
         }
         ServerNotice::ModerationReceived { server, by, target, kind, at, reason } => {
             let reason = if reason.is_empty() { String::new() } else { format!(" — motivo: {}", reason) };
             one(format!("🔨 [{}] {} {}{}", server, by, moderation_text(target, kind, *at), reason))
         }
-        ServerNotice::ActionsUndone { server, count } => one(format!(
-            "↩️ [{}] {} ação(ões) de moderação desfeita(s): o autor já estava banido ou perdeu o passaporte.",
-            server, count
-        )),
+        ServerNotice::EventRejected { server, description, reason } => {
+            one(format!("↩️ [{}] Alteração recusada ({}): {}.", server, description, reason))
+        }
         ServerNotice::BanStatus { server, banned: true } => {
             one(format!("⛔ Você foi banido de '{}': suas mensagens serão ignoradas pelos membros.", server))
         }
@@ -551,7 +543,7 @@ fn server_info(info: &ServerInfo) -> Vec<String> {
         format!("   Banidos: {}", none_or(bans)),
         format!("   Autoridades de tempo: {} (+ testemunhas da rede)", none_or(tsas)),
         format!(
-            "   Passaportes: validade {}, renovação nos últimos {} | Ações aguardando o dono: {}",
+            "   Passaportes: validade {}, renovação nos últimos {} | Alterações aguardando carimbo: {}",
             format_duration(Some(info.passport_validity_secs)),
             format_duration(Some(info.renewal_window_secs)),
             info.pending_actions
