@@ -60,6 +60,8 @@ pub enum UiEvent {
     },
     /// Servidores conhecidos (para o menu "Trocar de espaço")
     ServersChanged(Vec<ServerEntry>),
+    /// Pedidos de acesso pendentes do servidor atual: (nick, pubkey)
+    AccessRequests(Vec<(String, String)>),
     /// Amigos conhecidos e seu status online/offline
     FriendsChanged(Vec<FriendUiEntry>),
     /// Conversa direta (DM) recebida ou enviada (com timestamp cronológico de envio em milissegundos Unix)
@@ -141,6 +143,8 @@ pub struct TerminalUi {
     /// Menu, diálogo ou ajuda aberto por cima da tela
     overlay: Option<Overlay>,
     servers: Vec<ServerEntry>,
+    /// Pedidos de acesso pendentes no servidor atual: (nick, pubkey)
+    access_requests: Vec<(String, String)>,
     friends: Vec<FriendUiEntry>,
     /// Arquivos conhecidos (oferecidos, baixando e compartilhando) para o popup `/files` e autocompletar `Tab`
     known_files: Vec<FileUiEntry>,
@@ -198,6 +202,7 @@ impl TerminalUi {
             chat_scroll: 0,
             overlay: None,
             servers: Vec::new(),
+            access_requests: Vec::new(),
             friends: Vec::new(),
             known_files: Vec::new(),
             in_server: false,
@@ -356,12 +361,16 @@ impl TerminalUi {
                 self.space_name = space_name;
                 self.space_channels = channels;
                 self.in_server = is_server;
+                self.access_requests.clear();
                 // Membros de canais de outro espaço não valem mais (nomes de canal podem se repetir)
                 self.channel_members.clear();
                 self.channel_members.entry(self.current_channel.clone()).or_default().insert(self.my_nick.clone());
             }
             UiEvent::ServersChanged(servers) => {
                 self.servers = servers;
+            }
+            UiEvent::AccessRequests(requests) => {
+                self.access_requests = requests;
             }
             UiEvent::FriendsChanged(friends) => {
                 self.friends = friends;
@@ -648,6 +657,7 @@ impl TerminalUi {
             is_muted: self.is_muted.load(Ordering::Relaxed),
             is_screen_sharing: self.is_screen_sharing,
             servers: &self.servers,
+            access_requests: &self.access_requests,
             friends: &self.friends,
         };
         self.overlay = Some(Overlay::Menu(vec![main_menu(&ctx)]));

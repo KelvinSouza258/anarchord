@@ -289,6 +289,9 @@ impl Runtime {
                 if let Some(set) = self.peer_topics.get_mut(&peer_id) {
                     set.remove(&topic);
                 }
+                if let Some(server_id) = community::parse_server_access_topic(topic.as_str()).map(str::to_string) {
+                    self.on_access_topic_unsubscribed(&server_id, pubkey_hex_from_peer_id(&peer_id));
+                }
                 if topic == self.active.topic.hash() {
                     self.publish_channel_members();
                 }
@@ -459,6 +462,11 @@ impl Runtime {
         if self.screen.my_stream.is_some() && topic == self.screen.publish_topic.hash() {
             self.screen.engine.request_keyframe();
         }
+        // Entrou no tópico de pedidos de acesso: a inscrição já é o pedido (e pode ser um moderador
+        // chegando, para quem está esperando)
+        if let Some(server_id) = community::parse_server_access_topic(topic.as_str()).map(str::to_string) {
+            self.on_access_topic_subscribed(&server_id, pubkey_hex_from_peer_id(&peer_id));
+        }
         // Entrou no tópico de controle de um servidor que conhecemos: entrega a cadeia
         // (servidor privado: só para quem tem passaporte)
         if let Some(server_id) = community::parse_server_control_topic(topic.as_str()).map(str::to_string) {
@@ -525,7 +533,8 @@ impl Runtime {
         }
 
         let src_str = message.source.as_ref().map(|p| p.to_string());
-        if let Some(server_id) = community::parse_server_control_topic(&topic).map(str::to_string) {
+        // Tópico de controle ou de pedidos de acesso do servidor: as mesmas mensagens de servidor
+        if let Some(server_id) = community::parse_server_control_topic(&topic).or_else(|| community::parse_server_access_topic(&topic)).map(str::to_string) {
             self.sniff_packet("RX", &topic, src_str, &message.data, None);
             let from = message.source.as_ref().and_then(pubkey_hex_from_peer_id);
             return match wire::decode_as(&message.data) {

@@ -248,11 +248,18 @@ impl Runtime {
                             .send_response(channel, swarm_files::FileResponse::NotFound);
                         return;
                     }
-                    // Arquivo de servidor: só responde a membros do grupo cifrado
+                    // Arquivo de servidor: só responde a membros do grupo cifrado da sala do arquivo
                     let mls = &self.mls;
-                    let allow = |topic: &str| match community::parse_server_content_topic(topic) {
-                        Some(server_id) => requester.as_ref().is_some_and(|pk| mls.members(server_id).contains(pk)),
-                        None => true,
+                    let active_room = self.active_room();
+                    let allow = |topic: &str| {
+                        if community::parse_server_content_topic(topic).is_none() {
+                            return true;
+                        }
+                        let room = match community::parse_room_topic(topic) {
+                            Some((server_id, channel)) => Some(community::room_id(server_id, channel)),
+                            None => active_room.as_ref().map(|(_, _, room)| room.clone()),
+                        };
+                        room.is_some_and(|room| requester.as_ref().is_some_and(|pk| mls.members(&room).contains(pk)))
                     };
                     let (response, actions) = self.files.engine.handle_request(peer, request, &allow, now);
                     let _ = self.node.swarm.behaviour_mut().files.send_response(channel, response);

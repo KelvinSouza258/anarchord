@@ -12,7 +12,7 @@ use p2p_core::runtime::{
 /// Ajuda dos comandos de servidor
 pub const SERVER_HELP: &str = "Comandos: /server create <nome> | join <id> | accept | list | switch <nome|id|lobby> | info | history | bans \
 | invite | mod add <par> | mod remove <par> | channel add <nome> [voz] | channel remove <nome> | passport issue <par> [mod] [duração] | passport show | passport flatten \
-| ban <par> [30m|12h|3d|2w|perm] [motivo] | unban <par> | revoke <par> | close (privado) | open (público) \
+| ban <par> [30m|12h|3d|2w|perm] [motivo] | unban <par> | revoke <par> | requests | dismiss <par> | close (privado) | open (público) \
 | policy <validade> <janela> (ex.: 7d 2d) | tsa add <nome> <url> <chave-base64> | tsa remove <nome> | rotate-key | leave  (atalho: /lobby)";
 
 pub fn space_label(space: &SpaceInfo) -> String {
@@ -363,6 +363,8 @@ fn server(notice: &ServerNotice) -> Vec<String> {
             ),
             ServerChange::TsaAdded(name) => format!("🕰️ Autoridade de tempo '{}' adicionada à configuração do servidor.", name),
             ServerChange::TsaRemoved(name) => format!("🕰️ Autoridade de tempo '{}' removida da configuração do servidor.", name),
+            ServerChange::AccessPow(0) => "⛏️ Pedidos de acesso sem prova de trabalho.".to_string(),
+            ServerChange::AccessPow(bits) => format!("⛏️ Pedidos de acesso exigem prova de trabalho ({} bits).", bits),
         }),
         ServerNotice::Moderated { target, kind, at, recorded_by_owner, .. } => {
             let what = match kind {
@@ -388,6 +390,21 @@ fn server(notice: &ServerNotice) -> Vec<String> {
         ServerNotice::BanStatus { server, banned: false } => one(format!("🕊️ Seu ban em '{}' acabou.", server)),
         ServerNotice::Role { server, moderator: true } => one(format!("🛡️ Você agora é moderador em '{}'.", server)),
         ServerNotice::Role { server, moderator: false } => one(format!("🛡️ Você não é mais moderador em '{}'.", server)),
+        // Atualização automática da lista: só alimenta o menu do servidor
+        ServerNotice::AccessRequests { explicit: false, .. } => Vec::new(),
+        ServerNotice::AccessProofComputing { server, bits } => one(format!("⛏️ [{}] Calculando prova de trabalho ({} bits) para pedir acesso…", server, bits)),
+        ServerNotice::AccessProofFailed { server, reason } => one(format!("⚠️ [{}] Sem carimbo de TSA ({}); pedindo a uma testemunha da rede.", server, reason)),
+        ServerNotice::AccessRequests { server, requests, .. } => {
+            if requests.is_empty() {
+                return one(format!("🎫 [{}] Nenhum pedido de acesso pendente.", server));
+            }
+            let mut lines = vec![format!("🎫 [{}] Pedidos de acesso pendentes ({}):", server, requests.len())];
+            for r in requests {
+                lines.push(format!("   {} ({}) desde {}", r.nick, short_id(&r.pubkey), fmt_utc(r.since)));
+            }
+            lines.push("   Emita com /server passport issue <par> [mod] ou pelo menu do servidor; dispense com /server dismiss <par>.".to_string());
+            lines
+        }
         ServerNotice::AccessRequested { server, who } => one(format!(
             "🎫 [{}] {} pediu acesso. Servidor privado: emita com /server passport issue {}.",
             server, who, who

@@ -92,6 +92,9 @@ pub fn parse_server_command(rest: &str) -> ServerCommand {
         }
         "unban" => non_empty(args).map(ServerCommand::Unban),
         "revoke" => non_empty(args).map(ServerCommand::Revoke),
+        "requests" | "pedidos" => Some(ServerCommand::Requests),
+        "pow" => args.trim().parse::<u8>().ok().map(ServerCommand::AccessPow),
+        "dismiss" => non_empty(args).map(ServerCommand::DismissRequest),
         "tsa" => {
             let mut parts = args.split_whitespace();
             match (parts.next(), parts.next(), parts.next(), parts.next()) {

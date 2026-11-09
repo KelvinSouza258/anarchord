@@ -412,6 +412,7 @@ fn dissect_incoming(incoming: Incoming) -> (String, SniffedCrypto) {
                 crate::community::ServerMessage::PassportOffer { .. } => "Server.PassportOffer",
                 crate::community::ServerMessage::FlattenRequest { .. } => "Server.FlattenRequest",
                 crate::community::ServerMessage::AccessRequest { .. } => "Server.AccessRequest",
+                crate::community::ServerMessage::AccessPolicy { .. } => "Server.AccessPolicy",
                 crate::community::ServerMessage::GroupLeave { .. } => "Server.GroupLeave",
                 crate::community::ServerMessage::StampRequest { .. } => "Server.StampRequest",
                 crate::community::ServerMessage::Stamp { .. } => "Server.Stamp",

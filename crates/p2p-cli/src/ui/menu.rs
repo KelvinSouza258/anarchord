@@ -122,6 +122,8 @@ pub struct MenuContext<'a> {
     pub is_muted: bool,
     pub is_screen_sharing: bool,
     pub servers: &'a [ServerEntry],
+    /// Pedidos de acesso pendentes do servidor atual: (nick, pubkey)
+    pub access_requests: &'a [(String, String)],
     pub friends: &'a [FriendUiEntry],
 }
 
@@ -158,6 +160,13 @@ pub fn main_menu(ctx: &MenuContext) -> Menu {
 pub fn spaces_category_menu(ctx: &MenuContext) -> Menu {
     let mut items = Vec::new();
     if ctx.in_server {
+        // Pedidos de acesso pendentes (só chegam a quem pode emitir passaporte)
+        if !ctx.access_requests.is_empty() {
+            items.push(MenuItem {
+                label: format!("🎫 Pedidos de acesso ({}) ▸", ctx.access_requests.len()),
+                action: MenuAction::Submenu(access_requests_menu(ctx.access_requests)),
+            });
+        }
         items.push(run("📨 Convidar para este servidor", "/server invite"));
         items.push(ask("➕ Criar canal de texto…", "Nome do canal", "/server channel add {}"));
         items.push(ask("➕ Criar sala de voz…", "Nome da sala de voz", "/server channel add {} voz"));
@@ -450,6 +459,26 @@ pub fn bans_menu(server_name: &str, bans: &[BanUiEntry]) -> Menu {
 }
 
 /// Duração do ban; cada opção pergunta o motivo (opcional)
+/// Pedidos de acesso pendentes: cada um abre as ações de emitir passaporte (membro ou moderador)
+/// ou dispensar, sem precisar digitar nada
+pub fn access_requests_menu(requests: &[(String, String)]) -> Menu {
+    let items = requests
+        .iter()
+        .map(|(nick, pubkey)| MenuItem {
+            label: format!("{} ({}) ▸", nick, &pubkey[..pubkey.len().min(8)]),
+            action: MenuAction::Submenu(Menu::new(
+                format!(" Pedido de {} ", nick),
+                vec![
+                    run("✅ Emitir passaporte de membro", format!("/server passport issue {}", pubkey)),
+                    run("🛡️ Emitir passaporte de moderador", format!("/server passport issue {} mod", pubkey)),
+                    run("🙈 Dispensar (não bane; pode pedir de novo)", format!("/server dismiss {}", pubkey)),
+                ],
+            )),
+        })
+        .collect();
+    Menu::new(" Pedidos de acesso ", items)
+}
+
 /// Confirmação de saída: sair renuncia ao passaporte (Esc cancela)
 pub fn leave_menu() -> Menu {
     Menu::new(
@@ -585,6 +614,7 @@ mod tests {
             is_muted: false,
             is_screen_sharing: false,
             servers: &[],
+            access_requests: &[],
             friends: &[],
         };
         let lobby = main_menu(&lobby_ctx);
@@ -605,6 +635,7 @@ mod tests {
             is_muted: false,
             is_screen_sharing: true,
             servers: &[],
+            access_requests: &[],
             friends: &[],
         };
         let spaces_server = spaces_category_menu(&server_ctx);

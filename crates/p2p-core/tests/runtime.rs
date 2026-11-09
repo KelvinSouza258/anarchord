@@ -866,3 +866,147 @@ async fn test_leaving_private_server_needs_new_passport_to_return() {
         })
         .await;
 }
+
+/// Pedido de acesso a servidor privado (#91): um aviso só, lista de pendentes e emissão pela lista
+#[tokio::test]
+async fn test_private_server_access_request_is_listed_once() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut alice, alice_task) = start("Alice", None);
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+            let (mut carol, carol_task) = start("Carol", Some(alice_port));
+            tokio::task::spawn_local(carol_task.run());
+            let CoreEvent::PeerIdentified { pubkey: carol_pk, .. } =
+                alice.wait("Alice identificar Carol", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Carol")).await
+            else {
+                unreachable!()
+            };
+            alice.server(ServerCommand::Create("Clube".into()));
+            let CoreEvent::Server(ServerNotice::Created { id, .. }) =
+                alice.wait("servidor criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))).await
+            else {
+                unreachable!()
+            };
+            alice.server(ServerCommand::Close);
+            alice.wait("servidor privado", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::Closed, .. }))).await;
+
+            carol.server(ServerCommand::Join(id.clone()));
+            let pk = carol_pk.clone();
+            alice
+                .wait("Alice ver Carol na lista", move |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::AccessRequests { requests, .. }) if requests.iter().any(|r| r.pubkey == pk))
+                })
+                .await;
+            // Vários ciclos de sincronização depois, continua sendo um aviso só
+            alice.drain(Duration::from_secs(12)).await;
+            let warnings = alice.seen.iter().filter(|e| matches!(e, CoreEvent::Server(ServerNotice::AccessRequested { .. }))).count();
+            assert_eq!(warnings, 1, "um aviso por pessoa, sem repetir a cada ciclo");
+            assert!(
+                !carol.seen.iter().any(|e| matches!(e, CoreEvent::Server(ServerNotice::PassportUpdated { .. }))),
+                "servidor privado: sem passaporte automático"
+            );
+
+            // Emissão pela lista (o que o menu "Pedidos de acesso" executa)
+            alice.server(ServerCommand::IssuePassport { target: carol_pk.clone(), moderator: false, duration: None });
+            carol.wait("Carol receber passaporte", |e| matches!(e, CoreEvent::Server(ServerNotice::PassportUpdated { .. }))).await;
+            alice.seen.clear();
+            let mut emptied = false;
+            for _ in 0..20 {
+                alice.server(ServerCommand::Requests);
+                if let CoreEvent::Server(ServerNotice::AccessRequests { requests, .. }) =
+                    alice.wait("lista", |e| matches!(e, CoreEvent::Server(ServerNotice::AccessRequests { explicit: true, .. }))).await
+                {
+                    if requests.is_empty() {
+                        emptied = true;
+                        break;
+                    }
+                }
+                alice.seen.clear();
+                alice.drain(Duration::from_millis(500)).await;
+            }
+            assert!(emptied, "quem recebeu passaporte sai da lista de pendentes");
+        })
+        .await;
+}
+
+/// Moderador que fica online depois vê quem está esperando (#91)
+#[tokio::test]
+async fn test_moderator_online_later_sees_pending_request() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let alice_ident = UserIdentity::generate_with_nick("Alice");
+            let (alice_srv, alice_down) = (temp_dir("pend_a_srv"), temp_dir("pend_a_down"));
+            let room = format!("teste-{}", rand_suffix());
+            let (mut alice, alice_task) = start_with_dirs("Alice", alice_ident.clone(), alice_srv.clone(), alice_down.clone(), room.clone(), None);
+            tokio::task::spawn_local(alice_task.run());
+            alice.server(ServerCommand::Create("Clube".into()));
+            let CoreEvent::Server(ServerNotice::Created { id, .. }) =
+                alice.wait("servidor criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))).await
+            else {
+                unreachable!()
+            };
+            alice.server(ServerCommand::Close);
+            alice.wait("servidor privado", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::Closed, .. }))).await;
+            alice.send(CoreCommand::Shutdown);
+            alice.wait("Alice sair", |e| matches!(e, CoreEvent::Stopped)).await;
+
+            // Carol pede acesso sem ninguém online
+            let (mut carol, carol_task) = start("Carol", None);
+            tokio::task::spawn_local(carol_task.run());
+            let CoreEvent::Started { pubkey: carol_pk, .. } = carol.wait("Carol iniciar", |e| matches!(e, CoreEvent::Started { .. })).await else {
+                unreachable!()
+            };
+            carol.server(ServerCommand::Join(id.clone()));
+            carol.wait("Carol procurando o servidor", |e| matches!(e, CoreEvent::Server(ServerNotice::Searching { .. }))).await;
+
+            // Alice volta e se conecta a Carol
+            let (mut alice, alice_task) = start_with_dirs("Alice", alice_ident, alice_srv, alice_down, room, None);
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+            carol.send(CoreCommand::Dial(format!("/ip4/127.0.0.1/tcp/{}", alice_port)));
+            // No Lobby, o aviso chega; no servidor, a lista de pendentes também
+            alice.wait("Alice ser avisada do pedido", |e| matches!(e, CoreEvent::Server(ServerNotice::AccessRequested { .. }))).await;
+            alice.server(ServerCommand::Switch(id.clone()));
+            let pk = carol_pk.clone();
+            alice
+                .wait("Alice ver Carol na lista", move |e| {
+                    matches!(e, CoreEvent::Server(ServerNotice::AccessRequests { requests, .. }) if requests.iter().any(|r| r.pubkey == pk))
+                })
+                .await;
+        })
+        .await;
+}
+
+/// Pedido de acesso com prova de trabalho (#91), sem internet: o servidor exige prova e não tem
+/// TSA na política, então a semente é carimbada por uma testemunha da rede
+#[tokio::test]
+async fn test_access_request_with_proof_of_work_via_witness() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut alice, alice_task) = start("Alice", None);
+            let alice_port = alice_task.listen_port();
+            tokio::task::spawn_local(alice_task.run());
+            let (mut carol, carol_task) = start("Carol", Some(alice_port));
+            tokio::task::spawn_local(carol_task.run());
+            alice.wait("Alice identificar Carol", |e| matches!(e, CoreEvent::PeerIdentified { nick, .. } if nick == "Carol")).await;
+            alice.server(ServerCommand::Create("Forte".into()));
+            let CoreEvent::Server(ServerNotice::Created { id, .. }) =
+                alice.wait("servidor criado", |e| matches!(e, CoreEvent::Server(ServerNotice::Created { .. }))).await
+            else {
+                unreachable!()
+            };
+            alice.server(ServerCommand::RemoveTsa("FreeTSA".into()));
+            alice.wait("sem TSA", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::TsaRemoved(_), .. }))).await;
+            alice.server(ServerCommand::AccessPow(8));
+            alice.wait("prova exigida", |e| matches!(e, CoreEvent::Server(ServerNotice::Changed { change: ServerChange::AccessPow(8), .. }))).await;
+
+            carol.server(ServerCommand::Join(id.clone()));
+            carol.wait("Carol calcular a prova", |e| matches!(e, CoreEvent::Server(ServerNotice::AccessProofComputing { .. }))).await;
+            carol.wait("Carol receber passaporte", |e| matches!(e, CoreEvent::Server(ServerNotice::PassportUpdated { .. }))).await;
+        })
+        .await;
+}

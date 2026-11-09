@@ -73,6 +73,8 @@ pub enum Entry {
     SetClosed(bool),
     SetPassportPolicy { validity_secs: u64, renewal_window_secs: u64 },
     SetTimestampPolicy(TimestampPolicy),
+    /// Dificuldade da prova de trabalho exigida nos pedidos de acesso (0 = desligada)
+    SetAccessPow { bits: u8 },
     /// Revoga um passaporte específico
     RevokePassport { serial: String },
     /// Ban aplicado pela Chave do Servidor
@@ -206,6 +208,8 @@ pub struct ServerState {
     pub passport_validity_secs: u64,
     pub renewal_window_secs: u64,
     pub timestamp_policy: TimestampPolicy,
+    /// Bits zero exigidos na prova de trabalho dos pedidos de acesso (0 = sem prova)
+    pub access_pow_bits: u8,
     /// Seriais de passaporte revogados
     pub revoked: BTreeSet<String>,
     pub bans: BTreeMap<String, Vec<BanState>>,
@@ -252,6 +256,7 @@ impl ServerState {
                     self.timestamp_policy = policy.clone();
                     governance = true; // carimbos aceitos mudaram: reavaliar
                 }
+                Entry::SetAccessPow { bits } => self.access_pow_bits = (*bits).min(super::access_proof::MAX_POW_BITS),
                 Entry::RevokePassport { serial } => {
                     self.events.push(GovEvent { source: GovSource::OwnerRevoke { serial: serial.clone() }, seen_at: at });
                     governance = true;

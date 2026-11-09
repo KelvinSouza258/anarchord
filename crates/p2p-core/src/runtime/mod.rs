@@ -7,6 +7,7 @@
 //! O estado fica em [`Runtime`]; cada assunto tem seu arquivo com os métodos dele
 //! (`network`, `chat`, `voice`, `screen`, `servers`, `files`).
 
+mod access;
 mod chat;
 pub mod discovery;
 pub mod command;
@@ -252,8 +253,11 @@ pub(crate) struct Runtime {
     /// Carimbos pedidos às TSAs em threads; o resultado volta para o loop
     stamp_tx: UnboundedSender<servers::StampResult>,
     stamp_rx: Option<UnboundedReceiver<servers::StampResult>>,
-    /// Último pedido de acesso de quem ainda não tem passaporte, por servidor
-    last_access_request: HashMap<String, std::time::Instant>,
+    /// Provas de trabalho de pedidos de acesso calculadas em threads
+    pow_tx: UnboundedSender<access::PowResult>,
+    pow_rx: Option<UnboundedReceiver<access::PowResult>>,
+    /// Pedidos de acesso: inscrições, pendentes e esperas (#91)
+    access: access::AccessState,
     /// Último líder do grupo cifrado avisado à interface, por servidor
     last_leader: HashMap<String, Option<String>>,
     /// Última republicação das renúncias de servidores dos quais saímos
@@ -300,6 +304,7 @@ impl Runtime {
         let screen = screen::ScreenState::new(&mut node);
         let files = files::FilesState::new(&identity, config.download_dir.clone());
         let (stamp_tx, stamp_rx) = unbounded_channel();
+        let (pow_tx, pow_rx) = unbounded_channel();
         Ok(Self {
             identity,
             nick,
@@ -330,7 +335,9 @@ impl Runtime {
             last_snapshot_reply: HashMap::new(),
             stamp_tx,
             stamp_rx: Some(stamp_rx),
-            last_access_request: HashMap::new(),
+            pow_tx,
+            pow_rx: Some(pow_rx),
+            access: access::AccessState::default(),
             last_leader: HashMap::new(),
             last_renounce_publish: None,
             voice: voice::VoiceState::default(),
@@ -389,6 +396,7 @@ impl Runtime {
         let mut manifest_rx = self.files.manifests.take();
         let mut fs_events_rx = self.files.fs_events.take();
         let mut stamp_rx = self.stamp_rx.take();
+        let mut pow_rx = self.pow_rx.take();
 
         loop {
             tokio::select! {
@@ -409,6 +417,7 @@ impl Runtime {
                 Some(job) = recv(&mut manifest_rx) => self.manifest_ready(job),
                 Some(()) = recv(&mut fs_events_rx) => self.on_fs_watch_event(),
                 Some(result) = recv(&mut stamp_rx) => self.on_stamp_result(result),
+                Some(result) = recv(&mut pow_rx) => self.on_pow_result(result),
             }
         }
 

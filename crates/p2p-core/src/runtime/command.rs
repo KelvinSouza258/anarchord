@@ -93,6 +93,12 @@ pub enum ServerCommand {
     Unban(String),
     /// Revoga o passaporte conhecido de um participante
     Revoke(String),
+    /// Lista os pedidos de acesso pendentes do servidor atual
+    Requests,
+    /// Tira um pedido de acesso da lista local (não bane; a pessoa pode pedir de novo mais tarde)
+    DismissRequest(String),
+    /// Dificuldade da prova de trabalho exigida nos pedidos de acesso (dono); 0 desliga
+    AccessPow(u8),
     Close,
     Open,
     /// Lista os membros banidos do servidor atual

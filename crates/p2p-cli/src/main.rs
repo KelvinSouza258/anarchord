@@ -863,6 +863,9 @@ fn ui_events(event: &CoreEvent) -> Vec<UiEvent> {
 
         }),
 
+        CoreEvent::Server(ServerNotice::AccessRequests { requests, .. }) => {
+            out.push(UiEvent::AccessRequests(requests.iter().map(|r| (r.nick.clone(), r.pubkey.clone())).collect()))
+        }
         CoreEvent::ServersChanged(servers) => out.push(UiEvent::ServersChanged(
             servers
                 .iter()

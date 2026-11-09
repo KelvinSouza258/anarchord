@@ -10,6 +10,7 @@
 //! Este módulo contém só lógica (sem rede nem interface): o loop de eventos publica as
 //! mensagens que ele devolve e repassa a ele as que chegam.
 
+pub mod access_proof;
 pub mod cert;
 pub mod chain;
 pub mod e2ee;
@@ -104,6 +105,18 @@ pub fn parse_server_channel_topic(topic: &str) -> Option<(&str, &str)> {
 /// Tópico de controle de um servidor: blocos da cadeia, ações de moderação e pedidos de cadeia
 pub fn server_control_topic(server_id: &str) -> String {
     format!("{}/server/{}", TOPIC_PREFIX, server_id)
+}
+
+/// Tópico de pedidos de acesso de um servidor: quem quer entrar e quem pode emitir passaporte se
+/// inscrevem nele; a própria inscrição é o pedido, e o `AccessRequest` é publicado uma vez
+pub fn access_topic(server_id: &str) -> String {
+    format!("{}/server/{}/access", TOPIC_PREFIX, server_id)
+}
+
+/// Se o tópico é o de pedidos de acesso de um servidor, devolve o id do servidor
+pub fn parse_server_access_topic(topic: &str) -> Option<&str> {
+    let id = topic.strip_prefix(TOPIC_PREFIX)?.strip_prefix("/server/")?.strip_suffix("/access")?;
+    is_valid_server_id(id).then_some(id)
 }
 
 /// Se o tópico é o de controle de um servidor, devolve o id do servidor
@@ -207,8 +220,15 @@ pub enum ServerMessage {
     /// É só um atalho: quem volta sem esse aviso ter chegado é readmitido pelo próprio `KeyPackage`.
     GroupLeave { server_id: String, room: String },
     /// Quem não tem passaporte pede um. Em servidor público, moderadores com `IssueMember`
-    /// online emitem automaticamente.
-    AccessRequest { server_id: String },
+    /// online emitem automaticamente. Se o servidor exige prova de trabalho, ela vem junto.
+    AccessRequest {
+        server_id: String,
+        #[serde(default)]
+        proof: Option<access_proof::AccessProof>,
+    },
+    /// Resposta a pedido sem prova válida num servidor que a exige: a dificuldade e as autoridades
+    /// de tempo aceitas (quem pede ainda não tem a cadeia para saber)
+    AccessPolicy { server_id: String, pow_bits: u8, tsas: Vec<TrustedTsa> },
     /// Pedido de carimbo de tempo a testemunhas da rede (só o hash viaja)
     StampRequest { server_id: String, imprint: String, nonce: String },
     /// Carimbo sobre `imprint` (de uma TSA ou de uma testemunha) para anexar ao objeto correspondente
@@ -852,6 +872,7 @@ impl ServerRegistry {
             | ServerMessage::PassportOffer { .. }
             | ServerMessage::FlattenRequest { .. }
             | ServerMessage::AccessRequest { .. }
+            | ServerMessage::AccessPolicy { .. }
             | ServerMessage::GroupLeave { .. }
             | ServerMessage::StampRequest { .. } => {
                 vec![ServerEvent::Ignored("mensagem do grupo cifrado, passaporte ou carimbo (tratada pelo runtime)".into())]
@@ -953,6 +974,44 @@ impl ServerRegistry {
         let passport = self.issue_passport(server_id, issuer, requester, PassportPermission::member(), Some(validity), now).ok()?;
         state.verify_passport(&passport, now).ok()?;
         Some(ServerMessage::PassportOffer { server_id: server_id.to_string(), target: requester.to_string(), passport })
+    }
+
+    /// O pedido de acesso de `from` cumpre a prova de trabalho exigida pelo servidor? `None` = o
+    /// servidor não exige. Confere dificuldade, assinatura, autoridade do carimbo (política da cadeia;
+    /// testemunha não pode ser quem pede) e se o carimbo é recente.
+    pub fn access_proof_ok(&self, server_id: &str, from: &str, proof: Option<&access_proof::AccessProof>, now: UtcSecs) -> Option<bool> {
+        let server = self.servers.get(server_id).filter(|s| s.has_chain())?;
+        let state = server.effective_state(now);
+        let bits = state.access_pow_bits;
+        if bits == 0 {
+            return None;
+        }
+        let Some(proof) = proof else { return Some(false) };
+        if !proof.verify_work(server_id, from, bits) {
+            return Some(false);
+        }
+        let imprint = access_proof::seed_imprint(server_id, from, &proof.body.seed);
+        Some(
+            state
+                .stamp_time(&proof.body.freshness, &imprint, from, 3)
+                .is_some_and(|at| access_proof::AccessProof::fresh_at(at, now)),
+        )
+    }
+
+    /// Política de acesso para mandar a quem pede sem prova (dificuldade e autoridades de tempo)
+    pub fn access_policy(&self, server_id: &str, now: UtcSecs) -> Option<ServerMessage> {
+        let server = self.servers.get(server_id).filter(|s| s.has_chain())?;
+        let state = server.effective_state(now);
+        (state.access_pow_bits > 0).then(|| ServerMessage::AccessPolicy {
+            server_id: server_id.to_string(),
+            pow_bits: state.access_pow_bits,
+            tsas: state.timestamp_policy.tsas.clone(),
+        })
+    }
+
+    /// Dificuldade da prova de trabalho dos pedidos de acesso (dono); 0 desliga
+    pub fn set_access_pow(&mut self, server_id: &str, bits: u8, now: UtcSecs) -> Result<ServerMessage, CommunityError> {
+        self.owner_append(server_id, now, vec![Entry::SetAccessPow { bits: bits.min(access_proof::MAX_POW_BITS) }])
     }
 
     /// Anexa um carimbo a quem tiver esse hash (usado quando o próprio nó obtém o carimbo)
@@ -1174,6 +1233,8 @@ fn describe_entry(entry: &Entry) -> String {
             if policy.tsas.is_empty() { "só testemunhas da rede".to_string() } else { policy.tsas.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ") }
         ),
         Entry::RevokePassport { serial } => format!("passaporte {} revogado", serial),
+        Entry::SetAccessPow { bits: 0 } => "pedidos de acesso sem prova de trabalho".into(),
+        Entry::SetAccessPow { bits } => format!("pedidos de acesso exigem prova de trabalho ({} bits)", bits),
         Entry::Ban { target, until, .. } => format!(
             "dono baniu {} ({})",
             short_id(target),
@@ -1250,6 +1311,9 @@ mod tests {
         assert_eq!(parse_server_content_topic(&channel_topic(&space, "geral")), Some(id.as_str()));
         assert_eq!(parse_server_channel_topic(&channel_topic(&space, "geral")), Some((id.as_str(), "geral")));
         assert_eq!(parse_server_channel_topic(&voice_topic(&space, "voz")), None, "voz não é canal de texto");
+        assert_eq!(parse_server_access_topic(&access_topic(&id)), Some(id.as_str()));
+        assert_eq!(parse_server_control_topic(&access_topic(&id)), None, "pedidos de acesso têm tópico próprio");
+        assert_eq!(parse_server_content_topic(&access_topic(&id)), None, "pedidos de acesso não são cifrados");
         assert_eq!(parse_room_topic(&channel_topic(&space, "geral")), Some((id.as_str(), "geral")));
         assert_eq!(parse_room_topic(&voice_topic(&space, "voz")), Some((id.as_str(), "voz")));
         assert_eq!(parse_room_topic(&screen_topic(&space)), None, "tela não tem sala própria");
@@ -1563,6 +1627,42 @@ mod tests {
 
         // O dono não renuncia (o passaporte dele vem da Chave do Servidor)
         assert!(owner.leave_renouncing(&id, &issuer, T0 + 19).is_none());
+    }
+
+    /// Prova de trabalho do pedido de acesso (#91): exigida só quando a política liga; vale com
+    /// carimbo recente de TSA da política; não vale sem prova, com carimbo velho ou de outra TSA
+    #[test]
+    fn test_access_proof_follows_server_policy() {
+        let tsa = timestamp::test_tsa::LocalTsa::new();
+        let policy = TimestampPolicy { tsas: vec![tsa.trusted("local")], max_delay_secs: 600 };
+        let mut owner = ServerRegistry::in_memory();
+        let id = owner.create_with_policy("Forte", OWNER, policy, T0).unwrap();
+        let carol = UserIdentity::generate();
+        let carol_pk = pk(&carol);
+        assert_eq!(owner.access_proof_ok(&id, &carol_pk, None, T0), None, "sem política: prova não é exigida");
+        assert!(owner.access_policy(&id, T0).is_none());
+
+        owner.set_access_pow(&id, 8, T0 + 1).unwrap();
+        assert_eq!(owner.access_proof_ok(&id, &carol_pk, None, T0 + 2), Some(false), "política ligada: sem prova não passa");
+        let Some(ServerMessage::AccessPolicy { pow_bits: 8, tsas, .. }) = owner.access_policy(&id, T0 + 2) else { panic!() };
+        assert_eq!(tsas.len(), 1, "quem pede recebe as autoridades aceitas");
+
+        let make = |stamp_at: u64, authority: &timestamp::test_tsa::LocalTsa, bits: u8| {
+            let seed = "semente";
+            let stamp = authority.stamp(&access_proof::seed_imprint(&id, &carol_pk, seed), stamp_at);
+            access_proof::AccessProof::sign(&carol, access_proof::compute(&id, &carol_pk, seed, stamp, bits))
+        };
+        let now = T0 + 100;
+        assert_eq!(owner.access_proof_ok(&id, &carol_pk, Some(&make(now - 10, &tsa, 8)), now), Some(true), "prova válida");
+        assert_eq!(owner.access_proof_ok(&id, &carol_pk, Some(&make(now - 2000, &tsa, 8)), now), Some(false), "carimbo velho");
+        assert_eq!(
+            owner.access_proof_ok(&id, &carol_pk, Some(&make(now - 10, &timestamp::test_tsa::LocalTsa::new(), 8)), now),
+            Some(false),
+            "TSA fora da política"
+        );
+        assert_eq!(owner.access_proof_ok(&id, &carol_pk, Some(&make(now - 10, &tsa, 2)), now), Some(false), "dificuldade abaixo da política");
+        let other = pk(&UserIdentity::generate());
+        assert_eq!(owner.access_proof_ok(&id, &other, Some(&make(now - 10, &tsa, 8)), now), Some(false), "prova de outra pessoa");
     }
 
     /// Sair e voltar ao próprio servidor: a chave de dono ficou no disco e a posse volta

@@ -262,8 +262,17 @@ pub enum ServerNotice {
     BanStatus { server: String, banned: bool },
     /// Este usuário passou a ser (ou deixou de ser) moderador
     Role { server: String, moderator: bool },
-    /// Alguém sem passaporte pediu acesso a um servidor privado (só moderador emite manualmente)
+    /// Alguém sem passaporte pediu acesso a um servidor privado (só moderador emite manualmente).
+    /// Avisado uma vez por pessoa (repete no máximo a cada 30 minutos).
     AccessRequested { server: String, who: String },
+    /// Pedidos de acesso pendentes no servidor atual (para quem pode emitir passaporte): enviado
+    /// quando a lista muda (`explicit: false`, só para a interface atualizar menus) e em resposta a
+    /// `/server requests` (`explicit: true`, para mostrar ao usuário)
+    AccessRequests { server_id: String, server: String, requests: Vec<AccessRequestEntry>, explicit: bool },
+    /// Calculando a prova de trabalho exigida para pedir acesso (pode levar alguns segundos)
+    AccessProofComputing { server: String, bits: u8 },
+    /// Não foi possível obter carimbo de TSA para a prova; tentando com uma testemunha da rede
+    AccessProofFailed { server: String, reason: String },
     /// Carimbo de tempo obtido (TSA ou testemunha) para uma ação ou passaporte deste nó
     StampObtained { server: String, source: String },
     /// Não foi possível obter carimbo de uma TSA da política
@@ -312,6 +321,17 @@ pub enum ServerChange {
     Policy { validity_secs: u64, renewal_window_secs: u64 },
     TsaAdded(String),
     TsaRemoved(String),
+    /// Dificuldade da prova de trabalho dos pedidos de acesso (0 = desligada)
+    AccessPow(u8),
+}
+
+/// Um pedido de acesso pendente
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccessRequestEntry {
+    pub pubkey: String,
+    pub nick: String,
+    /// Quando o pedido foi visto pela primeira vez (UTC)
+    pub since: UtcSecs,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

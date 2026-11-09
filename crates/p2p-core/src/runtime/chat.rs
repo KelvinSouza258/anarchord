@@ -138,6 +138,8 @@ impl Runtime {
         self.emit(CoreEvent::ChannelEntered { space: self.space_info(&self.active.space), channel: self.active.channel.clone() });
         if changing_room {
             self.enter_room_group();
+            // Pedidos de acesso do servidor atual (a interface monta o menu com eles)
+            self.emit_access_requests();
         }
     }
 

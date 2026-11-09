@@ -16,8 +16,6 @@ use base64::Engine as _;
 use libp2p::gossipsub::IdentTopic;
 use std::time::{Duration, Instant};
 
-/// Intervalo entre pedidos de acesso de quem ainda não tem passaporte
-const ACCESS_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
 /// Intervalo entre republicações da renúncia ao passaporte de quem saiu de um servidor
 const RENOUNCE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -53,7 +51,7 @@ pub fn parse_invite(text: &str) -> Option<String> {
 }
 
 impl Runtime {
-    fn notice(&self, notice: ServerNotice) {
+    pub(super) fn notice(&self, notice: ServerNotice) {
         self.emit(CoreEvent::Server(notice));
     }
 
@@ -107,10 +105,8 @@ impl Runtime {
     }
 
     fn enter_server(&mut self, server_id: String) {
-        let now = super::now_secs();
-        if self.servers.get(&server_id).is_some_and(|s| s.has_chain()) && !self.participating(&server_id, now) {
-            self.request_access(&server_id);
-        }
+        // Sem passaporte: tópico de pedidos; com passaporte: sai dele
+        self.sync_access_topics();
         let channel = self.default_channel(&server_id);
         self.enter_channel(Space::Server(server_id), channel);
     }
@@ -158,16 +154,6 @@ impl Runtime {
         }
     }
 
-    /// Sem passaporte: pede um (servidor público responde automaticamente)
-    fn request_access(&mut self, server_id: &str) {
-        if self.last_access_request.get(server_id).is_some_and(|t| t.elapsed() < ACCESS_REQUEST_INTERVAL) {
-            return;
-        }
-        if self.publish_server_message(server_id, &ServerMessage::AccessRequest { server_id: server_id.to_string() }) {
-            self.last_access_request.insert(server_id.to_string(), Instant::now());
-        }
-    }
-
     /// Avisa a interface quando o líder do grupo cifrado da sala atual muda
     pub(super) fn check_leader_changes(&mut self) {
         let me = self.my_pubkey();
@@ -212,7 +198,7 @@ impl Runtime {
 
     /// Pede carimbos de tempo para `imprint`: às TSAs da política (em threads, via HTTP) e às
     /// testemunhas da rede (pelo tópico de controle)
-    fn request_stamps(&mut self, server_id: &str, imprint: [u8; 32]) {
+    pub(super) fn request_stamps(&mut self, server_id: &str, imprint: [u8; 32]) {
         let nonce = timestamp::hex(&rand::random::<[u8; 8]>());
         self.publish_server_message(
             server_id,
@@ -280,19 +266,17 @@ impl Runtime {
     /// Ciclo periódico: pede cadeias que faltam, pede acesso, cuida do grupo
     /// cifrado e da manutenção do dono
     pub(super) fn server_sync_tick(&mut self) {
+        // Quem ainda não tem a cadeia pede com espera crescente (não a cada ciclo)
         for id in self.servers.list().filter(|s| !s.has_chain()).map(|s| s.server_id.clone()).collect::<Vec<_>>() {
-            if let Some(request) = self.servers.chain_request(&id) {
-                self.publish_server_message(&id, &request);
+            if self.chain_request_due(&id) {
+                if let Some(request) = self.servers.chain_request(&id) {
+                    self.publish_server_message(&id, &request);
+                }
             }
-            self.publish_server_message(&id, &ServerMessage::AccessRequest { server_id: id.clone() });
         }
         let now = super::now_secs();
-        let synced: Vec<String> = self.servers.list().filter(|s| s.has_chain()).map(|s| s.server_id.clone()).collect();
-        for id in &synced {
-            if !self.participating(id, now) {
-                self.request_access(id);
-            }
-        }
+        // Pedidos de acesso: inscrições no tópico de pedidos e republicação a cada 10 minutos
+        self.sync_access_topics();
         // Grupo cifrado efêmero com líder determinístico (menor pubkey), só da sala em que o usuário
         // está: estar online (ou no mesmo servidor) não basta para participar ou liderar. O dono não
         // precisa estar online.
@@ -366,12 +350,17 @@ impl Runtime {
         } else {
             self.pending_switch = Some(server_id.to_string());
             self.node.dht_find(server_dht_key(server_id));
-            if let Some(request) = self.servers.chain_request(server_id) {
-                self.publish_server_message(server_id, &request);
+            // Entrar de novo pelo comando recomeça a espera do pedido de cadeia
+            self.reset_chain_backoff(server_id);
+            if self.chain_request_due(server_id) {
+                if let Some(request) = self.servers.chain_request(server_id) {
+                    self.publish_server_message(server_id, &request);
+                }
             }
-            self.publish_server_message(server_id, &ServerMessage::AccessRequest { server_id: server_id.to_string() });
             self.notice(ServerNotice::Searching { id: server_id.to_string() });
         }
+        // Sem passaporte: entra no tópico de pedidos e pede acesso uma vez
+        self.sync_access_topics();
     }
 
     /// Convite com passaporte embutido: só vale se o passaporte for deste nó (em mensagem pública,
@@ -399,7 +388,7 @@ impl Runtime {
         }
     }
 
-    fn server_name(&self, id: &str) -> String {
+    pub(super) fn server_name(&self, id: &str) -> String {
         self.servers.get(id).map(|s| s.name()).unwrap_or_else(|| community::short_id(id).to_string())
     }
 
@@ -685,6 +674,20 @@ impl Runtime {
             }
             ServerCommand::Ban { target, duration, reason } => self.moderate(ModKind::Ban { until: duration.map(|d| now + d) }, &target, &reason),
             ServerCommand::Unban(target) => self.moderate(ModKind::Unban, &target, ""),
+            ServerCommand::AccessPow(bits) => {
+                let id = need_server!();
+                let result = self.servers.set_access_pow(&id, bits, now);
+                self.publish_change(&id, result, ServerChange::AccessPow(bits));
+            }
+            ServerCommand::Requests => {
+                need_server!();
+                self.show_access_requests();
+            }
+            ServerCommand::DismissRequest(target) => {
+                let id = need_server!();
+                let pubkey = self.resolve_pubkey(&target).unwrap_or(target);
+                self.dismiss_access_request(&id, &pubkey);
+            }
             ServerCommand::Revoke(target) => {
                 let id = need_server!();
                 let pubkey = need_peer!(target);
@@ -805,25 +808,18 @@ impl Runtime {
                 }
                 return;
             }
-            ServerMessage::AccessRequest { server_id } => {
-                let Some(from) = from_pubkey else { return };
-                if from == me {
-                    return;
+            ServerMessage::AccessRequest { server_id, proof } => {
+                if let Some(from) = from_pubkey {
+                    self.note_access_request(server_id, from, proof.as_ref(), true);
                 }
-                let closed = self.servers.get(server_id).is_some_and(|s| s.has_chain() && s.chain().state().closed);
-                if let Some(offer) = self.servers.answer_access_request(server_id, &self.identity, from, now) {
-                    if let ServerMessage::PassportOffer { passport, .. } = &offer {
-                        // Só pede carimbo para passaporte recém-emitido (reenvio já tem os seus)
-                        let fresh = self.servers.get_mut(server_id).is_some_and(|s| s.passport_of(&passport.body.holder) != Some(passport) && s.remember_issued(passport, now));
-                        let imprint = passport.imprint();
-                        self.publish_server_message(server_id, &offer);
-                        if fresh {
-                            self.request_stamps(server_id, imprint);
-                        }
-                    }
-                } else if closed && self.servers.get(server_id).is_some_and(|s| s.is_moderator(&me, now)) {
-                    self.notice(ServerNotice::AccessRequested { server: self.server_name(server_id), who: self.nick_for(from) });
-                }
+                return;
+            }
+            ServerMessage::AccessPolicy { server_id, pow_bits, tsas } => {
+                self.on_access_policy(server_id, *pow_bits, tsas.clone());
+                return;
+            }
+            // Carimbo de uma semente nossa (prova de trabalho sem TSA): não é para o registro
+            ServerMessage::Stamp { imprint, stamp, .. } if self.on_access_stamp(imprint, stamp) => {
                 return;
             }
             ServerMessage::GroupLeave { server_id, room } => {
@@ -835,11 +831,21 @@ impl Runtime {
                 return;
             }
             ServerMessage::StampRequest { server_id, imprint, nonce } => {
-                if from_pubkey == Some(me.as_str()) {
+                let Some(from) = from_pubkey.filter(|pk| *pk != me) else { return };
+                // Quem ainda não é membro (semente de prova de trabalho): limite de taxa e uma
+                // testemunha só, para não virar amplificação
+                let member = self.servers.get(server_id).is_some_and(|s| s.is_allowed(from, now));
+                if !self.may_stamp_for_stranger(server_id, from) {
                     return;
                 }
                 if let Some(stamp) = self.servers.witness_stamp(server_id, &self.identity, imprint, nonce, now) {
-                    self.publish_server_message(server_id, &stamp);
+                    if member {
+                        self.publish_server_message(server_id, &stamp);
+                    } else {
+                        // Quem não é membro está no tópico de pedidos (talvez sem o de controle)
+                        let access = IdentTopic::new(community::access_topic(server_id));
+                        let _ = self.publish_gossip(access, crate::wire::encode(&stamp));
+                    }
                 }
                 return;
             }
@@ -905,6 +911,8 @@ impl Runtime {
                 if *target == me {
                     let was_moderator = self.servers.get(server_id).is_some_and(|s| s.has_chain() && s.is_moderator(&me, now));
                     if self.servers.accept_my_passport(server_id, &me, passport, now) {
+                        // Recebeu passaporte: sai do tópico de pedidos
+                        self.sync_access_topics();
                         self.notice(ServerNotice::PassportUpdated { server: self.server_name(server_id) });
                         let server = self.servers.get(server_id);
                         let moderator = server.is_some_and(|s| s.has_chain() && s.is_moderator(&me, now));
@@ -1042,8 +1050,11 @@ impl Runtime {
         // Ban, revogação ou ação nova: o líder tira do grupo cifrado na hora quem perdeu o direito
         if governance_changed {
             self.enforce_now(topic_server_id);
+            // Cadeia ou moderação mudou: quem pede ou quem emite pode ter mudado
+            self.sync_access_topics();
             if self.active.server_id() == Some(topic_server_id) {
                 self.publish_channel_members();
+                self.emit_access_requests();
             }
         }
 
